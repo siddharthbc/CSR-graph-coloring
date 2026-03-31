@@ -1,3 +1,21 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Cloned golden reference repo
+Picasso_golden/
+
+# CSL compiled output
+csl_compiled_out/
+
+# LaTeX intermediates
+*.aux
+*.log
+*.toc
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# OS
+.DS_Store

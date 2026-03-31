@@ -1,6 +1,8 @@
 
 # Targets:
 #   make test         -- compare our Python output against C++ golden files
+#   make test-csl     -- run Cerebras CSL speculative parallel coloring against golden files
+#   make test-all     -- run both Python and CSL tests
 #   make golden       -- clone + build + run the official C++ repo to get golden outputs
 #   make golden-clean -- nuke the cloned repo and golden outputs
 #   make clean        -- remove all generated stuff
@@ -28,7 +30,13 @@ TEST_NAMES  := $(basename $(notdir $(TEST_INPUTS)))
 PYTHON      := python3
 PICASSO_CMD := $(PYTHON) -m picasso
 
-.PHONY: golden golden-clone golden-build golden-run golden-clean clean test help
+# Cerebras CSL settings
+CSL_DIR     := $(ROOT_DIR)/csl
+NUM_PES     := 2
+GRID_ROWS   := 1
+CSL_COMPILED := $(ROOT_DIR)/csl_compiled_out
+
+.PHONY: golden golden-clone golden-build golden-run golden-clean clean test test-csl test-all help
 
 golden: golden-clone golden-build golden-run
 	@echo ""
@@ -139,6 +147,23 @@ test:
 	if [ "$$fail" -gt 0 ]; then exit 1; fi
 
 
+# --- Cerebras CSL tests ---
+
+test-csl:
+	@echo ""
+	@echo "Running Cerebras CSL speculative coloring tests..."
+	@echo "  PEs: $(NUM_PES) ($(shell echo $$(( $(NUM_PES) / $(GRID_ROWS) )))x$(GRID_ROWS))"
+	@echo ""
+	$(PYTHON) picasso/run_csl_tests.py \
+		--num-pes $(NUM_PES) \
+		--grid-rows $(GRID_ROWS) \
+		--palette-size $(PALETTE_SIZE) \
+		--root $(ROOT_DIR)
+
+test-all: test test-csl
+	@echo ""
+	@echo "All tests complete."
+
 # --- cleanup ---
 
 golden-clean:
@@ -150,10 +175,13 @@ clean: golden-clean
 	@echo "Removing generated artifacts..."
 	rm -rf __pycache__ picasso/__pycache__
 	rm -rf .venv
+	rm -rf $(CSL_COMPILED)
 
 help:
 	@echo "Targets:"
 	@echo "  make test          run Python against golden outputs"
+	@echo "  make test-csl      run Cerebras CSL coloring (sim) against golden outputs"
+	@echo "  make test-all      run both Python and CSL tests"
 	@echo "  make golden        clone + build + run official C++ to generate golden files"
 	@echo "  make golden-clone  clone the official repo"
 	@echo "  make golden-build  build the official binary"
