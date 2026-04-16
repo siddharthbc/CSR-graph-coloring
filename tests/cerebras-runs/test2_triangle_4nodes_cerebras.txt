@@ -1,0 +1,22 @@
+The grouping output: 
+using parallel speculative coloring (Cerebras WSE)
+***********Level 0*******
+Num Nodes: 4
+Num Edges: 3
+Avg. Deg.: 1.5
+Palette Size: 2
+List Size: 2
+Num Conflict Edges: 3
+Conflict to Edge (%): 100
+Num Colors: 2
+Color Assignment (Level 0): 0 1 1 1
+
+Final Num invalid Vert: 0
+# of Final colors: 2
+Color Assignment (Final): 0 1 1 1
+
+--- Color Assignment ---
+  vertex 0: color 0
+  vertex 1: color 1
+  vertex 2: color 1
+  vertex 3: color 1

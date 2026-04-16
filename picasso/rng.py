@@ -48,6 +48,10 @@ class MT19937:
         """Random int in [a, b], Lemire's method (matches libstdc++)."""
         span = b - a
         if span == 0:
+            # C++ std::uniform_int_distribution still consumes one engine
+            # call even when the range is a single value.  We must do the
+            # same to keep the RNG stream in sync.
+            self()
             return a
 
         span_plus1 = span + 1

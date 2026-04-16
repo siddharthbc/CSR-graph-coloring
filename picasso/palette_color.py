@@ -128,6 +128,13 @@ class PaletteColor:
 
         # color isolated vertices right away, bucket the rest
         for v in vertices:
+            if not self.color_lists[v]:
+                # empty list — mark invalid (degenerate palette)
+                self.invalid_vertices.append(v)
+                self.colors[v] = -2
+                processed[0] += 1
+                continue
+
             if conflict_graph.degree(v) == 0:
                 idx = rng.uniform_int(0, len(self.color_lists[v]) - 1)
                 self.colors[v] = self.color_lists[v][idx]

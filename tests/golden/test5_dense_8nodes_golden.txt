@@ -9,11 +9,11 @@ List Size: 2
 Num Conflict Edges: 13
 Conflict to Edge (%): 100
 Num Colors: 3
-Assign Time: 2.79304e-06
-Conf. Build Time: 3.42197e-06
-Conf. Color Time: 1.6335e-05
+Assign Time: 1.177e-06
+Conf. Build Time: 1.479e-06
+Conf. Color Time: 6.518e-06
 
 Final Num invalid Vert: 2
-Naive Color TIme: 2.59955e-07
+Naive Color TIme: 1.24e-07
 # of Final colors: 4
 Total memory usage(KB): 192

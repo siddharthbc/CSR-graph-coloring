@@ -20,7 +20,8 @@ param max_local_verts: i16;
 param max_local_edges: i16;
 param max_boundary: i16;
 param max_relay: i16;
-param palette_size: i16;
+param max_palette_size: i16;  // compile-time max (sizes forbidden[] array)
+param max_list_size: i16;     // T: max colors per vertex list (Picasso)
 
 // East/West fabric colors (always used)
 const east_color_0: color = @get_color(0);
@@ -106,7 +107,8 @@ layout {
           .max_local_edges = max_local_edges,
           .max_boundary    = max_boundary,
           .max_relay       = max_relay,
-          .palette_size    = palette_size,
+          .max_palette_size = max_palette_size,
+          .max_list_size   = max_list_size,
           .is_west_edge    = is_west,
           .is_east_edge    = is_east,
           .is_north_edge   = is_north,
@@ -213,11 +215,12 @@ layout {
   @export_name("boundary_local_idx",     [*]i32, true);
   @export_name("boundary_neighbor_gid",  [*]i32, true);
   @export_name("boundary_direction",     [*]i32, true);
-  @export_name("pe_mask",               [*]i32, true);
+  @export_name("runtime_config",         [*]i32, true);
   @export_name("num_boundary",           [*]i32, true);
   @export_name("coloring_timer",         [*]f32, true);
   @export_name("perf_counters",          [*]i32, true);
-  @export_name("expected_data_recv",     [*]i32, true);
-  @export_name("expected_done_recv",     [*]i32, true);
+  @export_name("expected_recv",          [*]i32, true);
+  @export_name("color_list",             [*]i32, true);
+  @export_name("list_len",               [*]i32, true);
   @export_name("start_coloring",         fn()void);
 }

@@ -1,0 +1,17 @@
+The grouping output: 
+using list greedy ordering for conflict coloring
+***********Level 0*******
+Num Nodes: 3
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 3
+List Size: 1
+Num Conflict Edges: 0
+Conflict to Edge (%): -nan
+Num Colors: 3
+Assign Time: 6.14e-07
+Conf. Build Time: 2.25e-07
+Conf. Color Time: 9.86e-07
+
+# of Final colors: 3
+Total memory usage(KB): 192

@@ -1,0 +1,82 @@
+The grouping output: 
+using parallel speculative coloring (Cerebras WSE)
+***********Level 0*******
+Num Nodes: 20
+Num Edges: 158
+Avg. Deg.: 15.8
+Palette Size: 2
+List Size: 2
+Num Conflict Edges: 158
+Conflict to Edge (%): 100
+Num Colors: 2
+Color Assignment (Level 0): 0 -1 1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+
+***********Level 1*******
+Num Nodes: 18
+Num Edges: 121
+Avg. Deg.: 13.4444
+Palette Size: 2
+List Size: 2
+Num Conflict Edges: 121
+Conflict to Edge (%): 100
+Num Colors: 4
+Color Assignment (Level 1): 0 2 1 3 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+
+***********Level 2*******
+Num Nodes: 16
+Num Edges: 88
+Avg. Deg.: 11
+Palette Size: 2
+List Size: 2
+Num Conflict Edges: 88
+Conflict to Edge (%): 100
+Num Colors: 6
+Color Assignment (Level 2): 0 2 1 3 4 4 4 5 5 5 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+
+***********Level 3*******
+Num Nodes: 10
+Num Edges: 19
+Avg. Deg.: 3.8
+Palette Size: 2
+List Size: 2
+Num Conflict Edges: 19
+Conflict to Edge (%): 100
+Num Colors: 8
+Color Assignment (Level 3): 0 2 1 3 4 4 4 5 5 5 6 6 6 7 -1 -1 7 -1 -1 7
+
+***********Level 4*******
+Num Nodes: 4
+Num Edges: 2
+Avg. Deg.: 1
+Palette Size: 2
+List Size: 2
+Num Conflict Edges: 2
+Conflict to Edge (%): 100
+Num Colors: 10
+Color Assignment (Level 4): 0 2 1 3 4 4 4 5 5 5 6 6 6 7 8 8 7 9 9 7
+
+Final Num invalid Vert: 0
+# of Final colors: 10
+Color Assignment (Final): 0 2 1 3 4 4 4 5 5 5 6 6 6 7 8 8 7 9 9 7
+
+--- Color Assignment ---
+  vertex 0: color 0
+  vertex 1: color 2
+  vertex 2: color 1
+  vertex 3: color 3
+  vertex 4: color 4
+  vertex 5: color 4
+  vertex 6: color 4
+  vertex 7: color 5
+  vertex 8: color 5
+  vertex 9: color 5
+  vertex 10: color 6
+  vertex 11: color 6
+  vertex 12: color 6
+  vertex 13: color 7
+  vertex 14: color 8
+  vertex 15: color 8
+  vertex 16: color 7
+  vertex 17: color 9
+  vertex 18: color 9
+  vertex 19: color 7

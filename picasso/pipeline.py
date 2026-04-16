@@ -61,14 +61,18 @@ class PicassoColoring:
         """Run the full pipeline, return final color assignment."""
         invalid = self._run_level(level=0)
 
-        # recursive levels
+        # recursive levels (paper Algorithm 1: while Vℓ is not empty)
         if self.recursive:
             level = 1
             while len(invalid) > self.max_invalid:
+                prev_count = len(invalid)
                 new_size = max(1, int(len(invalid) * self.next_frac))
                 self.coloring.reinit(invalid, new_size, self.alpha)
                 invalid = self._run_level(invalid, level=level)
                 level += 1
+                # stop if no progress (palette too small to reduce invalids)
+                if len(invalid) >= prev_count:
+                    break
 
         # fallback for anything left
         self.final_invalid = invalid
