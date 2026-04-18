@@ -907,11 +907,13 @@ def find_tool(name):
 
 
 def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
-                max_boundary, max_relay, max_palette_size, max_list_size, output_dir):
+                max_boundary, max_relay, max_palette_size, max_list_size,
+                routing_mode, output_dir):
     """Compile the CSL program with cslc.
     
     max_palette_size: compile-time upper bound (sizes the forbidden[] array).
     The actual palette_size is uploaded at runtime per test.
+    routing_mode: 0 = SW relay, 1 = HW filter (1D only).
     
     Runs from the repo root so the singularity container bind covers
     both the CSL sources and the output directory.  The layout file is
@@ -944,7 +946,8 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
         f'max_boundary:{max_boundary},'
         f'max_relay:{max_relay},'
         f'max_palette_size:{max_palette_size},'
-        f'max_list_size:{max_list_size}',
+        f'max_list_size:{max_list_size},'
+        f'routing_mode:{routing_mode}',
     ]
     print(f"  Compiling: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_root)
@@ -1164,6 +1167,11 @@ def main():
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Directory to write per-test Cerebras run output '
                              '(default: tests/cerebras-runs)')
+    parser.add_argument('--routing', type=str, default='sw-relay',
+                        choices=['sw-relay', 'hw-filter'],
+                        help='Routing mode: sw-relay (default) or hw-filter '
+                             '(1D only, uses hardware filter for wire-speed '
+                             'wavelet delivery)')
     args = parser.parse_args()
 
     # --- Appliance mode: load compile artifact ---
@@ -1177,6 +1185,13 @@ def main():
         with open(args.artifact, 'r') as f:
             compile_info = json.load(f)
         artifact_path = compile_info['artifact_path']
+        # Cross-check routing_mode: artifact must match --routing flag
+        artifact_rm = compile_info.get('routing_mode', 0)
+        requested_rm = 1 if args.routing == 'hw-filter' else 0
+        if artifact_rm != requested_rm:
+            sys.exit(f"ERROR: artifact was compiled with routing_mode={artifact_rm} "
+                     f"but --routing={'hw-filter' if requested_rm else 'sw-relay'} "
+                     f"(routing_mode={requested_rm}) was requested. Recompile.")
         # Use artifact dims unless explicitly overridden
         if args.num_pes == 2 and args.grid_rows == 1:
             num_cols = compile_info['num_cols']
@@ -1193,6 +1208,22 @@ def main():
         total_pes = num_cols * num_rows
         assert total_pes & (total_pes - 1) == 0, \
             f"total PEs ({total_pes}) must be a power of 2 for hash-based partitioning"
+
+    # HW-filter requires 1D layout
+    if args.routing == 'hw-filter' and num_rows > 1:
+        sys.exit("ERROR: --routing hw-filter requires 1D layout (num_rows=1); "
+                 f"got num_rows={num_rows}. Use --routing sw-relay for 2D.")
+
+    # HW-filter is blocked on WSE-3: interior PEs cannot both receive from
+    # fabric (rx=WEST) and inject from RAMP on the same color — WSE-3 allows
+    # only 1 rx direction per color.  All SDK multi-sender examples use 1-hop
+    # checkerboard (SW-relay).  Color swap (.color_swap_x) is "in development"
+    # for WSE-3; revisit when available.
+    if args.routing == 'hw-filter':
+        sys.exit("ERROR: --routing hw-filter is not supported on WSE-3 (CS-3). "
+                 "WSE-3 allows only 1 rx direction per color, so interior PEs "
+                 "cannot inject from RAMP while also receiving/forwarding from "
+                 "fabric.  Use --routing sw-relay instead.")
 
     root_dir = args.root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     inputs_dir = os.path.join(root_dir, 'tests', 'inputs')
@@ -1249,20 +1280,25 @@ def main():
     # --- Pre-partition overflow prediction (no partition needed) ---
     # Use a conservative max_relay estimate for early warning.
     # This runs on raw edges before any partitioning work.
-    print("Pre-partition relay overflow prediction:")
-    for td in test_data_list:
-        early = predict_relay_overflow(
-            td['num_verts'], td['edges'], num_cols, num_rows,
-            max_relay=100000)  # large value to find actual peak
-        td['relay_peak'] = early['max_load']
-        print(f"  [{td['name']}] peak relay (×headroom): {early['max_load']}, "
-              f"boundary={early['total_boundary']}")
-        # In 1D (num_rows==1), compiler eliminates south/north relay queues
-        relay_dirs = 2 if num_rows <= 1 else 4
-        relay_sram = early['max_load'] * 4 * relay_dirs
-        print(f"    Required max_relay: {early['max_load']} "
-              f"(SRAM cost: {relay_sram:,} bytes, {relay_sram/1024:.1f} KB, "
-              f"{relay_dirs} dirs)")
+    if args.routing == 'hw-filter':
+        print("Pre-partition relay overflow prediction: SKIPPED (HW-filter mode)")
+        for td in test_data_list:
+            td['relay_peak'] = 1  # unused in HW filter mode
+    else:
+        print("Pre-partition relay overflow prediction:")
+        for td in test_data_list:
+            early = predict_relay_overflow(
+                td['num_verts'], td['edges'], num_cols, num_rows,
+                max_relay=100000)  # large value to find actual peak
+            td['relay_peak'] = early['max_load']
+            print(f"  [{td['name']}] peak relay (×headroom): {early['max_load']}, "
+                  f"boundary={early['total_boundary']}")
+            # In 1D (num_rows==1), compiler eliminates south/north relay queues
+            relay_dirs = 2 if num_rows <= 1 else 4
+            relay_sram = early['max_load'] * 4 * relay_dirs
+            print(f"    Required max_relay: {early['max_load']} "
+                  f"(SRAM cost: {relay_sram:,} bytes, {relay_sram/1024:.1f} KB, "
+                  f"{relay_dirs} dirs)")
     print()
 
     # Partition every test and estimate per-PE SRAM usage.
@@ -1332,8 +1368,12 @@ def main():
     test_data_list = fitting_tests
 
     # max_relay: relay buffer size for checkerboard SW relay.
-    # Use the actual peak relay load from predict_relay_overflow.
-    max_relay = max(td.get('relay_peak', 1) for td in test_data_list)
+    # HW filter mode: no relay needed, use minimal allocation.
+    routing_mode = 1 if args.routing == 'hw-filter' else 0
+    if routing_mode == 1:
+        max_relay = 1  # minimal — relay queues unused in HW filter mode
+    else:
+        max_relay = max(td.get('relay_peak', 1) for td in test_data_list)
 
     # Compute max_list_size (T) for Picasso color lists
     max_n = max(td['num_verts'] for td in test_data_list)
@@ -1359,11 +1399,31 @@ def main():
         max(2, int(args.palette_frac * td['num_verts']))
         for td in test_data_list
     ) if test_data_list else 30
-    # Round up to next power of 2 for alignment, minimum 32
-    mps = 32
-    while mps < max_palette_size:
-        mps *= 2
-    max_palette_size = mps
+    if routing_mode == 1:
+        # HW-filter: 5-bit color encoding caps at 30 (color 31 → col+1=32
+        # wraps to 0 in lower 5 bits, colliding with the done sentinel).
+        # Cap instead of rounding to power-of-2.
+        max_palette_size = min(max(max_palette_size, 2), 30)
+    else:
+        # Round up to next power of 2 for alignment, minimum 32
+        mps = 32
+        while mps < max_palette_size:
+            mps *= 2
+        max_palette_size = mps
+
+    # HW-filter encoding cap checks (after max_palette_size is computed):
+    #   color+1 in 5 bits → max color value 30  (31 → col+1=32 wraps to 0 = done sentinel)
+    #   sender_gid in 11 bits → max GID 2047 per PE
+    if routing_mode == 1:
+        if max_palette_size > 30:
+            sys.exit(f"ERROR: HW-filter encoding caps color at 30 "
+                     f"(got max_palette_size={max_palette_size}). "
+                     f"Reduce --palette-frac or --max-palette-size.")
+        max_gid_per_pe = max(td['num_verts'] for td in test_data_list)
+        if max_gid_per_pe > 2047:
+            sys.exit(f"ERROR: HW-filter encoding caps global vertex ID at 2047 "
+                     f"(got max vertex count={max_gid_per_pe}). "
+                     f"Use more PEs or --routing sw-relay.")
 
     compiled_dir = None
     if args.mode == 'appliance':
@@ -1390,7 +1450,7 @@ def main():
         compiled_dir = os.path.join(root_dir, 'csl_compiled_out')
         ok = compile_csl(csl_dir, num_cols, num_rows, max_lv, max_le,
                          max_bnd, max_relay, max_palette_size,
-                         max_list_size, compiled_dir)
+                         max_list_size, routing_mode, compiled_dir)
         if not ok:
             sys.exit(1)
     print()

@@ -36,6 +36,7 @@ MAX_LIST_SIZE="8"
 MAX_ROUNDS="30"
 HEADROOM="1.5"
 SKIP_COMPILE="0"
+ROUTING_MODE="0"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -52,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --max-rounds)        MAX_ROUNDS="$2"; shift 2 ;;
     --headroom)          HEADROOM="$2"; shift 2 ;;
     --no-compile)        SKIP_COMPILE="1"; shift ;;
+    --hw-filter)         ROUTING_MODE="1"; shift ;;
     -h|--help)           sed -n '1,20p' "$0"; exit 0 ;;
     -*)                  die "unknown flag: $1" ;;
     *)                   [[ -z "$TEST_NAME" ]] && TEST_NAME="$1" || die "extra arg: $1"; shift ;;
@@ -108,6 +110,11 @@ import json,sys
 b=json.loads(sys.argv[1])
 print(b["max_lv"],b["max_le"],b["max_bnd"],b["max_relay"])
 ' "$BOUNDS_JSON")"
+# HW filter mode: relay queues unused, override to minimal
+if [[ "$ROUTING_MODE" == "1" ]]; then
+  MAX_RELAY=1
+  echo "    HW-filter mode: max_relay overridden to 1"
+fi
 echo "    derived: max_lv=${MAX_LV} max_le=${MAX_LE} max_bnd=${MAX_BND} max_relay=${MAX_RELAY}"
 echo
 
@@ -142,6 +149,7 @@ else
       --max-local-verts ${MAX_LV} --max-local-edges ${MAX_LE} \
       --max-boundary ${MAX_BND} --max-relay ${MAX_RELAY} \
       --max-palette-size ${MAX_PALETTE_SIZE} --max-list-size ${MAX_LIST_SIZE} \
+      --routing-mode ${ROUTING_MODE} \
       --hardware --output ${ARTIFACT}
   '" 2>&1 | tee "${LOG_DIR}/compile.log"
   echo "    artifact: ${ARTIFACT}"
@@ -155,6 +163,11 @@ REMOTE_LOG="${REMOTE_LOG_DIR}/${TEST_NAME}_${NUM_PES}pe_${TS}.log"
 echo "[4/5] Launching on CS-3 hardware (this blocks until the job finishes)..."
 echo "      Golden: ${GOLDEN_DIR}  Palette frac: ${PALETTE_FRAC}  Alpha: ${ALPHA}"
 echo "      Remote log (tail anytime):  ssh ${REMOTE} 'tail -f ${REMOTE_LOG}'"
+ROUTING_FLAG=""
+if [[ "$ROUTING_MODE" == "1" ]]; then
+  ROUTING_FLAG="--routing hw-filter"
+fi
+
 ssh -tt "$REMOTE" "bash -lc '
   mkdir -p ${REMOTE_LOG_DIR} &&
   cd ${REMOTE_ROOT} &&
@@ -169,6 +182,7 @@ ssh -tt "$REMOTE" "bash -lc '
     --palette-frac ${PALETTE_FRAC} --alpha ${ALPHA} \
     --max-rounds ${MAX_ROUNDS} \
     --output-dir tests/cerebras-runs-${TEST_NAME}-${NUM_PES}pe-hw \
+    ${ROUTING_FLAG} \
     2>&1 | tee ${REMOTE_LOG}
 '" 2>&1 | tee "${LOG_DIR}/run.log"
 echo

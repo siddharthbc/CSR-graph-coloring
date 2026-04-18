@@ -32,6 +32,8 @@ def main():
                         help='Compile-time max palette size (sizes forbidden[] array)')
     parser.add_argument('--max-list-size', type=int, default=16,
                         help='Max colors per vertex list (Picasso T parameter)')
+    parser.add_argument('--routing-mode', type=int, default=0,
+                        help='Routing mode: 0=SW relay (default), 1=HW filter')
     parser.add_argument('--csl-dir', type=str, default=None,
                         help='Path to CSL source directory (default: ../csl)')
     parser.add_argument('--output', type=str, default='artifact_path.json',
@@ -77,7 +79,8 @@ def main():
         f"max_boundary:{args.max_boundary},"
         f"max_relay:{args.max_relay},"
         f"max_palette_size:{args.max_palette_size},"
-        f"max_list_size:{args.max_list_size}"
+        f"max_list_size:{args.max_list_size},"
+        f"routing_mode:{args.routing_mode}"
     )
 
     # --arch flag: wse2 (default) for simulator, wse3 for CS-3 hardware
@@ -123,6 +126,7 @@ def main():
         "max_relay": args.max_relay,
         "max_palette_size": args.max_palette_size,
         "max_list_size": args.max_list_size,
+        "routing_mode": args.routing_mode,
         "hardware": args.hardware,
     }
     with open(args.output, 'w', encoding='utf8') as f:

@@ -13,6 +13,8 @@
 //   - In 2D mode, queues 4,5 are occupied by N/S data → barrier is
 //     implemented as in-band control tokens on the existing data colors
 //     (see pe_program.csl 2D Barrier Protocol section).
+//     NOTE: dedicated-color barrier is BLOCKED on WSE-3 — memcpy claims
+//     Q0/Q1, and WSE-3 has only 6 queues (Q0-Q5), leaving zero free.
 //
 // BSP round: Speculate → Send → Recv (relay) → BARRIER → Detect/Resolve → loop
 
@@ -24,6 +26,10 @@ param max_boundary: i16;
 param max_relay: i16;
 param max_palette_size: i16;  // compile-time max (sizes forbidden[] array)
 param max_list_size: i16;     // T: max colors per vertex list (Picasso)
+param routing_mode: i16 = 0;  // 0 = SW relay, 1 = HW filter (1D only)
+
+// Derived flag: HW filter is only valid for 1D grids
+const use_hw_filter_flag: bool = (routing_mode == 1) and (num_rows == 1);
 
 // East/West fabric colors (always used)
 const east_color_0: color = @get_color(0);
@@ -72,9 +78,15 @@ layout {
       const is_north = (row == 0);
       const is_south = (row == num_rows - 1);
 
-      // E/W checkerboard colors — same pattern for 1D and 2D.
-      // Alternating send/recv colors by parity prevents send-recv collision.
-      const ew_colors = if (parity == 0) .{
+      // E/W color assignment.
+      // HW filter (1D): single color per direction (filter handles delivery).
+      // SW relay: checkerboard alternation prevents send-recv collision.
+      const ew_colors = if (use_hw_filter_flag) .{
+        .send_east_color  = east_color_0,
+        .send_west_color  = west_color_0,
+        .recv_east_color  = east_color_0,
+        .recv_west_color  = west_color_0,
+      } else if (parity == 0) .{
         .send_east_color  = east_color_0,
         .send_west_color  = west_color_1,
         .recv_east_color  = west_color_0,
@@ -115,6 +127,7 @@ layout {
           .is_east_edge    = is_east,
           .is_north_edge   = is_north,
           .is_south_edge   = is_south,
+          .use_hw_filter   = use_hw_filter_flag,
         }, ew_colors),
         ns_colors),
         // Sync barrier params (1D only; 2D uses in-band tokens)
@@ -131,19 +144,72 @@ layout {
         },
       ));
 
-      // ── E/W route configs: checkerboard routing (1D and 2D) ──
-      // Even-parity PEs send on color_0, recv on color_1; odd PEs swap.
-      // Each wavelet travels one hop; software relay forwards to next hop.
-      if (parity == 0) {
-        @set_color_config(col, row, east_color_0, .{ .routes = RX_R_TX_E });
-        @set_color_config(col, row, east_color_1, .{ .routes = RX_W_TX_R });
-        @set_color_config(col, row, west_color_0, .{ .routes = RX_E_TX_R });
-        @set_color_config(col, row, west_color_1, .{ .routes = RX_R_TX_W });
+      // ── E/W route configs ──
+      if (use_hw_filter_flag) {
+        // HW filter: 1D pass-through routing on single color per direction.
+        // Non-destination PEs forward at wire speed (~1 cycle/hop).
+        //
+        // *** WSE-3 KNOWN LIMITATION ***
+        // Interior PEs have rx=WEST (or rx=EAST), NOT rx=RAMP.
+        // WSE-3 allows only 1 rx direction per color, so interior PEs
+        // CANNOT inject from RAMP — output queues are never drained.
+        // Only edge PEs (with rx=RAMP) can inject.
+        // This mode is blocked in run_csl_tests.py for WSE-3.
+        // Potential fix: color swap (.color_swap_x) is "in development"
+        // for WSE-3. When available, use inject-color + swap-to-flow-color.
+        const pe_filter = .{
+          .kind = .{ .range = true },
+          .min_idx = pe_idx,
+          .max_idx = pe_idx,
+        };
+
+        // Eastward traffic on east_color_0
+        if (is_east) {
+          @set_color_config(col, row, east_color_0, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+            .filter = pe_filter,
+          });
+        } else if (is_west) {
+          @set_color_config(col, row, east_color_0, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+          });
+        } else {
+          @set_color_config(col, row, east_color_0, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP, EAST } },
+            .filter = pe_filter,
+          });
+        }
+
+        // Westward traffic on west_color_0
+        if (is_west) {
+          @set_color_config(col, row, west_color_0, .{
+            .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP } },
+            .filter = pe_filter,
+          });
+        } else if (is_east) {
+          @set_color_config(col, row, west_color_0, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST } },
+          });
+        } else {
+          @set_color_config(col, row, west_color_0, .{
+            .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP, WEST } },
+            .filter = pe_filter,
+          });
+        }
       } else {
-        @set_color_config(col, row, east_color_0, .{ .routes = RX_W_TX_R });
-        @set_color_config(col, row, east_color_1, .{ .routes = RX_R_TX_E });
-        @set_color_config(col, row, west_color_0, .{ .routes = RX_R_TX_W });
-        @set_color_config(col, row, west_color_1, .{ .routes = RX_E_TX_R });
+        // SW relay: checkerboard routing (1D and 2D)
+        // Even-parity PEs send on color_0, recv on color_1; odd PEs swap.
+        if (parity == 0) {
+          @set_color_config(col, row, east_color_0, .{ .routes = RX_R_TX_E });
+          @set_color_config(col, row, east_color_1, .{ .routes = RX_W_TX_R });
+          @set_color_config(col, row, west_color_0, .{ .routes = RX_E_TX_R });
+          @set_color_config(col, row, west_color_1, .{ .routes = RX_R_TX_W });
+        } else {
+          @set_color_config(col, row, east_color_0, .{ .routes = RX_W_TX_R });
+          @set_color_config(col, row, east_color_1, .{ .routes = RX_R_TX_E });
+          @set_color_config(col, row, west_color_0, .{ .routes = RX_R_TX_W });
+          @set_color_config(col, row, west_color_1, .{ .routes = RX_E_TX_R });
+        }
       }
 
       // ── N/S route configs (only when 2D) ──
