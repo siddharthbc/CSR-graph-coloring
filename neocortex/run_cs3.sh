@@ -131,13 +131,14 @@ echo
 if [[ "$SKIP_COMPILE" == "1" ]]; then
   echo "[3/5] SKIP compile (--no-compile). Re-using ${ARTIFACT} on remote."
 else
+  NUM_COLS=$((NUM_PES / GRID_ROWS))
   echo "[3/5] Recompiling on CS-3 user node for hardware (WSE-3)..."
   ssh "$REMOTE" "bash -lc '
     cd ${REMOTE_ROOT} &&
     source ~/picasso_venv/bin/activate &&
     rm -f ${ARTIFACT} &&
     python neocortex/compile_appliance.py \
-      --num-cols ${NUM_PES} --num-rows ${GRID_ROWS} \
+      --num-cols ${NUM_COLS} --num-rows ${GRID_ROWS} \
       --max-local-verts ${MAX_LV} --max-local-edges ${MAX_LE} \
       --max-boundary ${MAX_BND} --max-relay ${MAX_RELAY} \
       --max-palette-size ${MAX_PALETTE_SIZE} --max-list-size ${MAX_LIST_SIZE} \

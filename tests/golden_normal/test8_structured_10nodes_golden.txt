@@ -1,0 +1,90 @@
+Using 32-bit offsets
+Temp Storage Bytes: 767
+Current Bytes: 44
+Fits: 232 < 360
+***********Level 0*******
+Num Nodes: 10
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 1
+List Size: 1
+Num Conflict Edges: 29
+Conflict to Edge (%): inf
+Num Colors: 1
+Assign Time: 0.191084
+Conf. Build Time: 0.014778
+Conf. Color Time: 8.749e-06
+
+Color Assignment (Level 0): -2 -2 -2 -2 0 -2 0 -2 -2 -2
+Temp Storage Bytes: 767
+Current Bytes: 44
+Fits: 144 < 224
+***********Level 1*******
+Num Nodes: 8
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 1
+List Size: 1
+Num Conflict Edges: 18
+Conflict to Edge (%): inf
+Num Colors: 2
+Assign Time: 0.000120465
+Conf. Build Time: 0.00768226
+Conf. Color Time: 8.123e-06
+
+Color Assignment (Level 1): -2 -2 -2 1 0 -2 0 1 -2 -2
+Temp Storage Bytes: 767
+Current Bytes: 44
+Fits: 80 < 120
+***********Level 2*******
+Num Nodes: 6
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 1
+List Size: 1
+Num Conflict Edges: 10
+Conflict to Edge (%): inf
+Num Colors: 3
+Assign Time: 5.2653e-05
+Conf. Build Time: 0.00784751
+Conf. Color Time: 4.868e-06
+
+Color Assignment (Level 2): -2 -2 -2 1 0 -2 0 1 2 -2
+Temp Storage Bytes: 767
+Current Bytes: 44
+Fits: 40 < 80
+***********Level 3*******
+Num Nodes: 5
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 1
+List Size: 1
+Num Conflict Edges: 5
+Conflict to Edge (%): inf
+Num Colors: 4
+Assign Time: 3.3245e-05
+Conf. Build Time: 0.0151255
+Conf. Color Time: 6.649e-06
+
+Color Assignment (Level 3): -2 -2 3 1 0 3 0 1 2 -2
+Temp Storage Bytes: 767
+Current Bytes: 44
+Fits: 8 < 24
+***********Level 4*******
+Num Nodes: 3
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 1
+List Size: 1
+Num Conflict Edges: 1
+Conflict to Edge (%): inf
+Num Colors: 5
+Assign Time: 4.1069e-05
+Conf. Build Time: 0.00447354
+Conf. Color Time: 3.921e-06
+
+Color Assignment (Level 4): -2 4 3 1 0 3 0 1 2 4
+Final Num invalid Vert: 1
+Naive Color TIme: 7.09988e-08
+# of Final colors: 6
+Color Assignment (Level -1): 5 4 3 1 0 3 0 1 2 4

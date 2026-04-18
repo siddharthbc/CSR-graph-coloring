@@ -1257,9 +1257,12 @@ def main():
         td['relay_peak'] = early['max_load']
         print(f"  [{td['name']}] peak relay (×headroom): {early['max_load']}, "
               f"boundary={early['total_boundary']}")
-        relay_sram = early['max_load'] * 4 * 4
+        # In 1D (num_rows==1), compiler eliminates south/north relay queues
+        relay_dirs = 2 if num_rows <= 1 else 4
+        relay_sram = early['max_load'] * 4 * relay_dirs
         print(f"    Required max_relay: {early['max_load']} "
-              f"(SRAM cost: {relay_sram:,} bytes, {relay_sram/1024:.1f} KB)")
+              f"(SRAM cost: {relay_sram:,} bytes, {relay_sram/1024:.1f} KB, "
+              f"{relay_dirs} dirs)")
     print()
 
     # Partition every test and estimate per-PE SRAM usage.
@@ -1287,18 +1290,23 @@ def main():
         #   global_vertex_ids:    max_lv * 4
         #   color_list:           max_lv * max_list_size_est * 4
         #   list_len:             max_lv * 4
-        #   boundary arrays (6):  max_bnd * 4 * 6
-        #   send bufs (4):        max_bnd * 4 * 4
-        #   relay bufs (4):       relay_peak * 4 * 4
+        #   boundary arrays (4):  max_bnd * 4 * 4
+        #   send bufs (2 or 4):   max_bnd * 4 * send_dirs
+        #   relay bufs (2 or 4):  relay_peak * 4 * relay_dirs
+        # In 1D mode (num_rows==1), the CSL compiler eliminates south/north
+        # send buffers and relay queues (dead code — no N/S routes configured).
         td_relay = td.get('relay_peak', 1)
         max_ls_est = max(1, int(args.alpha * math.log(max(td['num_verts'], 2))))
+        relay_dirs = 2 if num_rows <= 1 else 4
+        send_dirs = 2 if num_rows <= 1 else 4
         sram_est = (PE_FIXED_OVERHEAD
                     + td_max_le * 4                # csr_adj
                     + (td_max_lv + 1) * 4          # csr_offsets
                     + td_max_lv * 4 * 5            # colors, tentative, gids, list_len, forbidden
                     + td_max_lv * max_ls_est * 4   # color_list
-                    + td_max_bnd * 4 * 8           # boundary (4) + send bufs (4)
-                    + td_relay * 4 * 4)            # relay bufs (actual peak)
+                    + td_max_bnd * 4 * 4           # boundary arrays (always 4: idx, gid, dir, recv)
+                    + td_max_bnd * 4 * send_dirs   # send bufs (E/W only in 1D)
+                    + td_relay * 4 * relay_dirs)   # relay bufs (E/W only in 1D)
 
         td['sram_est'] = sram_est
         if sram_est > PE_SRAM_BUDGET:

@@ -1,0 +1,56 @@
+Using 32-bit offsets
+Temp Storage Bytes: 767
+Current Bytes: 360
+Fits: 15904 < 31328
+***********Level 0*******
+Num Nodes: 89
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 11
+List Size: 8
+Num Conflict Edges: 1988
+Conflict to Edge (%): inf
+Num Colors: 11
+Assign Time: 2.38871
+Conf. Build Time: 0.00892508
+Conf. Color Time: 8.0218e-05
+
+Color Assignment (Level 0): 4 3 -2 3 10 -2 -2 1 -2 7 -2 -2 10 0 6 8 -2 3 9 -2 5 -2 -2 1 8 9 6 -2 6 0 10 6 10 3 -2 -2 5 -2 0 7 -2 1 -2 1 -2 -2 0 7 -2 2 -2 2 2 7 -2 -2 -2 8 0 3 9 7 -2 3 10 -2 6 -2 1 -2 8 9 8 -2 5 -2 8 9 5 -2 10 0 2 5 2 3 -2 -2 2
+Temp Storage Bytes: 767
+Current Bytes: 360
+Fits: 1928 < 3968
+***********Level 1*******
+Num Nodes: 32
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 4
+List Size: 4
+Num Conflict Edges: 241
+Conflict to Edge (%): inf
+Num Colors: 15
+Assign Time: 3.5977e-05
+Conf. Build Time: 0.0059675
+Conf. Color Time: 2.3957e-05
+
+Color Assignment (Level 1): 4 3 13 3 10 12 14 1 14 7 14 -2 10 0 6 8 -2 3 9 14 5 12 13 1 8 9 6 -2 6 0 10 6 10 3 -2 -2 5 12 0 7 14 1 -2 1 11 12 0 7 13 2 14 2 2 7 11 -2 13 8 0 3 9 7 -2 3 10 11 6 11 1 11 8 9 8 12 5 -2 8 9 5 -2 10 0 2 5 2 3 -2 -2 2
+Temp Storage Bytes: 767
+Current Bytes: 360
+Fits: 240 < 528
+***********Level 2*******
+Num Nodes: 12
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 1
+List Size: 1
+Num Conflict Edges: 30
+Conflict to Edge (%): inf
+Num Colors: 16
+Assign Time: 2.3228e-05
+Conf. Build Time: 0.00910199
+Conf. Color Time: 5.502e-06
+
+Color Assignment (Level 2): 4 3 13 3 10 12 14 1 14 7 14 -2 10 0 6 8 -2 3 9 14 5 12 13 1 8 9 6 -2 6 0 10 6 10 3 -2 15 5 12 0 7 14 1 -2 1 11 12 0 7 13 2 14 2 2 7 11 -2 13 8 0 3 9 7 -2 3 10 11 6 11 1 11 8 9 8 12 5 15 8 9 5 -2 10 0 2 5 2 3 15 -2 2
+Final Num invalid Vert: 9
+Naive Color TIme: 1.535e-06
+# of Final colors: 21
+Color Assignment (Level -1): 4 3 13 3 10 12 14 1 14 7 14 16 10 0 6 8 20 3 9 14 5 12 13 1 8 9 6 16 6 0 10 6 10 3 17 15 5 12 0 7 14 1 17 1 11 12 0 7 13 2 14 2 2 7 11 18 13 8 0 3 9 7 19 3 10 11 6 11 1 11 8 9 8 12 5 15 8 9 5 19 10 0 2 5 2 3 15 17 2

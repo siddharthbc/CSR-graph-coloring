@@ -409,10 +409,21 @@ fn shrink_color_lists() void {
 //
 // HW filter mode (1D): [31:16]=dest_pe  [15:5]=sender_gid [4:0]=color+1
 //   Filter matches on [31:16]; task receives only lower 16 bits.
-// SW relay mode  (2D): [31:16]=sender_gid [15:8]=dest_pe  [7:0]=color+1
+// SW relay mode  (2D): [31:16]=sender_gid [15:8]=dest_pe  [7:0]=opcode
 //   Task receives full 32. Relay PEs inspect dest_pe to route.
-//   8 bits for color → max 255 usable colors per level (relative mode).
+//   Low byte opcodes: 0=done, 1=row_reduce, 2=col_reduce,
+//     3=col_bcast, 4=row_bcast, >=5 means data color = byte - 5.
 //   8 bits for dest_pe → max 256 PEs.
+//
+// Barrier wavelets (2D only, SW relay): [15:8]=round_parity, [7:0]=opcode
+//   Sent one-hop at a time, never routed through relay queues.
+
+const OPCODE_DONE: u32 = 0;
+const OPCODE_ROW_REDUCE: u32 = 1;
+const OPCODE_COL_REDUCE: u32 = 2;
+const OPCODE_COL_BCAST: u32 = 3;
+const OPCODE_ROW_BCAST: u32 = 4;
+const DATA_COLOR_OFFSET: u32 = 5;
 
 fn pack_wavelet(gid: i32, dest_pe: i32, col: i32) u32 {
   if (use_hw_filter) {
@@ -422,12 +433,32 @@ fn pack_wavelet(gid: i32, dest_pe: i32, col: i32) u32 {
     const col_part = @as(u32, @as(u16, @as(i16, col + 1))) & 0x1F;
     return upper | gid_part | col_part;
   } else {
-    // SW relay: sender_gid in upper 16, dest_pe in [15:8], color in [7:0]
+    // SW relay: sender_gid in upper 16, dest_pe in [15:8], opcode in [7:0]
+    // Data: color + DATA_COLOR_OFFSET; Done sentinel: OPCODE_DONE (0)
     const id_part = @as(u32, @as(u16, @as(i16, gid)));
     const dpe_part = (@as(u32, @as(u16, @as(i16, dest_pe))) & 0xFF) << 8;
-    const col_part = @as(u32, @as(u16, @as(i16, col + 1))) & 0xFF;
+    const col_part = if (col < 0)
+      OPCODE_DONE
+    else
+      (@as(u32, @as(u16, @as(i16, col))) + DATA_COLOR_OFFSET) & 0xFF;
     return (id_part << 16) | dpe_part | col_part;
   }
+}
+
+/// Pack a barrier control wavelet (2D only). Carries round parity
+/// so stale tokens from a prior round are dropped.
+fn pack_barrier(opcode: u32) u32 {
+  return ((@as(u32, current_round) & 1) << 8) | opcode;
+}
+
+/// Pack a barrier token with OR-reduce flag in bit 9.
+fn pack_barrier_flag(opcode: u32, flag: u32) u32 {
+  return ((flag & 1) << 9) | ((@as(u32, current_round) & 1) << 8) | opcode;
+}
+
+/// Extract the OR-reduce flag (bit 9) from a barrier token.
+fn get_barrier_flag(wval: u32) u32 {
+  return (wval >> 9) & 1;
 }
 
 /// Unpack sender GID from wavelet data.
@@ -455,8 +486,22 @@ fn unpack_color(wval: u32) i32 {
   if (use_hw_filter) {
     return @as(i32, wval & 0x1F) - 1;
   } else {
-    return @as(i32, @as(u16, wval & 0xFF)) - 1;
+    // Low byte: 0=done, 1-4=barrier opcodes, >=5=data color+5
+    const low = wval & 0xFF;
+    if (low < DATA_COLOR_OFFSET) return -1;  // control/done
+    return @as(i32, low - DATA_COLOR_OFFSET);
   }
+}
+
+/// Check if a SW-relay wavelet is a barrier control packet (opcodes 1-4).
+fn is_barrier_packet(wval: u32) bool {
+  const low = wval & 0xFF;
+  return low >= OPCODE_ROW_REDUCE and low <= OPCODE_ROW_BCAST;
+}
+
+/// Check if the round parity in a barrier packet matches the current round.
+fn barrier_parity_ok(wval: u32) bool {
+  return ((wval >> 8) & 1) == (@as(u32, current_round) & 1);
 }
 
 /// Compute destination PE index from a global vertex ID (hash-based).
@@ -581,6 +626,17 @@ var local_data_done: bool = false;
 var sync_barrier_done: bool = false;
 var sync_buf = @zeros([1]u32);
 
+// 2D barrier state (meaningful when use_sync_barrier == false, i.e., num_rows > 1)
+// Four-stage in-band token chain:
+//   row_reduce (westbound) → col_reduce (northbound on col 0)
+//   → col_bcast (southbound on col 0) → row_bcast (eastbound)
+var row_reduce_done: bool = false;
+var pending_row_reduce: bool = false;  // row_reduce arrived before local_data_done
+var pending_col_reduce: bool = false;  // col_reduce arrived before row_reduce_done
+var barrier_flag: u32 = 0;             // OR-accumulated has_uncolored flag (2D barrier)
+var pending_row_reduce_flag: u32 = 0;  // cached flag from early-arriving row_reduce token
+var pending_col_reduce_flag: u32 = 0;  // cached flag from early-arriving col_reduce token
+
 fn send_sync_reduce() void {
   var sync_out = @get_dsd(fabout_dsd, .{
     .extent = 1,
@@ -616,9 +672,9 @@ fn maybe_proceed() void {
     // No more relay wavelets can be in flight because every sender
     // has finished and every destination has received all its wavelets.
     block_all_recv();
-    // After barrier, sync_buf[0] holds the OR-reduced "has_uncolored" flag.
-    // If no PE has uncolored vertices (sync_buf[0] == 0) AND we've done at
-    // least one round, we can skip detect_resolve and terminate early.
+    // Both 1D (OR-reduce barrier) and 2D (4-stage OR-reduce barrier)
+    // store the global "has_uncolored" flag in sync_buf[0].
+    // Early exit when no PE has uncolored vertices.
     if (current_round > 0 and sync_buf[0] == 0) {
       @activate(exit_task_id);
     } else {
@@ -630,6 +686,7 @@ fn maybe_proceed() void {
 /// Called when all expected data wavelets have been received.
 fn on_data_complete() void {
   if (use_sync_barrier) {
+    // -- 1D path: row-reduce + broadcast via dedicated barrier colors --
     local_data_done = true;
     if (is_east_edge) {
       if (is_west_edge) {
@@ -650,10 +707,29 @@ fn on_data_complete() void {
     // Check if barrier already done (shouldn't happen first time, but safe)
     maybe_proceed();
   } else {
-    // No barrier (2D mode): block recv and proceed directly.
-    // (2D relay correctness requires done sentinels — future work.)
-    block_all_recv();
-    @activate(detect_resolve_task_id);
+    // -- 2D path: in-band four-stage token barrier --
+    // Do NOT block recv here — barrier tokens arrive via recv handlers.
+    local_data_done = true;
+    if (is_east_edge) {
+      // East-edge PE: initiate row_reduce westward
+      inject_row_reduce();
+    }
+    // If a row_reduce token arrived before we finished data exchange,
+    // process it now that local_data_done is true.
+    if (pending_row_reduce) {
+      pending_row_reduce = false;
+      const merged = pending_row_reduce_flag | sync_buf[0];
+      if (is_west_edge) {
+        row_reduce_done = true;
+        barrier_flag = merged;
+        start_col_reduce_if_ready();
+      } else {
+        // Forward the pending row_reduce west with OR'd flag
+        send_wavelet_west(pack_barrier_flag(OPCODE_ROW_REDUCE, merged));
+      }
+    }
+    // maybe_proceed won't trigger yet (sync_barrier_done still false)
+    maybe_proceed();
   }
 }
 
@@ -1163,10 +1239,166 @@ fn check_completion() void {
 }
 
 // =====================================================================
+// 2D Barrier Protocol (in-band control tokens)
+// =====================================================================
+// Four-stage BSP barrier using the existing fabric colors/recv handlers.
+// Each barrier token travels one hop per handler invocation, same as data.
+// Tokens bypass route_data_wavelet and relay queues entirely.
+//
+// Stage 1 — row_reduce: westbound across each row (recv_east handles it).
+//   East-edge PE injects when local_data_done. Each PE forwards west only
+//   after its own local_data_done is true. West-edge PE sets row_reduce_done.
+// Stage 2 — col_reduce: northbound on column 0 (recv_south handles it).
+//   South-edge PE(0, num_rows-1) injects when row_reduce_done. Each PE(0,row)
+//   forwards north only after its own row_reduce_done is true. PE(0,0) starts
+//   col_bcast.
+// Stage 3 — col_bcast: southbound on column 0 (recv_north handles it).
+//   PE(0,0) injects. Each PE(0,row) forwards south and starts row_bcast.
+// Stage 4 — row_bcast: eastbound across each row (recv_west handles it).
+//   West-edge PE injects. Each PE forwards east. Every PE marks
+//   sync_barrier_done on receipt and calls maybe_proceed().
+
+/// Inject a row_reduce token westward (2D stage 1 initiator).
+fn inject_row_reduce() void {
+  const my_flag = sync_buf[0];
+  if (!is_west_edge) {
+    send_wavelet_west(pack_barrier_flag(OPCODE_ROW_REDUCE, my_flag));
+  } else {
+    // Single-column row: row reduce is trivially done
+    row_reduce_done = true;
+    barrier_flag = my_flag;
+    start_col_reduce_if_ready();
+  }
+}
+
+/// Handle a received row_reduce token (from eastern neighbor).
+fn process_row_reduce(wval: u32) void {
+  if (!barrier_parity_ok(wval)) return;  // stale round — drop
+  if (!local_data_done) {
+    pending_row_reduce = true;
+    pending_row_reduce_flag = get_barrier_flag(wval);
+    return;
+  }
+  const merged = get_barrier_flag(wval) | sync_buf[0];
+  if (is_west_edge) {
+    row_reduce_done = true;
+    barrier_flag = merged;
+    start_col_reduce_if_ready();
+  } else {
+    // Forward west with OR'd flag
+    send_wavelet_west(pack_barrier_flag(OPCODE_ROW_REDUCE, merged));
+  }
+}
+
+/// Check if this PE should inject a col_reduce token (south-west corner).
+fn start_col_reduce_if_ready() void {
+  if (!is_west_edge or !row_reduce_done) return;
+  if (num_rows <= 1) {
+    // Single row: skip col reduce/bcast, go directly to row bcast
+    start_row_bcast();
+    return;
+  }
+  if (is_south_edge) {
+    // Bottom-left PE: inject col_reduce northward with accumulated flag
+    if (!is_north_edge) {
+      send_wavelet_north(pack_barrier_flag(OPCODE_COL_REDUCE, barrier_flag));
+    } else {
+      // 1-row grid (shouldn't reach here with num_rows>1, but safe)
+      start_col_bcast_from_root();
+    }
+  }
+  // Non-south-edge column-0 PEs: wait for col_reduce token from south.
+  // If a pending token arrived early, process it now.
+  if (pending_col_reduce) {
+    pending_col_reduce = false;
+    barrier_flag = barrier_flag | pending_col_reduce_flag;
+    finish_col_reduce_at_this_pe();
+  }
+}
+
+/// Handle a received col_reduce token (from southern neighbor, column 0 only).
+fn process_col_reduce(wval: u32) void {
+  if (!barrier_parity_ok(wval)) return;
+  if (!row_reduce_done) {
+    pending_col_reduce = true;
+    pending_col_reduce_flag = get_barrier_flag(wval);
+    return;
+  }
+  // OR incoming column flag with this row's accumulated flag
+  barrier_flag = barrier_flag | get_barrier_flag(wval);
+  finish_col_reduce_at_this_pe();
+}
+
+fn finish_col_reduce_at_this_pe() void {
+  if (is_north_edge) {
+    // Root PE(0,0): col reduce complete, start col broadcast
+    start_col_bcast_from_root();
+  } else {
+    // Forward north with OR'd flag
+    send_wavelet_north(pack_barrier_flag(OPCODE_COL_REDUCE, barrier_flag));
+  }
+}
+
+/// PE(0,0) starts the column broadcast southward (stage 3).
+fn start_col_bcast_from_root() void {
+  // Root itself starts row_bcast for row 0
+  start_row_bcast();
+  // Send col_bcast south with global flag (if there are rows below)
+  if (!is_south_edge) {
+    send_wavelet_south(pack_barrier_flag(OPCODE_COL_BCAST, barrier_flag));
+  }
+}
+
+/// Handle a received col_bcast token (from northern neighbor, column 0 only).
+fn process_col_bcast(wval: u32) void {
+  if (!barrier_parity_ok(wval)) return;
+  // Propagate global flag from root
+  barrier_flag = get_barrier_flag(wval);
+  // Start row_bcast for this row
+  start_row_bcast();
+  // Forward south if not at south edge
+  if (!is_south_edge) {
+    send_wavelet_south(pack_barrier_flag(OPCODE_COL_BCAST, barrier_flag));
+  }
+}
+
+/// Inject a row_bcast token eastward (2D stage 4 initiator from col 0).
+fn start_row_bcast() void {
+  if (!is_east_edge) {
+    send_wavelet_east(pack_barrier_flag(OPCODE_ROW_BCAST, barrier_flag));
+  }
+  // Store global OR-reduced flag in sync_buf for exit check
+  sync_buf[0] = barrier_flag;
+  // This PE is done with the barrier
+  sync_barrier_done = true;
+  maybe_proceed();
+}
+
+/// Handle a received row_bcast token (from western neighbor).
+fn process_row_bcast(wval: u32) void {
+  if (!barrier_parity_ok(wval)) return;
+  // Propagate global flag
+  barrier_flag = get_barrier_flag(wval);
+  // Forward east if not at east edge
+  if (!is_east_edge) {
+    send_wavelet_east(pack_barrier_flag(OPCODE_ROW_BCAST, barrier_flag));
+  }
+  // Store global OR-reduced flag in sync_buf for exit check
+  sync_buf[0] = barrier_flag;
+  sync_barrier_done = true;
+  maybe_proceed();
+}
+
+// =====================================================================
 // Data tasks: receive wavelets from neighboring PEs
 // =====================================================================
 
 task recv_east(wval: u32) void {
+  // 2D barrier: row_reduce tokens arrive from eastern neighbor (westbound chain)
+  if (num_rows > 1 and is_barrier_packet(wval)) {
+    process_row_reduce(wval);
+    return;
+  }
   perf_counters[2] += 1;
   // Checkerboard routing: every wavelet arrives after one hop.
   // Check dest_pe: if ours, process; otherwise relay towards destination.
@@ -1175,18 +1407,33 @@ task recv_east(wval: u32) void {
 }
 
 task recv_west(wval: u32) void {
+  // 2D barrier: row_bcast tokens arrive from western neighbor (eastbound chain)
+  if (num_rows > 1 and is_barrier_packet(wval)) {
+    process_row_bcast(wval);
+    return;
+  }
   perf_counters[2] += 1;
   route_data_wavelet(wval);
   check_completion();
 }
 
 task recv_south(wval: u32) void {
+  // 2D barrier: col_reduce tokens arrive from southern neighbor (northbound chain)
+  if (is_barrier_packet(wval)) {
+    process_col_reduce(wval);
+    return;
+  }
   perf_counters[2] += 1;
   route_data_wavelet(wval);
   check_completion();
 }
 
 task recv_north(wval: u32) void {
+  // 2D barrier: col_bcast tokens arrive from northern neighbor (southbound chain)
+  if (is_barrier_packet(wval)) {
+    process_col_bcast(wval);
+    return;
+  }
   perf_counters[2] += 1;
   route_data_wavelet(wval);
   check_completion();
@@ -1244,12 +1491,20 @@ task detect_resolve() void {
   sync_buf[0] = if (has_uncolored) @as(u32, 1) else @as(u32, 0);
 
   current_round += 1;
+  reset_round_state();
+  @activate(speculate_task_id);
+}
 
-  // Reset state for next round
+/// Reset all per-round state. Called from both detect_resolve and start_coloring
+/// so the two sites cannot drift.
+fn reset_round_state() void {
   local_send_done = false;
   phase_complete = false;
   local_data_done = false;
   sync_barrier_done = false;
+  row_reduce_done = false;
+  pending_row_reduce = false;
+  pending_col_reduce = false;
   data_recv_remaining = expected_recv[0];
   done_recv_count = 0;
   relay_east_head = 0; relay_east_tail = 0; relay_east_count = 0;
@@ -1257,8 +1512,9 @@ task detect_resolve() void {
   relay_south_head = 0; relay_south_tail = 0; relay_south_count = 0;
   relay_north_head = 0; relay_north_tail = 0; relay_north_count = 0;
   relay_drain_start = 0;
-
-  @activate(speculate_task_id);
+  barrier_flag = 0;
+  pending_row_reduce_flag = 0;
+  pending_col_reduce_flag = 0;
 }
 
 // =====================================================================
@@ -1275,18 +1531,7 @@ fn start_coloring() void {
   }
 
   current_round = 0;
-  local_send_done = false;
-  phase_complete = false;
-  local_data_done = false;
-  sync_barrier_done = false;
-  data_recv_remaining = expected_recv[0];
-  done_recv_count = 0;
-  relay_east_head = 0; relay_east_tail = 0; relay_east_count = 0;
-  relay_west_head = 0; relay_west_tail = 0; relay_west_count = 0;
-  relay_south_head = 0; relay_south_tail = 0; relay_south_count = 0;
-  relay_north_head = 0; relay_north_tail = 0; relay_north_count = 0;
-  relay_drain_start = 0;
-
+  reset_round_state();
   @activate(speculate_task_id);
 }
 

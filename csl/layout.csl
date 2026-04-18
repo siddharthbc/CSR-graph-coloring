@@ -10,7 +10,9 @@
 //   - 3 fabric colors (8-10) for global sync barrier (1D mode only):
 //       C8,C9: row-reduce (last PE → first PE, even/odd alternation)
 //       C10:   broadcast from P(0,0) to all PEs eastward
-//   - In 2D mode, queues 4,5 are occupied by N/S data → no barrier
+//   - In 2D mode, queues 4,5 are occupied by N/S data → barrier is
+//     implemented as in-band control tokens on the existing data colors
+//     (see pe_program.csl 2D Barrier Protocol section).
 //
 // BSP round: Speculate → Send → Recv (relay) → BARRIER → Detect/Resolve → loop
 
@@ -115,7 +117,7 @@ layout {
           .is_south_edge   = is_south,
         }, ew_colors),
         ns_colors),
-        // Sync barrier params (1D only)
+        // Sync barrier params (1D only; 2D uses in-band tokens)
         if (num_rows == 1) .{
           .sync_reduce_recv_color = if (col % 2 == 0) sync_reduce_c0 else sync_reduce_c1,
           .sync_reduce_send_color = if (col % 2 == 0) sync_reduce_c1 else sync_reduce_c0,

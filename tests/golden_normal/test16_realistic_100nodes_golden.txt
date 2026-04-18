@@ -1,0 +1,56 @@
+Using 32-bit offsets
+Temp Storage Bytes: 767
+Current Bytes: 404
+Fits: 19896 < 39600
+***********Level 0*******
+Num Nodes: 100
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 12
+List Size: 9
+Num Conflict Edges: 2487
+Conflict to Edge (%): inf
+Num Colors: 12
+Assign Time: 2.82692
+Conf. Build Time: 0.0474598
+Conf. Color Time: 0.000152258
+
+Color Assignment (Level 0): -2 5 1 4 10 2 8 -2 3 3 -2 3 -2 10 6 -2 8 9 4 -2 -2 3 2 -2 9 -2 7 1 10 -2 2 2 -2 -2 0 -2 -2 5 -2 6 6 5 -2 0 -2 11 -2 11 0 -2 1 -2 5 4 -2 -2 0 11 5 10 6 8 -2 7 0 1 11 -2 -2 8 1 9 -2 2 -2 10 8 -2 9 11 7 -2 -2 4 -2 -2 0 3 -2 7 2 6 9 -2 5 -2 11 0 3 6
+Temp Storage Bytes: 767
+Current Bytes: 404
+Fits: 2240 < 4760
+***********Level 1*******
+Num Nodes: 35
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 4
+List Size: 4
+Num Conflict Edges: 280
+Conflict to Edge (%): inf
+Num Colors: 16
+Assign Time: 7.8698e-05
+Conf. Build Time: 0.0236055
+Conf. Color Time: 4.4324e-05
+
+Color Assignment (Level 1): 13 5 1 4 10 2 8 -2 3 3 -2 3 -2 10 6 15 8 9 4 14 14 3 2 -2 9 15 7 1 10 -2 2 2 13 15 0 13 13 5 15 6 6 5 -2 0 14 11 12 11 0 15 1 12 5 4 -2 13 0 11 5 10 6 8 12 7 0 1 11 -2 -2 8 1 9 12 2 -2 10 8 15 9 11 7 -2 12 4 -2 12 0 3 13 7 2 6 9 -2 5 14 11 0 3 6
+Temp Storage Bytes: 767
+Current Bytes: 404
+Fits: 312 < 624
+***********Level 2*******
+Num Nodes: 13
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 1
+List Size: 1
+Num Conflict Edges: 39
+Conflict to Edge (%): inf
+Num Colors: 17
+Assign Time: 7.215e-05
+Conf. Build Time: 0.0305394
+Conf. Color Time: 1.4473e-05
+
+Color Assignment (Level 2): 13 5 1 4 10 2 8 -2 3 3 -2 3 16 10 6 15 8 9 4 14 14 3 2 16 9 15 7 1 10 16 2 2 13 15 0 13 13 5 15 6 6 5 -2 0 14 11 12 11 0 15 1 12 5 4 -2 13 0 11 5 10 6 8 12 7 0 1 11 -2 -2 8 1 9 12 2 16 10 8 15 9 11 7 -2 12 4 -2 12 0 3 13 7 2 6 9 -2 5 14 11 0 3 6
+Final Num invalid Vert: 9
+Naive Color TIme: 1.54601e-06
+# of Final colors: 23
+Color Assignment (Level -1): 13 5 1 4 10 2 8 17 3 3 18 3 16 10 6 15 8 9 4 14 14 3 2 16 9 15 7 1 10 16 2 2 13 15 0 13 13 5 15 6 6 5 18 0 14 11 12 11 0 15 1 12 5 4 22 13 0 11 5 10 6 8 12 7 0 1 11 19 19 8 1 9 12 2 16 10 8 15 9 11 7 20 12 4 20 12 0 3 13 7 2 6 9 21 5 14 11 0 3 6

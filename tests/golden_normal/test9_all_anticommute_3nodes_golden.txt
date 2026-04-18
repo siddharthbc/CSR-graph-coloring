@@ -1,0 +1,20 @@
+Using 32-bit offsets
+Temp Storage Bytes: 767
+Current Bytes: 16
+Fits: 0 < 24
+***********Level 0*******
+Num Nodes: 3
+Num Edges: 0
+Avg. Deg.: 0
+Palette Size: 1
+List Size: 1
+Num Conflict Edges: 0
+Conflict to Edge (%): -nan
+Num Colors: 1
+Assign Time: 0.176464
+Conf. Build Time: 0.0124677
+Conf. Color Time: 4.14e-06
+
+Color Assignment (Level 0): 0 0 0
+# of Final colors: 1
+Color Assignment (Level -1): 0 0 0
