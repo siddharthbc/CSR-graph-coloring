@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Complex Graph Coloring on Cerebras WSE — 16-Vertex Example</title>
+<style>
+  :root {
+    --bg: #0a0c12; --card: #13151e; --border: #232738;
+    --text: #dde0ea; --dim: #7a7f96; --accent: #6c8cff;
+    --cyan: #22d3ee; --green: #34d399; --red: #f87171;
+    --orange: #fbbf24; --purple: #a78bfa; --pink: #f472b6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.55; }
+  .header { background: linear-gradient(135deg,#111425,#0d0f1a); border-bottom: 1px solid var(--border); padding: 1.6rem 2rem; text-align: center; }
+  .header h1 { font-size: 1.7rem; font-weight: 700; } .header h1 span { color: var(--cyan); }
+  .header p { color: var(--dim); font-size: .88rem; margin-top: .35rem; }
+  .container { max-width: 1300px; margin: 0 auto; padding: 1.5rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.4rem; margin-bottom: 1.3rem; }
+  .card h2 { font-size: 1.05rem; margin-bottom: .6rem; display: flex; align-items: center; gap: .45rem; }
+  .badge { font-size: .65rem; padding: .12rem .55rem; border-radius: 99px; font-weight: 600; }
+  .badge-cyan { background: rgba(34,211,238,.13); color: var(--cyan); }
+  .badge-green { background: rgba(52,211,153,.13); color: var(--green); }
+  .badge-orange { background: rgba(251,191,36,.13); color: var(--orange); }
+  .badge-purple { background: rgba(167,139,250,.13); color: var(--purple); }
+  .badge-red { background: rgba(248,113,113,.13); color: var(--red); }
+  .desc { color: var(--dim); font-size: .85rem; margin-bottom: .8rem; }
+  svg { width: 100%; height: auto; display: block; } svg text { font-family: 'Segoe UI', system-ui, sans-serif; }
+  .ctrl { display: flex; align-items: center; gap: .8rem; margin-top: .8rem; justify-content: center; flex-wrap: wrap; }
+  .btn { padding: .4rem 1.1rem; border-radius: 7px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; font-size: .82rem; transition: all .18s; }
+  .btn:hover { background: var(--cyan); border-color: var(--cyan); color: #111; }
+  .btn:disabled { opacity: .25; cursor: not-allowed; } .btn:disabled:hover { background: var(--card); color: var(--text); }
+  .btn.active { background: var(--cyan); color: #111; border-color: var(--cyan); font-weight: 600; }
+  .info { color: var(--dim); font-size: .82rem; min-width: 90px; text-align: center; }
+  .ann { background: rgba(34,211,238,.07); border: 1px solid rgba(34,211,238,.18); border-radius: 8px; padding: .65rem .9rem; margin-top: .8rem; font-size: .84rem; min-height: 2.2rem; }
+  .ann code { background: rgba(255,255,255,.07); padding: .08rem .35rem; border-radius: 4px; font-size: .78rem; }
+  .legend { display: flex; gap: 1.2rem; flex-wrap: wrap; margin-top: .6rem; font-size: .76rem; color: var(--dim); }
+  .legend-item { display: flex; align-items: center; gap: .3rem; }
+  .legend-dot { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
+  @media(max-width:900px){ .grid2,.grid3{grid-template-columns:1fr;} }
+  .stat-row { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: .7rem; }
+  .stat-box { background: #181b26; border: 1px solid var(--border); border-radius: 8px; padding: .5rem .8rem; min-width: 120px; text-align: center; }
+  .stat-box .num { font-size: 1.3rem; font-weight: 700; } .stat-box .lbl { font-size: .7rem; color: var(--dim); }
+  .tab-row { display: flex; gap: .4rem; flex-wrap: wrap; justify-content: center; margin-bottom: 1.2rem; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Complex Graph Coloring on <span>Cerebras WSE</span></h1>
+  <p>16 vertices · 24 conflict edges · 4 PEs (2×2 grid) · Speculative parallel coloring with wavelet communication</p>
+</div>
+
+<div class="container">
+
+<!-- ===== Input Graph & Partition ===== -->
+<div class="card">
+  <h2>Input: 16-Vertex Conflict Graph <span class="badge badge-cyan">from Pauli commutativity + color-list overlap</span></h2>
+  <p class="desc">This is the conflict graph <em>after</em> Phases ①–③ of Picasso: Pauli strings loaded, palettes assigned, and conflict edges built via COO→CSR. We now need to <b>color</b> this graph on the WSE.</p>
+  <div class="grid2">
+    <div><svg id="svg-input" viewBox="0 0 480 420"></svg></div>
+    <div>
+      <svg id="svg-csr-detail" viewBox="0 0 480 420"></svg>
+    </div>
+  </div>
+  <div class="stat-row" id="input-stats"></div>
+</div>
+
+<!-- ===== PE Partition ===== -->
+<div class="card">
+  <h2>Step 1 — Graph Partitioning onto 2×2 PE Grid <span class="badge badge-green">Host: memcpy_h2d</span></h2>
+  <p class="desc">The host partitions 16 vertices across 4 PEs in a 2×2 grid (4 vertices each). Each PE stores a local CSR slice. Edges spanning PE boundaries are <b>boundary edges</b> requiring wavelet communication.</p>
+  <svg id="svg-partition" viewBox="0 0 1000 460"></svg>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#6c8cff"></div> PE 0 (v0–v3)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#34d399"></div> PE 1 (v4–v7)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fbbf24"></div> PE 2 (v8–v11)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f472b6"></div> PE 3 (v12–v15)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div> Boundary edge</div>
+  </div>
+</div>
+
+<!-- ===== Speculative Coloring Rounds ===== -->
+<div class="card">
+  <h2>Step 2 — Speculative Parallel Coloring Rounds <span class="badge badge-purple">pe_program.csl → color_step()</span></h2>
+  <p class="desc">Each round: all PEs <b>simultaneously</b> pick tentative colors → local conflict check → wavelet exchange → boundary conflict resolve. Repeat until all vertices are colored.</p>
+  <svg id="svg-rounds" viewBox="0 0 1060 520"></svg>
+  <div class="ctrl">
+    <button class="btn" id="r-prev" onclick="roundStep(-1)">← Prev</button>
+    <button class="btn" id="r-auto" onclick="toggleAuto()">▶ Auto-Play</button>
+    <span class="info" id="r-info">Step 1 / 14</span>
+    <button class="btn" id="r-next" onclick="roundStep(1)">Next →</button>
+  </div>
+  <div class="ann" id="r-ann"></div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#555"></div> Uncolored</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#22d3ee"></div> Tentative</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#34d399"></div> Confirmed</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div> Conflict → yield</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fbbf24"></div> Wavelet exchange</div>
+  </div>
+</div>
+
+<!-- ===== Final Result ===== -->
+<div class="card">
+  <h2>Step 3 — Final Result &amp; Verification <span class="badge badge-green">Host: memcpy_d2h</span></h2>
+  <p class="desc">After all rounds complete, the host copies colors back from all PEs via <code>memcpy_d2h</code> and verifies: no two adjacent vertices share a color.</p>
+  <div class="grid2">
+    <div><svg id="svg-final" viewBox="0 0 480 420"></svg></div>
+    <div><svg id="svg-timeline" viewBox="0 0 480 420"></svg></div>
+  </div>
+  <div class="stat-row" id="final-stats"></div>
+</div>
+
+</div>
+
+<script>
+// ========== Graph definition ==========
+const N = 16;
+const EDGES = [
+  [0,1],[0,4],[0,5],[1,2],[1,5],[1,6],[2,3],[2,6],[2,7],
+  [3,7],[4,5],[4,8],[4,9],[5,6],[5,9],[5,10],[6,7],[6,10],[6,11],
+  [7,11],[8,9],[8,12],[9,10],[9,13],[10,11],[10,13],[10,14],[11,14],[11,15],
+  [12,13],[13,14],[14,15]
+];
+// adjacency list
+const ADJ = Array.from({length:N},()=>[]);
+EDGES.forEach(([u,v])=>{ ADJ[u].push(v); ADJ[v].push(u); });
+// CSR
+const offsets = new Array(N+1); offsets[0] = 0;
+const adj = [];
+for(let i=0;i<N;i++){ const nb = [...ADJ[i]].sort((a,b)=>a-b); adj.push(...nb); offsets[i+1]=adj.length; }
+
+// Vertex layout: 4x4 grid
+function vtxPos(i, ox, oy, sp) {
+  const r = Math.floor(i/4), c = i%4;
+  return { x: ox + c*sp, y: oy + r*sp };
+}
+
+const PALETTE = ['#6c8cff','#34d399','#f87171','#fbbf24','#a78bfa','#22d3ee','#f472b6','#fb923c'];
+const CNAMES = ['C0','C1','C2','C3','C4','C5','C6','C7'];
+const PE_COLORS = ['#6c8cff','#34d399','#fbbf24','#f472b6'];
+
+// ========== SVG helpers ==========
+function el(tag,a){const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const[k,v]of Object.entries(a||{}))e.setAttribute(k,v);return e;}
+function rect(s,x,y,w,h,f,st,rx){const r=el('rect',{x,y,width:w,height:h,fill:f,rx:rx||4});if(st){r.setAttribute('stroke',st);r.setAttribute('stroke-width','1.5');}s.appendChild(r);return r;}
+function circ(s,cx,cy,r,f,st,sw){const c=el('circle',{cx,cy,r,fill:f,stroke:st||'none','stroke-width':sw||2});s.appendChild(c);return c;}
+function txt(s,x,y,t,sz,f,a,w){const e=el('text',{x,y,'font-size':sz||12,fill:f||'#dde0ea','text-anchor':a||'middle','dominant-baseline':'central'});if(w)e.setAttribute('font-weight',w);e.textContent=t;s.appendChild(e);return e;}
+function line(s,x1,y1,x2,y2,st,w,d){const l=el('line',{x1,y1,x2,y2,stroke:st||'#333','stroke-width':w||1.5});if(d)l.setAttribute('stroke-dasharray',d);s.appendChild(l);return l;}
+function arrow(s,x1,y1,x2,y2,c,w){
+  const id='a'+Math.random().toString(36).substr(2,5);
+  const defs=el('defs');const mk=el('marker',{id,markerWidth:7,markerHeight:7,refX:6,refY:3.5,orient:'auto'});
+  mk.appendChild(el('path',{d:'M0,0 L7,3.5 L0,7 Z',fill:c||'#555'}));defs.appendChild(mk);s.appendChild(defs);
+  const l=line(s,x1,y1,x2,y2,c,w);l.setAttribute('marker-end',`url(#${id})`);return l;
+}
+
+// ========== 1. Input Graph ==========
+(function drawInput(){
+  const s=document.getElementById('svg-input');
+  const sp=95, ox=75, oy=60;
+  txt(s,240,22,'Conflict Graph (16 vertices, '+EDGES.length+' edges)',11,'#7a7f96');
+  // edges
+  for(const[u,v]of EDGES){
+    const a=vtxPos(u,ox,oy,sp),b=vtxPos(v,ox,oy,sp);
+    line(s,a.x,a.y,b.x,b.y,'#2a2e3a',1);
+  }
+  // vertices
+  for(let i=0;i<N;i++){
+    const p=vtxPos(i,ox,oy,sp);
+    circ(s,p.x,p.y,18,'#181b26','#3a4055');
+    txt(s,p.x,p.y,'v'+i,9,'#dde0ea');
+  }
+  // degree histogram
+  txt(s,240,400,'Degree distribution: min=2, max=6, avg=4.0',9,'#555');
+})();
+
+// ========== CSR Detail ==========
+(function drawCSR(){
+  const s=document.getElementById('svg-csr-detail');
+  txt(s,240,18,'CSR Arrays (scipy.sparse.csr_array)',11,'#7a7f96');
+  // offsets row
+  txt(s,15,48,'offsets',9,'#7a7f96','start');
+  const ow=26;
+  for(let i=0;i<=N;i++){
+    const x=15+i*ow; if(i>0) rect(s,x,55,ow-2,20,'#13151e','#232738',3);
+    if(i>0) txt(s,x+(ow-2)/2,65,offsets[i],7,'#6c8cff');
+    if(i<=N && i>0) txt(s,x+(ow-2)/2,82,i-1,6,'#444');
+  }
+  // first part of adj
+  txt(s,15,105,'adj[0..31]',9,'#7a7f96','start');
+  for(let i=0;i<Math.min(adj.length,32);i++){
+    const r=Math.floor(i/16), c=i%16;
+    const x=15+c*ow, y=118+r*28;
+    rect(s,x,y,ow-2,20,'#13151e','#232738',3);
+    txt(s,x+(ow-2)/2,y+10,adj[i],7,'#34d399');
+  }
+  // adj continued
+  if(adj.length>32){
+    txt(s,15,175,'adj[32..'+adj.length+']',9,'#7a7f96','start');
+    for(let i=32;i<adj.length;i++){
+      const r=Math.floor((i-32)/16), c=(i-32)%16;
+      const x=15+c*ow, y=188+r*28;
+      rect(s,x,y,ow-2,20,'#13151e','#232738',3);
+      txt(s,x+(ow-2)/2,y+10,adj[i],7,'#34d399');
+    }
+  }
+  // neighbor lookup examples
+  let ny = 260;
+  txt(s,15,ny,'Neighbor lookups via CSR:',10,'#7a7f96','start'); ny+=22;
+  const examples = [0,5,10,15];
+  for(const v of examples){
+    const nb = [];
+    for(let j=offsets[v];j<offsets[v+1];j++) nb.push('v'+adj[j]);
+    txt(s,15,ny,`neighbors_of(v${v}): adj[${offsets[v]}..${offsets[v+1]}] → [${nb.join(',')}]`,8,'#34d399','start');
+    ny+=18;
+  }
+  // Memory estimate
+  ny+=10;
+  const totalBytes = (N+1+adj.length)*4;
+  txt(s,15,ny,`Total CSR storage: ${N+1} offsets + ${adj.length} adj = ${totalBytes} bytes`,9,'#a78bfa','start');
+  txt(s,15,ny+16,`Per PE (4 vertices): ~${Math.ceil(totalBytes/4)} bytes — well within 48KB`,9,'#555','start');
+})();
+
+// ========== Input stats ==========
+(function(){
+  const d=document.getElementById('input-stats');
+  const stats = [
+    {num:N,lbl:'Vertices'},{num:EDGES.length,lbl:'Conflict Edges'},
+    {num:'2–6',lbl:'Degree Range'},{num:4,lbl:'PEs (2×2)'},{num:'48KB',lbl:'SRAM / PE'}
+  ];
+  for(const st of stats){
+    const box = document.createElement('div'); box.className='stat-box';
+    box.innerHTML=`<div class="num" style="color:var(--cyan)">${st.num}</div><div class="lbl">${st.lbl}</div>`;
+    d.appendChild(box);
+  }
+})();
+
+// ========== 2. Partition ==========
+(function drawPartition(){
+  const s=document.getElementById('svg-partition');
+  const sp=65, ox=70, oy=55;
+  // PE boxes (2x2)
+  const peBoxes = [
+    {x:ox-30,y:oy-30,w:sp*3+60,h:sp+60,label:'PE 0 (v0–v3)'},
+    {x:ox+sp*3+40,y:oy-30,w:sp*3+60,h:sp+60,label:'PE 1 (v4–v7)'},
+    {x:ox-30,y:oy+sp+50,w:sp*3+60,h:sp+60,label:'PE 2 (v8–v11)'},
+    {x:ox+sp*3+40,y:oy+sp+50,w:sp*3+60,h:sp+60,label:'PE 3 (v12–v15)'},
+  ];
+  for(let p=0;p<4;p++){
+    const b=peBoxes[p];
+    rect(s,b.x,b.y,b.w,b.h,PE_COLORS[p]+'08',PE_COLORS[p]+'40',10);
+    txt(s,b.x+b.w/2,b.y+14,b.label,9,PE_COLORS[p],'middle','600');
+  }
+
+  // Vertex positions within PE boxes
+  function vpos(i){
+    const pe=Math.floor(i/4), li=i%4;
+    const pb=peBoxes[pe];
+    return {x: pb.x+30+li*sp, y: pb.y+55};
+  }
+
+  // Classify edges
+  for(const[u,v]of EDGES){
+    const pu=Math.floor(u/4),pv=Math.floor(v/4);
+    const a=vpos(u),b=vpos(v);
+    const isBoundary = pu!==pv;
+    line(s,a.x,a.y,b.x,b.y, isBoundary?'#f87171':'#2a2e3a60', isBoundary?1.8:1, isBoundary?'4,3':'');
+  }
+  // Vertices
+  for(let i=0;i<N;i++){
+    const p=vpos(i), pe=Math.floor(i/4);
+    circ(s,p.x,p.y,16,PE_COLORS[pe]+'20',PE_COLORS[pe]);
+    txt(s,p.x,p.y,'v'+i,8,'#dde0ea');
+  }
+
+  // Count boundary edges
+  let boundaryCount=0, localCount=0;
+  for(const[u,v]of EDGES){ Math.floor(u/4)===Math.floor(v/4)?localCount++:boundaryCount++; }
+
+  // Stats
+  txt(s,500,230,`Local edges: ${localCount}`,10,'#34d399','start');
+  txt(s,500,248,`Boundary edges: ${boundaryCount} (need wavelet exchange)`,10,'#f87171','start');
+
+  // PE memory layout
+  const my=280;
+  txt(s,50,my,'Local CSR per PE (memcpy_h2d from host):',11,'#7a7f96','start');
+  for(let p=0;p<4;p++){
+    const bx=50+p*240, by=my+20;
+    rect(s,bx,by,220,140,PE_COLORS[p]+'06',PE_COLORS[p]+'30',8);
+    txt(s,bx+110,by+15,`PE ${p}  (v${p*4}–v${p*4+3})`,9,PE_COLORS[p],'middle','600');
+
+    // Local offsets
+    const lo=[0]; let lAdj=[];
+    for(let vi=0;vi<4;vi++){
+      const gv=p*4+vi;
+      const localNb=[];
+      for(let j=offsets[gv];j<offsets[gv+1];j++){
+        localNb.push(adj[j]);
+      }
+      lAdj.push(...localNb);
+      lo.push(lAdj.length);
+    }
+    txt(s,bx+8,by+35,'off: ['+lo.join(',')+']',7,'#6c8cff','start');
+    // Show adj in chunks
+    const chunk1 = lAdj.slice(0,10).join(',');
+    const chunk2 = lAdj.length>10 ? ','+lAdj.slice(10).join(',') : '';
+    txt(s,bx+8,by+52,'adj: ['+chunk1,7,'#34d399','start');
+    if(chunk2) txt(s,bx+20,by+66,chunk2+']',7,'#34d399','start');
+    else txt(s,bx+8+('adj: ['+chunk1).length*3.5,by+52,']',7,'#34d399','start');
+
+    // Boundary vertices
+    const bndry = [];
+    for(let vi=0;vi<4;vi++){
+      const gv=p*4+vi;
+      for(const nb of ADJ[gv]){
+        if(Math.floor(nb/4)!==p){ bndry.push('v'+gv); break; }
+      }
+    }
+    txt(s,bx+8,by+85,'boundary: ['+bndry.join(',')+']',7,'#fbbf24','start');
+
+    // Memory usage
+    const bytes = (5+lAdj.length+4+4*3)*4; // offsets+adj+colors+lists
+    const pct = bytes/(48*1024)*100;
+    rect(s,bx+8,by+105,204,10,'#181b26','#232738',3);
+    rect(s,bx+8,by+105,204*pct/100*8,10,PE_COLORS[p]+'50',null,3);
+    txt(s,bx+110,by+126,bytes+' bytes / 48KB ('+(pct).toFixed(2)+'%)',7,'#555');
+  }
+})();
+
+// ========== 3. Speculative Coloring Simulation ==========
+// Run a simulated speculative coloring
+const SIM_COLORS = new Int8Array(N).fill(-1);
+const CONFIRMED = new Uint8Array(N); // 0=no, 1=yes
+const COLOR_HISTORY = []; // [{phase,vertex_colors,confirmed,conflicts,annotation}]
+
+function simRun(){
+  const vc = new Int8Array(N).fill(-1);
+  const conf = new Uint8Array(N);
+  const tentative = new Int8Array(N).fill(-1);
+  // Pre-determined "random" picks to make a good demo
+  const picks = [
+    [0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3], // round 1 tentative
+    [-1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1], // round 2
+    [-1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1], // round 3
+  ];
+  // Manually craft a realistic multi-round scenario
+  // Round 1: all 16 pick colors
+  // Conflicts: many boundary edges will conflict since PEs pick independently
+  const r1_tent = [0,1,2,0, 1,0,3,2, 2,1,0,3, 0,2,1,3];
+  // Local conflicts (within PE):
+  //   PE0: v0=0,v1=1,v2=2,v3=0 → v0,v3 both 0, edge(0,1) ok, but no edge(0,3)... check
+  //   edges within PE0: (0,1),(1,2),(2,3) → 0≠1, 1≠2, 2≠0 → ok
+  //   PE1: v4=1,v5=0,v6=3,v7=2 → edges(4,5),(5,6),(6,7) → 1≠0, 0≠3, 3≠2 → ok
+  //   PE2: v8=2,v9=1,v10=0,v11=3 → edges(8,9),(9,10),(10,11) → 2≠1, 1≠0, 0≠3 → ok
+  //   PE3: v12=0,v13=2,v14=1,v15=3 → edges(12,13),(13,14),(14,15) → 0≠2, 2≠1, 1≠3 → ok
+  // Boundary conflicts:
+  //   (0,4): 0 vs 1 ok, (0,5): 0 vs 0 CONFLICT!, (1,5): 1 vs 0 ok, (1,6): 1 vs 3 ok
+  //   (2,6): 2 vs 3 ok, (2,7): 2 vs 2 CONFLICT!, (3,7): 0 vs 2 ok
+  //   (4,8): 1 vs 2 ok, (4,9): 1 vs 1 CONFLICT!, (5,9): 0 vs 1 ok, (5,10): 0 vs 0 CONFLICT!
+  //   (6,10): 3 vs 0 ok, (6,11): 3 vs 3 CONFLICT!, (7,11): 2 vs 3 ok
+  //   (8,12): 2 vs 0 ok, (9,13): 1 vs 2 ok, (10,13): 0 vs 2 ok, (10,14): 0 vs 1 ok, (11,14): 3 vs 1 ok, (11,15): 3 vs 3 CONFLICT!
+  //   (12,13): 0 vs 2 ok, (13,14): 2 vs 1 ok, (14,15): 1 vs 3 ok
+
+  // Boundary conflicts: (0,5)→v5 yields, (2,7)→v7 yields, (4,9)→v9 yields, (5,10)→v10 yields but v5 already yielded so just v10
+  // (6,11)→v11 yields, (11,15)→v15 yields but v11 already yielded so just v15
+  // Wait - v5 yields from (0,5), so (5,10) - v5 is uncolored, no conflict there anymore
+  // Let me redo: higher ID yields
+  // (0,5): both color 0 → v5(id=5) > v0(id=0) → v5 yields
+  // (2,7): both color 2 → v7 > v2 → v7 yields
+  // (4,9): both color 1 → v9 > v4 → v9 yields
+  // (5,10): v5 already yielded → no conflict
+  // (6,11): both color 3 → v11 > v6 → v11 yields
+  // (11,15): v11 already yielded → no conflict
+  const r1_yield = [5,7,9,11]; // these revert to -1
+  // After round 1: colored = 0,1,2,3,4,6,8,10,12,13,14,15; uncolored = 5,7,9,11
+
+  // Round 2: only v5,v7,v9,v11 pick new colors
+  // v5 neighbors colored: v0=0,v1=1,v4=1,v6=3,v9=?,v10=0 → avoid 0,1,3 → pick 4
+  // v7 neighbors colored: v2=2,v3=0,v6=3,v11=? → avoid 0,2,3 → pick 4
+  // v9 neighbors colored: v4=1,v5=?,v8=2,v10=0,v13=2 → avoid 0,1,2 → pick 3
+  // v11 neighbors colored: v6=3,v7=?,v10=0,v14=1,v15=3 → avoid 0,1,3 → pick 4
+  const r2_tent_partial = {5:4, 7:4, 9:3, 11:4};
+  // Check conflicts among these: edge(5,9)? → 4 vs 3 ok. edge(7,11)? → 4 vs 4 CONFLICT!
+  // But is there edge(7,11)? Check: 7's adj includes 11? edges has [7,11]? yes! → conflict
+  // v11 > v7 → v11 yields
+  const r2_yield = [11];
+  // After round 2: colored = all except v11
+
+  // Round 3: only v11
+  // v11 neighbors: v6=3,v7=4,v10=0,v14=1,v15=3 → avoid 0,1,3,4 → pick 5
+  const r3_tent_partial = {11:5};
+  // No conflicts
+  // Done!
+
+  // Build step-by-step history
+  const h = COLOR_HISTORY;
+  const vc0 = ()=>new Int8Array(N).fill(-1);
+  const c0 = ()=>new Uint8Array(N);
+
+  // Step 0: initial state
+  h.push({phase:'init', vc:vc0(), conf:c0(), conflicts:[], ann:'<b>Initial state:</b> 16 uncolored vertices, distributed across 4 PEs. The host has copied CSR slices via <code>memcpy_h2d</code>. Ready to begin speculative coloring.'});
+
+  // Round 1 - Step 1: tentative
+  {const v=vc0();for(let i=0;i<N;i++)v[i]=r1_tent[i];
+  h.push({phase:'r1-tentative', vc:v.slice(), conf:c0(), conflicts:[], ann:'<b>Round 1 — Speculate:</b> All 4 PEs simultaneously pick tentative colors for their vertices. PE0: v0→C0, v1→C1, v2→C2, v3→C0. PE1: v4→C1, v5→C0, v6→C3, v7→C2. PE2: v8→C2, v9→C1, v10→C0, v11→C3. PE3: v12→C0, v13→C2, v14→C1, v15→C3.'});}
+
+  // Round 1 - Step 2: local check
+  h.push({phase:'r1-local', vc:h[h.length-1].vc.slice(), conf:c0(), conflicts:[], ann:'<b>Round 1 — Local check:</b> Each PE checks edges within its partition. PE0: (v0,v1) 0≠1 ✓, (v1,v2) 1≠2 ✓, (v2,v3) 2≠0 ✓. PE1: (v4,v5) 1≠0 ✓, (v5,v6) 0≠3 ✓, (v6,v7) 3≠2 ✓. PE2: all ✓. PE3: all ✓. <span style="color:#34d399">No local conflicts!</span>'});
+
+  // Round 1 - Step 3: wavelet exchange
+  h.push({phase:'r1-exchange', vc:h[h.length-1].vc.slice(), conf:c0(), conflicts:[[0,5],[2,7],[4,9],[6,11]], ann:'<b>Round 1 — Wavelet exchange:</b> PEs send boundary vertex colors to neighbors via <code>fabout_dsd</code>/<code>fabin_dsd</code>. Each PE now has its neighbors\' boundary colors and can check for conflicts.'});
+
+  // Round 1 - Step 4: detect conflicts
+  h.push({phase:'r1-detect', vc:h[h.length-1].vc.slice(), conf:c0(), conflicts:[[0,5],[2,7],[4,9],[6,11]], ann:'<b>Round 1 — Detect conflicts:</b> Boundary edge (v0,v5): both C0 ⚡ | (v2,v7): both C2 ⚡ | (v4,v9): both C1 ⚡ | (v6,v11): both C3 ⚡ → <b>4 conflicts</b> found across PE boundaries!'});
+
+  // Round 1 - Step 5: resolve
+  {const v=h[h.length-1].vc.slice();const c=c0();
+  for(let i=0;i<N;i++)if(!r1_yield.includes(i)){c[i]=1;}
+  for(const y of r1_yield){v[y]=-1;c[y]=0;}
+  h.push({phase:'r1-resolve', vc:v.slice(), conf:c.slice(), conflicts:[[0,5],[2,7],[4,9],[6,11]],
+    ann:'<b>Round 1 — Resolve:</b> Higher-ID vertex yields in each conflict. (v0,v5)→v5 yields. (v2,v7)→v7 yields. (v4,v9)→v9 yields. (v6,v11)→v11 yields. <b>12 vertices confirmed, 4 uncolored</b> (v5,v7,v9,v11).'});}
+
+  // Round 2 - Step 6: tentative
+  {const v=h[h.length-1].vc.slice();const c=h[h.length-1].conf.slice();
+  for(const[vi,ci]of Object.entries(r2_tent_partial)){v[+vi]=ci;}
+  h.push({phase:'r2-tentative', vc:v.slice(), conf:c.slice(), conflicts:[],
+    ann:'<b>Round 2 — Speculate:</b> Only uncolored vertices participate. v5→C4, v7→C4, v9→C3, v11→C4. Each PE picks colors that don\'t conflict with already-confirmed local neighbors.'});}
+
+  // Round 2 - Step 7: local check
+  h.push({phase:'r2-local', vc:h[h.length-1].vc.slice(), conf:h[h.length-1].conf.slice(), conflicts:[],
+    ann:'<b>Round 2 — Local check:</b> v5 is the only uncolored in PE1, v7 only in PE1 too (wait — v5∈PE1, v7∈PE1). Check (v5,v6): 4≠3 ✓. (v6,v7): 3≠4 ✓. v9 in PE2: (v8,v9) 2≠3 ✓, (v9,v10) 3≠0 ✓. v11 in PE2: (v10,v11) 0≠4 ✓. <span style="color:#34d399">No local conflicts!</span>'});
+
+  // Round 2 - Step 8: exchange
+  h.push({phase:'r2-exchange', vc:h[h.length-1].vc.slice(), conf:h[h.length-1].conf.slice(), conflicts:[[7,11]],
+    ann:'<b>Round 2 — Wavelet exchange:</b> Boundary vertices v5,v7,v9,v11 send their new colors to neighboring PEs. Checking boundary edges for the re-colored vertices...'});
+
+  // Round 2 - Step 9: detect conflict
+  h.push({phase:'r2-detect', vc:h[h.length-1].vc.slice(), conf:h[h.length-1].conf.slice(), conflicts:[[7,11]],
+    ann:'<b>Round 2 — Detect:</b> Boundary edge (v7,v11): both C4 ⚡! But (v5,v9): C4≠C3 ✓, (v5,v10): C4≠C0 ✓, (v9,v13): C3≠C2 ✓. <b>1 conflict</b> found.'});
+
+  // Round 2 - Step 10: resolve
+  {const v=h[h.length-1].vc.slice();const c=h[h.length-1].conf.slice();
+  c[5]=1; c[7]=1; c[9]=1; // v5,v7,v9 confirmed
+  v[11]=-1; c[11]=0; // v11 yields
+  h.push({phase:'r2-resolve', vc:v.slice(), conf:c.slice(), conflicts:[[7,11]],
+    ann:'<b>Round 2 — Resolve:</b> (v7,v11)→v11(ID=11) > v7(ID=7) → v11 yields. v5,v7,v9 confirmed. <b>15 vertices colored, 1 remaining</b> (v11).'});}
+
+  // Round 3 - Step 11: tentative
+  {const v=h[h.length-1].vc.slice();const c=h[h.length-1].conf.slice();
+  v[11]=5;
+  h.push({phase:'r3-tentative', vc:v.slice(), conf:c.slice(), conflicts:[],
+    ann:'<b>Round 3 — Speculate:</b> Only v11 is uncolored. Neighbors: v6=C3, v7=C4, v10=C0, v14=C1, v15=C3. Must avoid {C0,C1,C3,C4} → picks <b>C5</b>.'});}
+
+  // Round 3 - Step 12: no conflicts
+  {const v=h[h.length-1].vc.slice();const c=h[h.length-1].conf.slice();
+  c[11]=1;
+  h.push({phase:'r3-done', vc:v.slice(), conf:c.slice(), conflicts:[],
+    ann:'<b>Round 3 — Complete:</b> v11=C5 has no conflicts with any neighbor. <span style="color:#34d399"><b>All 16 vertices colored in 3 rounds!</b></span> Host calls <code>memcpy_d2h</code> to copy colors back.'});}
+
+  // Final
+  h.push({phase:'final', vc:h[h.length-1].vc.slice(), conf:h[h.length-1].conf.slice(), conflicts:[],
+    ann:'<b>✅ Final result:</b> 16 vertices colored with 6 colors (C0–C5) in 3 speculative rounds. Verified: no two adjacent vertices share a color. Sequential CPU would process vertices one-by-one; WSE colored <b>16 in parallel</b> with just 3 communication rounds.'});
+}
+simRun();
+
+// ========== Draw Rounds ==========
+let roundIdx = 0;
+let autoTimer = null;
+
+function drawRounds(){
+  const s = document.getElementById('svg-rounds');
+  s.innerHTML = '';
+  const h = COLOR_HISTORY[roundIdx];
+  const sp = 55, ox = 55, oy = 60;
+
+  // PE boxes (2x2 layout within the viz)
+  const peBox = [
+    {x:20,y:30,w:sp*3+70,h:sp+70},{x:sp*3+120,y:30,w:sp*3+70,h:sp+70},
+    {x:20,y:sp+130,w:sp*3+70,h:sp+70},{x:sp*3+120,y:sp+130,w:sp*3+70,h:sp+70},
+  ];
+  function vpos(i){
+    const pe=Math.floor(i/4),li=i%4;
+    const pb=peBox[pe];
+    return {x:pb.x+35+li*sp, y:pb.y+50};
+  }
+
+  // PE boxes
+  for(let p=0;p<4;p++){
+    const b=peBox[p];
+    rect(s,b.x,b.y,b.w,b.h,PE_COLORS[p]+'06',PE_COLORS[p]+'30',10);
+    txt(s,b.x+b.w/2,b.y+14,'PE '+p,9,PE_COLORS[p],'middle','600');
+  }
+
+  // Edges
+  for(const[u,v]of EDGES){
+    const a=vpos(u),b=vpos(v);
+    const pu=Math.floor(u/4),pv=Math.floor(v/4);
+    const isBoundary = pu!==pv;
+    const isConflict = h.conflicts.some(([cu,cv])=>(cu===u&&cv===v)||(cu===v&&cv===u));
+    let col='#1e2130', w=1, d='';
+    if(isBoundary) { col='#2a2e3a40'; w=1; d='3,3'; }
+    if(isConflict) { col='#f87171'; w=2.5; d=''; }
+    line(s,a.x,a.y,b.x,b.y,col,w,d);
+    if(isConflict){
+      const mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
+      txt(s,mx,my-8,'⚡',10,'#f87171');
+    }
+  }
+
+  // Vertices
+  for(let i=0;i<N;i++){
+    const p=vpos(i);
+    const c=h.vc[i];
+    const confirmed = h.conf[i];
+    const isYield = c===-1 && roundIdx>0 && COLOR_HISTORY[roundIdx-1].vc[i]>=0;
+    let fill='#181b26', stroke='#3a4055', sw=2;
+    if(c>=0 && confirmed){
+      fill=PALETTE[c]+'30'; stroke=PALETTE[c]; sw=2.5;
+    } else if(c>=0){
+      fill=PALETTE[c]+'15'; stroke='#22d3ee'; sw=2;
+    }
+    if(isYield){ fill='#f8717115'; stroke='#f87171'; }
+    circ(s,p.x,p.y,18,fill,stroke,sw);
+    txt(s,p.x,p.y-5,'v'+i,7,'#bbb');
+    if(c>=0){
+      txt(s,p.x,p.y+8,CNAMES[c],7,PALETTE[c],'middle','600');
+    } else {
+      txt(s,p.x,p.y+8,isYield?'✗':'?',9,isYield?'#f87171':'#444');
+    }
+  }
+
+  // Wavelet arrows for exchange phases
+  if(h.phase.includes('exchange')){
+    // Horizontal arrows between PE0↔PE1, PE2↔PE3
+    for(const[pa,pb,y] of [[0,1,peBox[0].y+50],[2,3,peBox[2].y+50]]){
+      const x1=peBox[pa].x+peBox[pa].w+3, x2=peBox[pb].x-3;
+      arrow(s,x1,y-5,x2,y-5,'#fbbf24',2);
+      arrow(s,x2,y+5,x1,y+5,'#fbbf24',2);
+      txt(s,(x1+x2)/2,y-15,'wavelets',7,'#fbbf24');
+    }
+    // Vertical arrows between PE0↔PE2, PE1↔PE3
+    for(const[pa,pb,x] of [[0,2,peBox[0].x+peBox[0].w/2],[1,3,peBox[1].x+peBox[1].w/2]]){
+      const y1=peBox[pa].y+peBox[pa].h+3, y2=peBox[pb].y-3;
+      arrow(s,x-5,y1,x-5,y2,'#fbbf24',2);
+      arrow(s,x+5,y2,x+5,y1,'#fbbf24',2);
+    }
+  }
+
+  // Round indicator on the right
+  const rx=680, ry=30;
+  rect(s,rx,ry,350,230,'#13151e','#232738',10);
+  txt(s,rx+175,ry+20,'Coloring Progress',11,'#7a7f96','middle','600');
+
+  // Progress bar
+  const colored = Array.from(h.vc).filter(c=>c>=0).length;
+  const confirmedCount = Array.from(h.conf).filter(c=>c>0).length;
+  rect(s,rx+15,ry+40,320,16,'#181b26','#232738',6);
+  rect(s,rx+15,ry+40,320*(confirmedCount/N),16,'#34d39980',null,6);
+  if(colored>confirmedCount) rect(s,rx+15+320*(confirmedCount/N),ry+40,320*((colored-confirmedCount)/N),16,'#22d3ee40',null,0);
+  txt(s,rx+175,ry+48,`${confirmedCount}/${N} confirmed` + (colored>confirmedCount?` (+${colored-confirmedCount} tentative)`:''),8,'#dde0ea');
+
+  // Round labels
+  const rounds = [
+    {label:'Round 1',steps:['Speculate','Local Check','Exchange','Detect','Resolve'],start:1},
+    {label:'Round 2',steps:['Speculate','Local Check','Exchange','Detect','Resolve'],start:6},
+    {label:'Round 3',steps:['Speculate','Done!'],start:11},
+  ];
+  let sy=ry+72;
+  for(const rd of rounds){
+    txt(s,rx+15,sy,rd.label,9,'#7a7f96','start','600');
+    for(let i=0;i<rd.steps.length;i++){
+      const stepGlobal = rd.start+i;
+      const isCurrent = roundIdx===stepGlobal;
+      const isDone = roundIdx>stepGlobal;
+      const col = isCurrent?'#22d3ee':(isDone?'#34d399':'#3a4055');
+      const dotR = isCurrent?5:3;
+      circ(s,rx+85+i*50,sy,dotR,isDone?col+'40':'none',col,1.5);
+      txt(s,rx+85+i*50,sy+14,rd.steps[i],6,col);
+    }
+    sy+=42;
+  }
+
+  // Color usage
+  sy=ry+195;
+  txt(s,rx+15,sy,'Colors used:',9,'#7a7f96','start');
+  const usedColors = new Set(Array.from(h.vc).filter(c=>c>=0));
+  let cx2=rx+95;
+  for(const c of [...usedColors].sort()){
+    rect(s,cx2,sy-8,24,16,PALETTE[c]+'30',PALETTE[c],4);
+    txt(s,cx2+12,sy,CNAMES[c],7,PALETTE[c]);
+    cx2+=30;
+  }
+
+  document.getElementById('r-info').textContent = `Step ${roundIdx+1} / ${COLOR_HISTORY.length}`;
+  document.getElementById('r-ann').innerHTML = h.ann;
+  document.getElementById('r-prev').disabled = roundIdx===0;
+  document.getElementById('r-next').disabled = roundIdx===COLOR_HISTORY.length-1;
+}
+
+function roundStep(d){
+  roundIdx=Math.max(0,Math.min(COLOR_HISTORY.length-1,roundIdx+d));
+  drawRounds();
+}
+
+function toggleAuto(){
+  const btn=document.getElementById('r-auto');
+  if(autoTimer){clearInterval(autoTimer);autoTimer=null;btn.textContent='▶ Auto-Play';btn.classList.remove('active');return;}
+  btn.textContent='⏸ Pause';btn.classList.add('active');
+  autoTimer=setInterval(()=>{
+    if(roundIdx>=COLOR_HISTORY.length-1){clearInterval(autoTimer);autoTimer=null;btn.textContent='▶ Auto-Play';btn.classList.remove('active');return;}
+    roundStep(1);
+  },1800);
+}
+
+// ========== 4. Final Result ==========
+(function drawFinal(){
+  const s=document.getElementById('svg-final');
+  const h=COLOR_HISTORY[COLOR_HISTORY.length-1];
+  const sp=95,ox=75,oy=60;
+  txt(s,240,22,'Final Coloring — Verified ✓',12,'#34d399','middle','600');
+  // edges
+  for(const[u,v]of EDGES){
+    const a=vtxPos(u,ox,oy,sp),b=vtxPos(v,ox,oy,sp);
+    line(s,a.x,a.y,b.x,b.y,'#2a2e3a60',1);
+  }
+  // vertices
+  for(let i=0;i<N;i++){
+    const p=vtxPos(i,ox,oy,sp);
+    const c=h.vc[i];
+    circ(s,p.x,p.y,20,PALETTE[c]+'30',PALETTE[c],2.5);
+    txt(s,p.x,p.y-5,'v'+i,8,'#dde0ea');
+    txt(s,p.x,p.y+8,CNAMES[c],8,PALETTE[c],'middle','600');
+  }
+  // Verification
+  let valid=true;
+  for(const[u,v]of EDGES){if(h.vc[u]===h.vc[v]){valid=false;break;}}
+  txt(s,240,400,valid?'✅ No adjacent vertices share a color — valid coloring!':'❌ INVALID',10,valid?'#34d399':'#f87171');
+})();
+
+// ========== Timeline ==========
+(function drawTimeline(){
+  const s=document.getElementById('svg-timeline');
+  txt(s,240,18,'Execution Timeline — WSE vs CPU',12,'#7a7f96','middle','600');
+
+  // WSE timeline
+  const ty=55;
+  txt(s,15,ty,'WSE',10,'#22d3ee','start','600');
+  txt(s,15,ty+14,'(4 PEs)',8,'#555','start');
+  const phases=[
+    {label:'R1: Speculate',w:50,c:'#22d3ee'},{label:'R1: Check',w:30,c:'#34d399'},
+    {label:'R1: Exchange',w:35,c:'#fbbf24'},{label:'R1: Resolve',w:30,c:'#a78bfa'},
+    {label:'R2: Spec',w:40,c:'#22d3ee'},{label:'R2: Chk',w:25,c:'#34d399'},
+    {label:'R2: Exch',w:30,c:'#fbbf24'},{label:'R2: Res',w:25,c:'#a78bfa'},
+    {label:'R3',w:25,c:'#22d3ee'},{label:'Done',w:25,c:'#34d399'},
+  ];
+  let px=80;
+  for(const p of phases){
+    rect(s,px,ty-8,p.w,20,p.c+'20',p.c+'60',4);
+    txt(s,px+p.w/2,ty+2,p.label,5.5,p.c);
+    px+=p.w+3;
+  }
+  const wseTotal=px-80;
+  txt(s,px+5,ty,'← 3 rounds',8,'#555','start');
+
+  // CPU timeline
+  const cy=ty+50;
+  txt(s,15,cy,'CPU',10,'#6c8cff','start','600');
+  txt(s,15,cy+14,'(sequential)',8,'#555','start');
+  px=80;
+  for(let i=0;i<N;i++){
+    const w=22;
+    rect(s,px,cy-8,w,20,'#6c8cff15','#6c8cff40',3);
+    txt(s,px+w/2,cy+2,'v'+i,5,'#6c8cff');
+    px+=w+2;
+  }
+  const cpuTotal=px-80;
+
+  // Speedup arrow
+  const ay=cy+40;
+  line(s,80,ay,80+wseTotal,ay,'#22d3ee',1.5);
+  txt(s,80+wseTotal/2,ay-8,'WSE time',8,'#22d3ee');
+  line(s,80,ay+20,80+cpuTotal,ay+20,'#6c8cff',1.5);
+  txt(s,80+cpuTotal/2,ay+12,'CPU time',8,'#6c8cff');
+
+  // Speedup
+  txt(s,240,ay+50,`WSE processes all vertices per round in parallel`,9,'#7a7f96');
+  txt(s,240,ay+68,`3 rounds × (speculate + check + exchange + resolve) vs 16 sequential steps`,8,'#555');
+  txt(s,240,ay+88,`Speedup grows with graph size: O(n) CPU → O(log n) WSE rounds`,9,'#22d3ee');
+
+  // Color usage breakdown
+  const bty = ay+120;
+  txt(s,240,bty,'Color Usage Breakdown',11,'#7a7f96','middle','600');
+  const finalColors = COLOR_HISTORY[COLOR_HISTORY.length-1].vc;
+  const colorCounts = {};
+  for(let i=0;i<N;i++){
+    const c=finalColors[i];
+    colorCounts[c] = (colorCounts[c]||0)+1;
+  }
+  let bx=50;
+  for(const[c,cnt] of Object.entries(colorCounts).sort((a,b)=>+a[0]-+b[0])){
+    const barW = cnt*25;
+    rect(s,bx,bty+15,barW,18,PALETTE[c]+'30',PALETTE[c],4);
+    txt(s,bx+barW/2,bty+24,CNAMES[c]+' ('+cnt+')',7,PALETTE[c]);
+    bx+=barW+8;
+  }
+})();
+
+// ========== Final stats ==========
+(function(){
+  const d=document.getElementById('final-stats');
+  const finalColors=COLOR_HISTORY[COLOR_HISTORY.length-1].vc;
+  const numColors = new Set(Array.from(finalColors)).size;
+  const stats = [
+    {num:'6',lbl:'Colors Used',c:'var(--cyan)'},{num:'3',lbl:'Rounds to Converge',c:'var(--green)'},
+    {num:'16/16',lbl:'Vertices Colored',c:'var(--green)'},{num:'4',lbl:'Conflicts Resolved',c:'var(--orange)'},
+    {num:'✓',lbl:'Valid Coloring',c:'var(--green)'},
+  ];
+  for(const st of stats){
+    const box=document.createElement('div');box.className='stat-box';
+    box.innerHTML=`<div class="num" style="color:${st.c}">${st.num}</div><div class="lbl">${st.lbl}</div>`;
+    d.appendChild(box);
+  }
+})();
+
+// Init
+drawRounds();
+</script>
+</body>
+</html>

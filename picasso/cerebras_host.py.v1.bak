@@ -2,10 +2,6 @@
 """
 Cerebras host script — runs inside cs_python (singularity container).
 
-Uses hash-based GID partitioning (power-of-2 PE count, bitwise AND),
-SW relay routing with 8-bit wavelet color encoding, and sentinel-based
-completion detection.
-
 Loads a partitioned graph from a JSON file, uploads it to the compiled
 CSL program via SdkRuntime, launches on-fabric coloring, reads back
 colors, and prints the result as JSON to stdout.
@@ -17,9 +13,8 @@ Usage (called by run_csl_tests.py, not directly):
 """
 
 import argparse
-import glob
 import json
-import os
+import math
 import sys
 
 import numpy as np
@@ -34,28 +29,10 @@ CS_FREQUENCY = 850_000_000
 
 
 def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
-                 max_local_verts, max_local_edges, max_boundary,
-                 max_list_size=0, palette_size=3, cmaddr=None):
-    """Load graph onto device, run coloring, read back results.
-
-    Args:
-        max_list_size: T — max colors per vertex list (Picasso). 0 = greedy.
-        palette_size: Runtime palette size for this test (must be <= compile-time max).
-        cmaddr: IP:port of CS system. None = simulator mode.
-                On the appliance, SdkLauncher passes this via %CMADDR%.
-    """
+                 max_local_verts, max_local_edges, max_boundary):
+    """Load graph onto device, run coloring, read back results."""
     total_pes = num_cols * num_rows
-
-    # On the appliance, SdkLauncher extracts the artifact tarball and
-    # sets CWD to the extracted dir.  The ELFs may be in a subdirectory
-    # named "out" or at the top level.  Search for them.
-    if not glob.glob(os.path.join(compiled_dir, '*.elf')):
-        out_sub = os.path.join(compiled_dir, 'out')
-        if os.path.isdir(out_sub):
-            compiled_dir = out_sub
-            print(f"[DEBUG] Using ELF dir: {compiled_dir}", file=sys.stderr, flush=True)
-
-    runner = SdkRuntime(compiled_dir, cmaddr=cmaddr, suppress_simfab_trace=True)
+    runner = SdkRuntime(compiled_dir, cmaddr=None)
 
     sym_offsets = runner.get_id('csr_offsets')
     sym_adj = runner.get_id('csr_adj')
@@ -65,11 +42,9 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
     sym_bnd_local = runner.get_id('boundary_local_idx')
     sym_bnd_nbr = runner.get_id('boundary_neighbor_gid')
     sym_bnd_dir = runner.get_id('boundary_direction')
-    sym_runtime_config = runner.get_id('runtime_config')
+    sym_verts_per_pe = runner.get_id('verts_per_pe')
     sym_nboundary = runner.get_id('num_boundary')
-    sym_expected_recv = runner.get_id('expected_recv')
-    sym_color_list = runner.get_id('color_list')
-    sym_list_len = runner.get_id('list_len')
+    sym_expected_total_recv = runner.get_id('expected_total_recv')
     sym_timer = runner.get_id('coloring_timer')
     sym_perf = runner.get_id('perf_counters')
 
@@ -77,18 +52,7 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
     runner.run()
     print(f"[DEBUG] runner.load() + run() complete. Uploading to {total_pes} PEs...", file=sys.stderr, flush=True)
 
-    # Fix 1: pe_mask = total_pes - 1 (power-of-2 hash partitioning)
-    pe_mask_val = total_pes - 1
-
-    # Upload runtime_config = [pe_mask, palette_size] to every PE
-    config_arr = np.array([pe_mask_val, palette_size], dtype=np.int32)
-    for p_idx in range(total_pes):
-        p_row = p_idx // num_cols
-        p_col = p_idx % num_cols
-        runner.memcpy_h2d(sym_runtime_config, config_arr, p_col, p_row, 1, 1,
-                          2, streaming=False,
-                          data_type=MemcpyDataType.MEMCPY_32BIT,
-                          order=MemcpyOrder.ROW_MAJOR, nonblock=False)
+    chunk = math.ceil(num_verts / total_pes)
 
     for pe_idx in range(total_pes):
         pe_row = pe_idx // num_cols
@@ -105,11 +69,6 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
         gids_padded[:len(d['global_ids'])] = d['global_ids']
 
         colors_init = np.full(max_local_verts, -1, dtype=np.int32)
-        # For recursion levels: upload pre-set colors (already-colored vertices
-        # keep their color, invalids reset to -1)
-        if 'upload_colors' in d:
-            uc = d['upload_colors']
-            colors_init[:len(uc)] = uc
         nverts = np.array([d['local_n']], dtype=np.int32)
 
         bnd_local = np.zeros(max_boundary, dtype=np.int32)
@@ -121,6 +80,7 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
             bnd_nbr[i] = d['boundary_neighbor_gid'][i]
             bnd_dir[i] = d['boundary_direction'][i]
         nbnd_arr = np.array([nbnd], dtype=np.int32)
+        vpp_arr = np.array([chunk], dtype=np.int32)
 
         # H2D transfers (2D coordinates: x=col, y=row)
         runner.memcpy_h2d(sym_offsets, off_padded, pe_col, pe_row, 1, 1,
@@ -163,41 +123,25 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
                           order=MemcpyOrder.ROW_MAJOR,
                           data_type=MemcpyDataType.MEMCPY_32BIT,
                           nonblock=False)
+        runner.memcpy_h2d(sym_verts_per_pe, vpp_arr, pe_col, pe_row, 1, 1, 1,
+                          streaming=False,
+                          order=MemcpyOrder.ROW_MAJOR,
+                          data_type=MemcpyDataType.MEMCPY_32BIT,
+                          nonblock=False)
         runner.memcpy_h2d(sym_nboundary, nbnd_arr, pe_col, pe_row, 1, 1, 1,
                           streaming=False,
                           order=MemcpyOrder.ROW_MAJOR,
                           data_type=MemcpyDataType.MEMCPY_32BIT,
                           nonblock=False)
 
-        # Expected recv counts: [data_recv, done_recv] merged into 2-element array
-        etr = d.get('expected_data_recv', 0)
-        edr = d.get('expected_done_recv', 0)
-        expected_recv_arr = np.array([etr, edr], dtype=np.int32)
-        runner.memcpy_h2d(sym_expected_recv, expected_recv_arr, pe_col, pe_row,
-                          1, 1, 2, streaming=False,
+        # Expected total recv count (precomputed by test runner)
+        etr = d.get('expected_total_recv', 0)
+        etr_arr = np.array([etr], dtype=np.int32)
+        runner.memcpy_h2d(sym_expected_total_recv, etr_arr, pe_col, pe_row,
+                          1, 1, 1, streaming=False,
                           order=MemcpyOrder.ROW_MAJOR,
                           data_type=MemcpyDataType.MEMCPY_32BIT,
                           nonblock=False)
-
-        # Picasso color lists (if provided)
-        if max_list_size > 0 and 'color_list' in d:
-            cl = d['color_list']
-            cl_padded = np.zeros(max_local_verts * max_list_size, dtype=np.int32)
-            cl_padded[:len(cl)] = cl
-            runner.memcpy_h2d(sym_color_list, cl_padded, pe_col, pe_row, 1, 1,
-                              max_local_verts * max_list_size, streaming=False,
-                              order=MemcpyOrder.ROW_MAJOR,
-                              data_type=MemcpyDataType.MEMCPY_32BIT,
-                              nonblock=False)
-            ll = d['list_len']
-            ll_padded = np.zeros(max_local_verts, dtype=np.int32)
-            ll_padded[:len(ll)] = ll
-            runner.memcpy_h2d(sym_list_len, ll_padded, pe_col, pe_row, 1, 1,
-                              max_local_verts, streaming=False,
-                              order=MemcpyOrder.ROW_MAJOR,
-                              data_type=MemcpyDataType.MEMCPY_32BIT,
-                              nonblock=False)
-
         if pe_idx % 8 == 0 or pe_idx == total_pes - 1:
             print(f"[DEBUG] H2D upload complete for PE {pe_idx}/{total_pes-1} (n={d['local_n']}, bnd={nbnd}, etr={etr})", file=sys.stderr, flush=True)
 
@@ -206,24 +150,22 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
     runner.launch('start_coloring', nonblock=False)
     print(f"[DEBUG] launch() returned — all PEs finished.", file=sys.stderr, flush=True)
 
-    # Read back colors from all PEs (Fix 1: hash-based mapping)
+    # Read back colors from all PEs
     print(f"[DEBUG] Reading back colors from {total_pes} PEs...", file=sys.stderr, flush=True)
     all_colors = np.full(num_verts, -1, dtype=np.int32)
     for pe_idx in range(total_pes):
         pe_row = pe_idx // num_cols
         pe_col = pe_idx % num_cols
-        d = graph_data[pe_idx]
-        local_n = d['local_n']
+        local_n = graph_data[pe_idx]['local_n']
         buf = np.zeros(max_local_verts, dtype=np.int32)
         runner.memcpy_d2h(buf, sym_colors, pe_col, pe_row, 1, 1,
                           max_local_verts, streaming=False,
                           order=MemcpyOrder.ROW_MAJOR,
                           data_type=MemcpyDataType.MEMCPY_32BIT,
                           nonblock=False)
-        # Hash-based: use the global_ids list to map back
+        start_v = pe_idx * chunk
         for i in range(local_n):
-            gid = d['global_ids'][i]
-            all_colors[gid] = buf[i]
+            all_colors[start_v + i] = buf[i]
 
     # Read back timing data from all PEs (3 x f32 per PE)
     timing_data = np.zeros(num_rows * num_cols * 3, dtype=np.uint32)
@@ -243,8 +185,8 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
                 max_cycles = int(cycles)
     elapsed_ms = (max_cycles / CS_FREQUENCY) * 1000
 
-    # Read back perf counters from all PEs (8 x i32 per PE)
-    NUM_PERF = 8
+    # Read back perf counters from all PEs (7 x i32 per PE)
+    NUM_PERF = 7
     perf_data = np.zeros(num_rows * num_cols * NUM_PERF, dtype=np.int32)
     runner.memcpy_d2h(perf_data, sym_perf, 0, 0, num_cols, num_rows,
                       NUM_PERF, streaming=False,
@@ -253,7 +195,7 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
     perf_reshaped = perf_data.reshape((num_rows, num_cols, NUM_PERF))
     perf_labels = ["rounds", "send_activations", "recv_invocations",
                    "relay_ops", "boundary_scans", "global_to_local",
-                   "adj_iterations", "relay_overflow_drops"]
+                   "adj_iterations"]
     per_pe_perf = {}
     for pe_row in range(num_rows):
         for pe_col in range(num_cols):
@@ -276,12 +218,6 @@ def main():
     parser.add_argument('--max-local-verts', type=int, required=True)
     parser.add_argument('--max-local-edges', type=int, required=True)
     parser.add_argument('--max-boundary', type=int, required=True)
-    parser.add_argument('--max-list-size', type=int, default=0,
-                        help='T: max colors per vertex list (Picasso, 0=greedy)')
-    parser.add_argument('--palette-size', type=int, default=3,
-                        help='Runtime palette size for this test')
-    parser.add_argument('--cmaddr', type=str, default=None,
-                        help='IP:port for CS system (None = simulator)')
     args = parser.parse_args()
 
     with open(args.graph_data, 'r') as f:
@@ -290,9 +226,7 @@ def main():
     colors, max_cycles, elapsed_ms, per_pe_cycles, per_pe_perf = run_coloring(
         args.compiled_dir, graph_data, args.num_cols, args.num_rows,
         args.num_verts, args.max_local_verts, args.max_local_edges,
-        args.max_boundary, max_list_size=args.max_list_size,
-        palette_size=args.palette_size,
-        cmaddr=args.cmaddr)
+        args.max_boundary)
 
     # Output as JSON on stdout (the test runner parses this)
     print(json.dumps({

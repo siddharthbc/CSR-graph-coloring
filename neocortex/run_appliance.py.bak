@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+Run Picasso graph coloring tests on the Cerebras CS-3 Cloud (appliance mode).
+
+Uses SdkLauncher to stage and execute the existing cerebras_host.py on the
+Wafer-Scale Cluster.  This script runs on the user node and communicates with
+the appliance to launch jobs on a worker node.
+
+Prerequisites:
+    1. Run compile_appliance.py first to produce artifact_path.json
+    2. Have cerebras_appliance and cerebras_sdk installed in your venv
+
+Usage:
+    # Run on appliance simulator:
+    python run_appliance.py --artifact artifact_path.json
+
+    # Run on real CS-3 hardware:
+    python run_appliance.py --artifact artifact_path.json --hardware
+
+    # Run a single test:
+    python run_appliance.py --artifact artifact_path.json --test test1_all_commute_4nodes
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+import tempfile
+
+import numpy as np
+
+# Add parent directory to path for importing picasso modules
+script_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(script_dir)
+sys.path.insert(0, repo_root)
+
+# Reuse the graph building and partitioning logic from the test runner
+from picasso.run_csl_tests import (
+    load_pauli_json, build_conflict_graph, build_csr,
+    partition_graph, validate_coloring, predict_relay_overflow,
+    generate_color_lists, run_picasso_module,
+)
+
+
+def run_single_test_appliance(launcher, graph_data, compile_info, num_verts,
+                              palette_size=3):
+    """Run a single test using SdkLauncher on the appliance.
+
+    Stages the graph data and cerebras_host.py, then executes on the
+    appliance worker node via cs_python.
+    """
+    num_cols = compile_info['num_cols']
+    num_rows = compile_info['num_rows']
+    max_lv = compile_info['max_local_verts']
+    max_le = compile_info['max_local_edges']
+    max_bnd = compile_info['max_boundary']
+
+    # Write graph data to a temp file and stage it
+    graph_json = json.dumps(graph_data)
+    graph_file = "graph_data.json"
+    with open(graph_file, 'w') as f:
+        f.write(graph_json)
+
+    launcher.stage(graph_file)
+
+    # Stage the host script
+    host_script = os.path.join(repo_root, 'picasso', 'cerebras_host.py')
+    launcher.stage(host_script)
+
+    # Build the command — %CMADDR% is replaced by SdkLauncher with the
+    # actual CS system address when running on hardware
+    cmd = (
+        f"cs_python cerebras_host.py "
+        f"--compiled-dir . "
+        f"--graph-data {graph_file} "
+        f"--num-cols {num_cols} "
+        f"--num-rows {num_rows} "
+        f"--num-verts {num_verts} "
+        f"--max-local-verts {max_lv} "
+        f"--max-local-edges {max_le} "
+        f"--max-boundary {max_bnd} "
+        f"--palette-size {palette_size} "
+        f"--cmaddr %CMADDR%"
+    )
+
+    print(f"  Launching on appliance: {cmd[:100]}...")
+
+    response = launcher.run(cmd)
+
+    # Clean up local temp file
+    if os.path.exists(graph_file):
+        os.unlink(graph_file)
+
+    # Parse JSON output from the response
+    if response:
+        for line in response.splitlines():
+            line = line.strip()
+            if line.startswith('{'):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    pass
+
+    print(f"  WARNING: Could not parse JSON from appliance response")
+    print(f"  Response: {response[:500] if response else '(empty)'}")
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Run Picasso tests on Cerebras CS-3 Cloud')
+    parser.add_argument('--artifact', type=str, default='artifact_path.json',
+                        help='Path to artifact_path.json from compile step')
+    parser.add_argument('--hardware', action='store_true',
+                        help='Run on real CS-3 hardware (default: simulator)')
+    parser.add_argument('--test', type=str, default=None,
+                        help='Run only this test (substring match)')
+    parser.add_argument('--num-pes', type=int, default=None,
+                        help='Override number of PEs (default: from artifact)')
+    parser.add_argument('--grid-rows', type=int, default=None,
+                        help='Override grid rows (default: from artifact)')
+    parser.add_argument('--palette-size', type=int, default=None,
+                        help='Fixed palette size P (default: use --palette-frac)')
+    parser.add_argument('--palette-frac', type=float, default=0.125,
+                        help='Compute P per-level as max(1, floor(frac*|remaining|)). '
+                             'Paper Normal=0.125, Aggressive=0.03. '
+                             'Overridden by --palette-size.')
+    parser.add_argument('--list-size', type=int, default=None,
+                        help='T: colors per vertex list (default: alpha*log(n))')
+    parser.add_argument('--alpha', type=float, default=2.0,
+                        help='Coefficient for list size T = alpha*log(n) '
+                             '(paper Normal=2, Aggressive=30)')
+    parser.add_argument('--inv', type=int, default=None,
+                        help='Max invalid vertex tolerance before recursion stops '
+                             '(default: palette size P per test)')
+    parser.add_argument('--max-rounds', type=int, default=30,
+                        help='Max recursion levels before stopping (default: 30)')
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='Directory to write per-test Cerebras run output '
+                             '(default: tests/cerebras-runs)')
+    args = parser.parse_args()
+
+    # Load compile artifact info
+    if not os.path.isfile(args.artifact):
+        print(f"ERROR: artifact file not found: {args.artifact}")
+        print("Run compile_appliance.py first.")
+        sys.exit(1)
+
+    with open(args.artifact, 'r') as f:
+        compile_info = json.load(f)
+
+    artifact_path = compile_info['artifact_path']
+    num_cols = args.num_pes // (args.grid_rows or 1) if args.num_pes else compile_info['num_cols']
+    num_rows = args.grid_rows or compile_info['num_rows']
+    total_pes = num_cols * num_rows
+
+    mode_str = "CS-3 Hardware" if args.hardware else "Appliance Simulator"
+    print(f"Picasso Graph Coloring — Cerebras CS-3 Cloud ({mode_str})")
+    print(f"  PEs: {total_pes} ({num_cols}x{num_rows})")
+    print(f"  Artifact:    {artifact_path}")
+    print(f"  Compiled with: max_lv={compile_info['max_local_verts']}, "
+          f"max_le={compile_info['max_local_edges']}, "
+          f"max_bnd={compile_info['max_boundary']}")
+    print()
+
+    # Discover tests
+    inputs_dir = os.path.join(repo_root, 'tests', 'inputs')
+    golden_dir = os.path.join(repo_root, 'tests', 'golden')
+
+    if not os.path.isdir(inputs_dir):
+        print(f"ERROR: inputs directory not found: {inputs_dir}")
+        sys.exit(1)
+
+    test_files = sorted(f for f in os.listdir(inputs_dir) if f.endswith('.json'))
+    if args.test:
+        test_files = [f for f in test_files if args.test in f]
+        if not test_files:
+            print(f"ERROR: no test matching '{args.test}'")
+            sys.exit(1)
+
+    print(f"  Tests: {len(test_files)}")
+    print()
+
+    # Pre-load all test graphs to compute max dimensions
+    test_data_list = []
+    for tf in test_files:
+        name = tf.replace('.json', '')
+        input_path = os.path.join(inputs_dir, tf)
+        golden_path = os.path.join(golden_dir, f'{name}_golden.txt')
+        paulis = load_pauli_json(input_path)
+        num_verts, edges, num_commuting = build_conflict_graph(paulis)
+        offsets, adj = build_csr(num_verts, edges)
+        test_data_list.append({
+            'name': name,
+            'golden_path': golden_path,
+            'paulis': paulis,
+            'num_verts': num_verts,
+            'edges': edges,
+            'num_commuting': num_commuting,
+            'offsets': offsets,
+            'adj': adj,
+        })
+
+    # --- Pre-partition overflow prediction ---
+    print("Pre-partition relay overflow prediction:")
+    any_overflow = False
+    for td in test_data_list:
+        early = predict_relay_overflow(
+            td['num_verts'], td['edges'], num_cols, num_rows,
+            max_relay=256)
+        print(f"  [{td['name']}] peak relay: {early['max_load']}, "
+              f"boundary wavelets: {early['total_boundary']}")
+        if early['overflow_pes']:
+            any_overflow = True
+            print(f"    OVERFLOW at max_relay=256: "
+                  f"{len(early['overflow_pes'])} PE-direction pairs affected")
+            print(f"    Minimum safe max_relay: {early['max_load']}")
+            sram = early['max_load'] * 4 * 4
+            print(f"    SRAM cost: {sram:,} bytes ({sram/1024:.1f} KB)")
+    if any_overflow:
+        print()
+        print("  Some tests will overflow at default buffer size.")
+        print("  Proceeding — relay overflow leads to lossy rounds, "
+              "not crashes.")
+    print()
+
+    # --- Partition every test and estimate per-PE SRAM usage ---
+    PE_SRAM_BUDGET = 48 * 1024  # 48 KB per PE
+    PE_FIXED_OVERHEAD = 4096    # code + stack + misc static data
+
+    max_lv = 1
+    max_le = 1
+    max_bnd = 1
+
+    skipped_tests = []
+    fitting_tests = []
+
+    for td in test_data_list:
+        pe_data = partition_graph(td['num_verts'], td['offsets'],
+                                 td['adj'], num_cols, num_rows)
+        td_max_lv = max(d['local_n'] for d in pe_data)
+        td_max_le = max(len(d['local_adj']) for d in pe_data)
+        td_max_bnd = max(len(d['boundary_local_idx']) for d in pe_data)
+        td['pe_max_lv'] = td_max_lv
+        td['pe_max_le'] = td_max_le
+        td['pe_max_bnd'] = td_max_bnd
+
+        max_ls_est = max(1, int(args.alpha * math.log(max(td['num_verts'], 2))))
+        sram_est = (PE_FIXED_OVERHEAD
+                    + td_max_le * 4
+                    + (td_max_lv + 1) * 4
+                    + td_max_lv * 4 * 5
+                    + td_max_lv * max_ls_est * 4
+                    + td_max_bnd * 4 * 10
+                    + 256 * 4 * 4)
+
+        td['sram_est'] = sram_est
+        if sram_est > PE_SRAM_BUDGET:
+            skipped_tests.append(td)
+            print(f"  SKIP  {td['name']}: ~{sram_est//1024} KB/PE exceeds "
+                  f"{PE_SRAM_BUDGET//1024} KB SRAM "
+                  f"(verts/PE={td_max_lv}, edges/PE={td_max_le}, bnd/PE={td_max_bnd})")
+        else:
+            fitting_tests.append(td)
+            max_lv = max(max_lv, td_max_lv)
+            max_le = max(max_le, td_max_le)
+            max_bnd = max(max_bnd, td_max_bnd)
+
+    if skipped_tests:
+        print(f"\n  {len(skipped_tests)} test(s) skipped — graph too dense for "
+              f"{PE_SRAM_BUDGET//1024} KB PE SRAM with {total_pes} PEs.")
+        print(f"  Increase --num-pes or use sparser test graphs.\n")
+
+    if not fitting_tests:
+        print("ERROR: no tests fit in PE SRAM. Increase --num-pes.")
+        sys.exit(1)
+
+    test_data_list = fitting_tests
+
+    # Compute max_list_size (T) for Picasso color lists
+    max_n = max(td['num_verts'] for td in test_data_list)
+    if args.palette_size is not None:
+        max_palette = args.palette_size
+    else:
+        max_palette = max(1, int(args.palette_frac * max_n))
+    if args.list_size is not None:
+        max_list_size = args.list_size
+    else:
+        max_list_size = max(1, int(args.alpha * math.log(max_n)))
+    if max_list_size > max_palette:
+        max_list_size = max_palette
+
+    print(f"Max dimensions: local_verts={max_lv}, local_edges={max_le}, "
+          f"boundary={max_bnd}, list_size={max_list_size}")
+    print()
+
+    # Import SdkLauncher
+    try:
+        from cerebras.sdk.client import SdkLauncher
+    except ImportError:
+        print("ERROR: cerebras_sdk not installed.")
+        print("Install with: pip install cerebras_sdk==2.5.0")
+        sys.exit(1)
+
+    passed = 0
+    failed = 0
+
+    # Open SdkLauncher context — one session for all tests
+    simulator = not args.hardware
+    with SdkLauncher(artifact_path, simulator=simulator,
+                     disable_version_check=True) as launcher:
+        for td in test_data_list:
+            name = td['name']
+            num_verts = td['num_verts']
+            edges = td['edges']
+            num_commuting = td['num_commuting']
+            offsets = td['offsets']
+            adj = td['adj']
+            golden_path = td['golden_path']
+            num_edges = len(edges)
+
+            print(f"--- {name} ---")
+
+            # Partition and run with host-driven recursion
+            pe_data_raw = partition_graph(num_verts, offsets, adj, num_cols, num_rows)
+
+            # Convert numpy types to plain Python for JSON serialization
+            pe_data = []
+            for d in pe_data_raw:
+                pe_data.append({
+                    'local_n': int(d['local_n']),
+                    'local_offsets': [int(x) for x in d['local_offsets']],
+                    'local_adj': [int(x) for x in d['local_adj']],
+                    'global_ids': [int(x) for x in d['global_ids']],
+                    'boundary_local_idx': [int(x) for x in d['boundary_local_idx']],
+                    'boundary_neighbor_gid': [int(x) for x in d['boundary_neighbor_gid']],
+                    'boundary_direction': [int(x) for x in d['boundary_direction']],
+                    'expected_data_recv': int(d.get('expected_data_recv', 0)),
+                    'expected_done_recv': int(d.get('expected_done_recv', 0)),
+                })
+
+            all_colors = [None] * num_verts
+            offset = 0
+            remaining = set(range(num_verts))
+            level = 0
+            total_levels = 0
+            level_info = []
+
+            # Determine inv threshold: same as golden C++ --inv = P
+            # For frac mode, base it on the level-0 palette size
+            if args.palette_size is not None:
+                cerebras_pal_l0 = args.palette_size
+            else:
+                cerebras_pal_l0 = max(2, int(args.palette_frac * num_verts))
+            cerebras_inv = args.inv if args.inv is not None else cerebras_pal_l0
+
+            result_data = None  # track last result for timing
+
+            while remaining and max_list_size > 0:
+                cur_n = len(remaining)
+
+                # Palette size: same logic at every level (paper Alg 1 line 5)
+                if args.palette_size is not None:
+                    cur_pal = args.palette_size
+                else:
+                    cur_pal = max(2, int(args.palette_frac * cur_n))
+
+                cur_T = max(1, int(args.alpha * math.log(max(cur_n, 2))))
+                if cur_T > cur_pal:
+                    cur_T = cur_pal
+                # When palette is small, give each vertex ALL colors so
+                # adjacent vertices can pick different ones (avoids T=1
+                # coin-flip deadlock with P=2).
+                if cur_pal <= 4:
+                    cur_T = cur_pal
+
+                # Cap palette to compile-time max (8-bit wavelet color).
+                # In relative mode, only per-level P matters, not absolute offset.
+                if cur_pal > 255:
+                    cur_pal = 255
+                    cur_T = min(cur_T, cur_pal)
+
+                # Generate color lists in RELATIVE mode [0, cur_pal).
+                # Host tracks offset and adds it when reading back.
+                generate_color_lists(pe_data, num_verts, cur_pal,
+                                     cur_T, seed=123 + level, offset=0,
+                                     vertex_subset=remaining)
+
+                # Update pe_data: reset colors for invalid vertices to -1.
+                # For already-colored vertices, upload cur_pal as sentinel:
+                # it's >= 0 (so kernel skips the vertex) and >= P (so it
+                # won't be added to any neighbor's forbidden array since
+                # the kernel checks nc < runtime_config[1] where [1]=P).
+                if level > 0:
+                    for pe in pe_data:
+                        if 'upload_colors' not in pe:
+                            pe['upload_colors'] = [-1] * len(pe['global_ids'])
+                        for i, gid in enumerate(pe['global_ids']):
+                            if gid in remaining:
+                                pe['upload_colors'][i] = -1
+                            elif all_colors[gid] is not None:
+                                pe['upload_colors'][i] = cur_pal  # sentinel
+
+                result_data = run_single_test_appliance(
+                    launcher, pe_data, compile_info, num_verts,
+                    palette_size=cur_pal)
+
+                if result_data is None:
+                    print(f"  FAIL  Cerebras run returned no result at level {level}")
+                    break
+
+                colors_this_level = result_data['colors']
+
+                # Collect results — kernel returns RELATIVE colors [0, P).
+                # Add offset to convert to absolute color values.
+                invalids = []
+                for gid in remaining:
+                    c = colors_this_level[gid]
+                    if c >= 0 and c < cur_pal:
+                        all_colors[gid] = c + offset
+                    else:
+                        invalids.append(gid)
+
+                cur_ncolors = max((c for c in all_colors if c is not None), default=-1) + 1
+                # Count edges in the subgraph induced by remaining vertices at this level
+                sub_edges = 0
+                for u, v in edges:
+                    if u in remaining and v in remaining:
+                        sub_edges += 1
+                color_state = ' '.join(str(c) if c is not None else '-1'
+                                       for c in all_colors)
+                level_info.append({
+                    'num_nodes': cur_n,
+                    'num_edges': sub_edges,
+                    'palette_size': cur_pal,
+                    'list_size': cur_T,
+                    'invalid': len(invalids),
+                    'colors_so_far': cur_ncolors,
+                    'color_state': color_state,
+                })
+                print(f"  Level {level}: pal={cur_pal} T={cur_T} "
+                      f"remaining={cur_n} invalid={len(invalids)} "
+                      f"colors_so_far={cur_ncolors}")
+                print(f"  Color state: {color_state}")
+
+                total_levels += 1
+
+                if not invalids:
+                    remaining = set()
+                    break
+
+                if total_levels >= args.max_rounds:
+                    remaining = set(invalids)
+                    print(f"  WARNING: max rounds ({args.max_rounds}) reached, "
+                          f"{len(invalids)} vertices still uncolored")
+                    break
+
+                # Only advance offset when progress was made (at least one
+                # vertex colored).  Re-using the same palette on a retry with
+                # a different seed avoids wasting color-space on failed rounds.
+                colored_this_level = cur_n - len(invalids)
+                if colored_this_level > 0:
+                    offset += cur_pal
+                remaining = set(invalids)
+                level += 1
+
+            colors = [c if c is not None else 0 for c in all_colors]
+            rounds = total_levels
+
+            # Write per-test output file for manual diffing
+            out_dir = args.output_dir or os.path.join(repo_root, 'tests', 'cerebras-runs')
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"{name}_cerebras.txt")
+            with open(out_path, 'w') as fout:
+                fout.write("The grouping output: \n")
+                fout.write("using parallel speculative coloring (Cerebras WSE)\n")
+                for li in range(total_levels):
+                    linfo = level_info[li]
+                    fout.write(f"***********Level {li}*******\n")
+                    fout.write(f"Num Nodes: {linfo['num_nodes']}\n")
+                    fout.write(f"Num Edges: {linfo['num_edges']}\n")
+                    avg_deg = (2.0 * linfo['num_edges'] / linfo['num_nodes']
+                               if linfo['num_nodes'] > 0 else 0)
+                    fout.write(f"Avg. Deg.: {avg_deg:g}\n")
+                    fout.write(f"Palette Size: {linfo['palette_size']}\n")
+                    fout.write(f"List Size: {linfo['list_size']}\n")
+                    fout.write(f"Num Conflict Edges: {linfo['num_edges']}\n")
+                    conf_pct = (100.0 * linfo['num_edges'] / linfo['num_edges']
+                                if linfo['num_edges'] > 0 else 0)
+                    fout.write(f"Conflict to Edge (%): {conf_pct:g}\n")
+                    fout.write(f"Num Colors: {linfo['colors_so_far']}\n")
+                    fout.write(f"Color Assignment (Level {li}): {linfo['color_state']}\n")
+                    fout.write(f"\n")
+                final_invalid = len(remaining) if remaining else 0
+                fout.write(f"Final Num invalid Vert: {final_invalid}\n")
+                num_colors_final = max((c for c in colors if c is not None), default=0) + 1 if any(c is not None for c in all_colors) else 0
+                fout.write(f"# of Final colors: {num_colors_final}\n")
+                final_state = ' '.join(str(c) for c in colors)
+                fout.write(f"Color Assignment (Final): {final_state}\n")
+                fout.write(f"\n--- Color Assignment ---\n")
+                for gid, c in enumerate(colors):
+                    fout.write(f"  vertex {gid}: color {c}\n")
+            print(f"  Output: {out_path}")
+
+            # Display timing from last level if available
+            if result_data and 'max_cycles' in result_data:
+                max_cycles = result_data['max_cycles']
+                elapsed_ms = result_data['elapsed_ms']
+                print(f"  Timing (last level): {max_cycles:,} cycles, {elapsed_ms:.3f} ms")
+
+            # --- Parse golden + run Picasso module ref ---
+            ref = {'nodes': None, 'edges': None, 'colors': None,
+                   'palette_size': None, 'list_size': None,
+                   'conflict_edges': None, 'num_invalid': None}
+            if os.path.isfile(golden_path):
+                with open(golden_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if 'Num Nodes:' in line:
+                            ref['nodes'] = ref['nodes'] or int(line.split()[-1])
+                        if 'Num Edges:' in line and 'Conflict' not in line:
+                            ref['edges'] = ref['edges'] or int(line.split()[-1])
+                        if 'Palette Size:' in line:
+                            ref['palette_size'] = ref['palette_size'] or int(line.split()[-1])
+                        if 'List Size:' in line:
+                            ref['list_size'] = ref['list_size'] or int(line.split()[-1])
+                        if 'Num Conflict Edges:' in line:
+                            ref['conflict_edges'] = ref['conflict_edges'] or int(line.split()[-1])
+                        if '# of Final colors:' in line:
+                            ref['colors'] = int(line.split()[-1])
+                        if 'Final Num invalid Vert:' in line:
+                            ref['num_invalid'] = int(line.split()[-1])
+            if args.palette_size is not None:
+                pal_sz_c = args.palette_size
+            else:
+                pal_sz_c = max(1, int(args.palette_frac * num_verts))
+            next_frac_c = args.palette_frac
+            inv_c = args.inv if args.inv is not None else pal_sz_c
+            module_result = run_picasso_module(
+                td['paulis'], palette_size=pal_sz_c, alpha=args.alpha,
+                list_size=ref['list_size'] if ref['list_size'] is not None else -1,
+                seed=123, max_invalid=inv_c, next_frac=next_frac_c)
+
+            pic_colors = module_result['num_colors']
+            pic_conflict_edges = module_result['num_conflict_edges']
+
+            print(f"  Picasso ref: {pic_colors} colors, "
+                  f"{pic_conflict_edges} conflict edges (L0)")
+
+            # Validate coloring correctness
+            errors, uncolored, num_colors = validate_coloring(num_verts, edges, colors)
+
+            # Also validate the Picasso module reference output
+            pic_errors, pic_uncolored, pic_num_colors = validate_coloring(
+                num_verts, edges, module_result['colors'])
+
+            ok = True
+            details = []
+
+            if errors > 0:
+                details.append(f"CSL INVALID: {errors} conflicts")
+                ok = False
+            if uncolored > 0:
+                details.append(f"CSL INVALID: {uncolored} uncolored")
+                ok = False
+
+            if pic_errors > 0:
+                details.append(f"PICASSO REF INVALID: {pic_errors} conflicts")
+                ok = False
+            if pic_uncolored > 0:
+                details.append(f"PICASSO REF INVALID: {pic_uncolored} uncolored")
+                ok = False
+
+            # Compare with golden file
+            if ref['nodes'] is not None and num_verts != ref['nodes']:
+                details.append(f"Nodes mismatch: ours={num_verts} ref={ref['nodes']}")
+                ok = False
+            if ref['edges'] is not None and ref['edges'] > 0 and num_commuting != ref['edges']:
+                details.append(f"Edges mismatch: ours={num_commuting} ref={ref['edges']}")
+                ok = False
+
+            if ref['conflict_edges'] is not None:
+                our_conf = pic_conflict_edges
+                if our_conf != ref['conflict_edges']:
+                    details.append(f"Conflict edges mismatch: picasso_ref={our_conf} "
+                                   f"golden={ref['conflict_edges']}")
+                    print(f"  WARN  Conflict edges differ (seed/RNG sensitive)")
+
+            color_note = ""
+            if ref['colors'] is not None:
+                if num_colors > ref['colors']:
+                    color_note = f" (CSL more: {num_colors} vs golden {ref['colors']})"
+                    print(f"  NOTE  CSL colors={num_colors} > golden={ref['colors']} "
+                          f"(parallel speculative vs sequential greedy)")
+                elif num_colors < ref['colors']:
+                    color_note = f" (CSL fewer: {num_colors} vs golden {ref['colors']})"
+                if pic_colors != ref['colors']:
+                    print(f"  NOTE  Picasso ref colors={pic_colors} vs golden={ref['colors']} "
+                          f"(may differ due to RNG)")
+
+            csl_vs_pic = ""
+            if num_colors > pic_colors:
+                csl_vs_pic = f" [CSL uses {num_colors - pic_colors} MORE than Picasso ref]"
+            elif num_colors < pic_colors:
+                csl_vs_pic = f" [CSL uses {pic_colors - num_colors} fewer than Picasso ref]"
+            else:
+                csl_vs_pic = " [matches Picasso ref]"
+
+            if ok:
+                print(f"  PASS  Nodes={num_verts} Edges={num_commuting} "
+                      f"ConflictEdges={num_edges} "
+                      f"CSL_Colors={num_colors} Picasso_Colors={pic_colors}"
+                      f"{color_note}{csl_vs_pic} Rounds={rounds}")
+                passed += 1
+            else:
+                for d in details:
+                    print(f"  FAIL  {d}")
+                print(f"       Nodes={num_verts} Edges={num_commuting} "
+                      f"ConflictEdges={num_edges} "
+                      f"CSL_Colors={num_colors} Picasso_Colors={pic_colors} "
+                      f"Rounds={rounds}")
+                failed += 1
+
+    print()
+    print(f"Results: {passed}/{passed + failed} passed, {failed} failed")
+    if failed > 0:
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

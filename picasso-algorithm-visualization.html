@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Picasso Graph Coloring — Algorithm Visualization</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #181b23;
+    --border: #2a2e3a;
+    --text: #e0e0e6;
+    --dim: #8b8fa3;
+    --accent: #6c8cff;
+    --accent2: #a78bfa;
+    --green: #34d399;
+    --red: #f87171;
+    --orange: #fbbf24;
+    --cyan: #22d3ee;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.6; padding: 0;
+  }
+  .header {
+    background: linear-gradient(135deg, #1a1d2e 0%, #151828 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 2rem 2rem 1.5rem;
+    text-align: center;
+  }
+  .header h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; }
+  .header h1 span { color: var(--accent); }
+  .header p { color: var(--dim); margin-top: 0.5rem; font-size: 0.95rem; }
+
+  .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+
+  /* Phase navigation */
+  .phase-nav {
+    display: flex; gap: 0.5rem; flex-wrap: wrap;
+    justify-content: center; margin-bottom: 2rem;
+  }
+  .phase-btn {
+    padding: 0.5rem 1.2rem; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--card);
+    color: var(--dim); cursor: pointer; font-size: 0.85rem;
+    transition: all 0.2s;
+  }
+  .phase-btn:hover { border-color: var(--accent); color: var(--text); }
+  .phase-btn.active {
+    background: var(--accent); color: #fff;
+    border-color: var(--accent); font-weight: 600;
+  }
+
+  .phase-panel { display: none; }
+  .phase-panel.active { display: block; }
+
+  /* Card styling */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;
+  }
+  .card h2 {
+    font-size: 1.15rem; margin-bottom: 0.75rem;
+    display: flex; align-items: center; gap: 0.5rem;
+  }
+  .card h2 .badge {
+    font-size: 0.7rem; padding: 0.15rem 0.6rem;
+    border-radius: 99px; font-weight: 600;
+  }
+  .badge-blue { background: rgba(108,140,255,0.15); color: var(--accent); }
+  .badge-green { background: rgba(52,211,153,0.15); color: var(--green); }
+  .badge-orange { background: rgba(251,191,36,0.15); color: var(--orange); }
+  .badge-purple { background: rgba(167,139,250,0.15); color: var(--accent2); }
+
+  .desc { color: var(--dim); font-size: 0.9rem; margin-bottom: 1rem; }
+
+  /* SVG canvas */
+  svg { width: 100%; height: auto; display: block; }
+  svg text { font-family: 'Segoe UI', system-ui, sans-serif; }
+
+  /* Step controls */
+  .step-controls {
+    display: flex; align-items: center; gap: 1rem;
+    margin-top: 1rem; justify-content: center;
+  }
+  .step-btn {
+    padding: 0.45rem 1.2rem; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--card);
+    color: var(--text); cursor: pointer; font-size: 0.85rem;
+    transition: all 0.2s;
+  }
+  .step-btn:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .step-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .step-btn:disabled:hover { background: var(--card); color: var(--text); }
+  .step-info { color: var(--dim); font-size: 0.85rem; min-width: 100px; text-align: center; }
+
+  /* Annotations */
+  .annotation-box {
+    background: rgba(108,140,255,0.08); border: 1px solid rgba(108,140,255,0.2);
+    border-radius: 8px; padding: 0.75rem 1rem; margin-top: 1rem;
+    font-size: 0.88rem; color: var(--text); min-height: 2.5rem;
+  }
+  .annotation-box code {
+    background: rgba(255,255,255,0.08); padding: 0.1rem 0.4rem;
+    border-radius: 4px; font-size: 0.82rem;
+  }
+
+  /* Legend */
+  .legend {
+    display: flex; gap: 1.5rem; flex-wrap: wrap;
+    margin-top: 0.75rem; font-size: 0.8rem; color: var(--dim);
+  }
+  .legend-item { display: flex; align-items: center; gap: 0.35rem; }
+  .legend-dot {
+    width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
+  }
+
+  /* Pipeline overview */
+  .pipeline-flow {
+    display: flex; align-items: center; gap: 0; flex-wrap: wrap;
+    justify-content: center; margin: 1.5rem 0;
+  }
+  .pipeline-box {
+    padding: 0.6rem 1.2rem; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--card);
+    font-size: 0.82rem; text-align: center; min-width: 130px;
+  }
+  .pipeline-box .label { font-weight: 600; color: var(--text); }
+  .pipeline-box .sub { font-size: 0.72rem; color: var(--dim); margin-top: 0.2rem; }
+  .pipeline-arrow {
+    color: var(--dim); font-size: 1.2rem; padding: 0 0.3rem;
+  }
+  .pipeline-box.highlight { border-color: var(--accent); }
+
+  /* Code reference */
+  .code-ref {
+    font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 0.78rem; color: var(--accent2);
+    background: rgba(167,139,250,0.08); padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+  }
+
+  /* Two column layout */
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  @media (max-width: 800px) { .two-col { grid-template-columns: 1fr; } }
+
+  /* Fade-in for svg elements */
+  .fade-in { animation: fadeIn 0.4s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>Picasso</span> Graph Coloring — Algorithm Visualization</h1>
+  <p>Palette-based greedy list coloring for Pauli string grouping &nbsp;·&nbsp; Ferdous et al., IPDPS 2024</p>
+</div>
+
+<div class="container">
+
+<!-- Pipeline overview -->
+<div class="card">
+  <h2>Full Pipeline Overview</h2>
+  <p class="desc">The Picasso algorithm colors Pauli strings so that commuting strings can share a group (color). It works in three phases, optionally recursing on uncolored vertices.</p>
+  <div class="pipeline-flow">
+    <div class="pipeline-box highlight" id="pov-1"><div class="label">① Pauli Strings</div><div class="sub">Load JSON input</div></div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-box" id="pov-2"><div class="label">② Palette Assignment</div><div class="sub">T random colors / vertex</div></div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-box" id="pov-3"><div class="label">③ Conflict Graph</div><div class="sub">COO → CSR (scipy)</div></div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-box" id="pov-4"><div class="label">④ Bucket Coloring</div><div class="sub">Greedy list color</div></div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-box" id="pov-5"><div class="label">⑤ Recurse / Naive</div><div class="sub">Handle invalids</div></div>
+  </div>
+</div>
+
+<!-- Phase navigation -->
+<div class="phase-nav">
+  <button class="phase-btn active" onclick="showPhase(0)">① Pauli Commutativity</button>
+  <button class="phase-btn" onclick="showPhase(1)">② Palette Assignment</button>
+  <button class="phase-btn" onclick="showPhase(2)">③ Conflict Graph (COO→CSR)</button>
+  <button class="phase-btn" onclick="showPhase(3)">④ Bucket Greedy Coloring</button>
+  <button class="phase-btn" onclick="showPhase(4)">⑤ Recursion &amp; Fallback</button>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 0: Pauli Commutativity                                  -->
+<!-- ============================================================ -->
+<div class="phase-panel active" id="phase-0">
+<div class="card">
+  <h2>Pauli String Commutativity <span class="badge badge-blue">pauli.py → is_an_edge()</span></h2>
+  <p class="desc">Two Pauli strings <b>anti-commute</b> iff the number of qubit positions where both are non-I and different is <b>odd</b>. Anti-commuting pairs form edges in the commutativity graph; they <em>cannot</em> share a group.</p>
+  <svg id="svg-pauli" viewBox="0 0 800 340"></svg>
+  <div class="step-controls">
+    <button class="step-btn" id="p0-prev" onclick="pauliStep(-1)">← Prev</button>
+    <span class="step-info" id="p0-info">Step 1 / 4</span>
+    <button class="step-btn" id="p0-next" onclick="pauliStep(1)">Next →</button>
+  </div>
+  <div class="annotation-box" id="p0-annot">We have 4 Pauli strings. Let's check which pairs commute vs anti-commute.</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 1: Palette Assignment                                   -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-1">
+<div class="card">
+  <h2>Palette Assignment <span class="badge badge-green">palette_color.py → _assign_list_color()</span></h2>
+  <p class="desc">Each vertex gets <b>T = ⌊α · ln(n)⌋</b> unique random colors drawn from [0, palSize-1] using MT19937. Colors are sorted. This is the "list" in "list coloring".</p>
+  <svg id="svg-palette" viewBox="0 0 800 300"></svg>
+  <div class="step-controls">
+    <button class="step-btn" id="p1-prev" onclick="paletteStep(-1)">← Prev</button>
+    <span class="step-info" id="p1-info">Step 1 / 5</span>
+    <button class="step-btn" id="p1-next" onclick="paletteStep(1)">Next →</button>
+  </div>
+  <div class="annotation-box" id="p1-annot">Each vertex receives a random subset of colors from the global palette.</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 2: Conflict Graph                                       -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-2">
+<div class="card">
+  <h2>Conflict Graph Construction <span class="badge badge-orange">graph_builder.py → build_conflict_graph()</span></h2>
+  <p class="desc">For each commuting pair (u,v), if their color lists share a common element, we add a <b>conflict edge</b>. The edge list (COO) is converted to CSR via <code>scipy.sparse</code>.</p>
+  <div class="two-col">
+    <div>
+      <svg id="svg-coo" viewBox="0 0 380 340"></svg>
+    </div>
+    <div>
+      <svg id="svg-csr" viewBox="0 0 380 340"></svg>
+    </div>
+  </div>
+  <div class="step-controls">
+    <button class="step-btn" id="p2-prev" onclick="conflictStep(-1)">← Prev</button>
+    <span class="step-info" id="p2-info">Step 1 / 5</span>
+    <button class="step-btn" id="p2-next" onclick="conflictStep(1)">Next →</button>
+  </div>
+  <div class="annotation-box" id="p2-annot">Scan all commuting pairs and check for color-list overlap.</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 3: Bucket Greedy Coloring                               -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-3">
+<div class="card">
+  <h2>Bucket-Based Greedy Coloring <span class="badge badge-purple">palette_color.py → conf_color_greedy()</span></h2>
+  <p class="desc">Vertices are placed in buckets by list size (smallest first). Each round: pick a random vertex from the smallest non-empty bucket, assign a tentative color, then propagate removals to neighbors via the CSR conflict graph (<code>_fix_buckets</code>).</p>
+  <svg id="svg-bucket" viewBox="0 0 800 420"></svg>
+  <div class="step-controls">
+    <button class="step-btn" id="p3-prev" onclick="bucketStep(-1)">← Prev</button>
+    <span class="step-info" id="p3-info">Step 1 / 8</span>
+    <button class="step-btn" id="p3-next" onclick="bucketStep(1)">Next →</button>
+  </div>
+  <div class="annotation-box" id="p3-annot">Place vertices into buckets by color-list size. Smallest bucket is processed first.</div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#6c8cff"></div> Uncolored</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#34d399"></div> Colored this step</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fbbf24"></div> Neighbor updated</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div> List exhausted → invalid</div>
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 4: Recursion & Fallback                                 -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-4">
+<div class="card">
+  <h2>Recursion &amp; Naive Fallback <span class="badge badge-blue">pipeline.py → run()</span></h2>
+  <p class="desc">Invalid vertices (exhausted color lists) get a fresh palette in a higher color range and re-enter the pipeline. When few remain (&le; n_inv), a simple greedy fallback finishes the job.</p>
+  <svg id="svg-recurse" viewBox="0 0 800 320"></svg>
+  <div class="annotation-box">
+    <b>Level 0:</b> All <i>n</i> vertices, palette [0, palSz). → some become invalid.<br>
+    <b>Level 1:</b> Invalid vertices get fresh palette [nColors, nColors + newPalSz). → fewer invalids.<br>
+    <b>…</b><br>
+    <b>Fallback:</b> Remaining ≤ <code>n_inv</code> vertices colored with naive greedy (<code>naive.py</code>).
+  </div>
+</div>
+</div>
+
+</div><!-- container -->
+
+<script>
+// ========== Phase Navigation ==========
+const panels = document.querySelectorAll('.phase-panel');
+const btns = document.querySelectorAll('.phase-btn');
+const povBoxes = [document.getElementById('pov-1'), document.getElementById('pov-2'),
+  document.getElementById('pov-3'), document.getElementById('pov-4'), document.getElementById('pov-5')];
+
+function showPhase(idx) {
+  panels.forEach((p,i) => { p.classList.toggle('active', i===idx); });
+  btns.forEach((b,i) => { b.classList.toggle('active', i===idx); });
+  povBoxes.forEach((b,i) => { b.classList.toggle('highlight', i===idx); });
+}
+
+// ========== Shared Drawing Helpers ==========
+const COLORS = ['#6c8cff','#34d399','#f87171','#fbbf24','#a78bfa','#22d3ee','#f472b6','#fb923c'];
+const COLOR_NAMES = ['Blue','Green','Red','Yellow','Purple','Cyan','Pink','Orange'];
+
+function drawCircle(svg, cx, cy, r, fill, stroke, id) {
+  const c = document.createElementNS('http://www.w3.org/2000/svg','circle');
+  c.setAttribute('cx', cx); c.setAttribute('cy', cy); c.setAttribute('r', r);
+  c.setAttribute('fill', fill); c.setAttribute('stroke', stroke || 'none');
+  c.setAttribute('stroke-width', '2');
+  if (id) c.setAttribute('id', id);
+  svg.appendChild(c);
+  return c;
+}
+function drawText(svg, x, y, text, size, fill, anchor, weight) {
+  const t = document.createElementNS('http://www.w3.org/2000/svg','text');
+  t.setAttribute('x', x); t.setAttribute('y', y);
+  t.setAttribute('font-size', size || 13); t.setAttribute('fill', fill || '#e0e0e6');
+  t.setAttribute('text-anchor', anchor || 'middle');
+  t.setAttribute('dominant-baseline', 'central');
+  if (weight) t.setAttribute('font-weight', weight);
+  t.textContent = text;
+  svg.appendChild(t);
+  return t;
+}
+function drawLine(svg, x1, y1, x2, y2, stroke, width, dash) {
+  const l = document.createElementNS('http://www.w3.org/2000/svg','line');
+  l.setAttribute('x1',x1); l.setAttribute('y1',y1);
+  l.setAttribute('x2',x2); l.setAttribute('y2',y2);
+  l.setAttribute('stroke', stroke||'#555'); l.setAttribute('stroke-width', width||1.5);
+  if (dash) l.setAttribute('stroke-dasharray', dash);
+  svg.appendChild(l);
+  return l;
+}
+function drawRect(svg, x, y, w, h, fill, stroke, rx) {
+  const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+  r.setAttribute('x',x); r.setAttribute('y',y); r.setAttribute('width',w); r.setAttribute('height',h);
+  r.setAttribute('fill', fill); r.setAttribute('rx', rx||4);
+  if (stroke) { r.setAttribute('stroke', stroke); r.setAttribute('stroke-width','1.5'); }
+  svg.appendChild(r);
+  return r;
+}
+function drawArrow(svg, x1, y1, x2, y2, color) {
+  // Arrow head as marker
+  const mid = 'arrow-' + Math.random().toString(36).substr(2,6);
+  const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
+  const marker = document.createElementNS('http://www.w3.org/2000/svg','marker');
+  marker.setAttribute('id', mid); marker.setAttribute('markerWidth','8');
+  marker.setAttribute('markerHeight','8'); marker.setAttribute('refX','8');
+  marker.setAttribute('refY','4'); marker.setAttribute('orient','auto');
+  const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+  path.setAttribute('d','M0,0 L8,4 L0,8 Z'); path.setAttribute('fill', color||'#555');
+  marker.appendChild(path); defs.appendChild(marker); svg.appendChild(defs);
+  const l = drawLine(svg, x1, y1, x2, y2, color||'#555', 1.5);
+  l.setAttribute('marker-end', `url(#${mid})`);
+  return l;
+}
+
+// ========== PHASE 0: Pauli Commutativity ==========
+const paulis = ['IXYZ', 'XZIY', 'YYXI', 'ZIIZ'];
+const pauliPositions = [{x:200,y:80},{x:600,y:80},{x:200,y:260},{x:600,y:260}];
+let pauliStepIdx = 0;
+const pauliSteps = [
+  { annot: 'We have 4 Pauli strings as vertices. We need to check each pair for commutativity.' },
+  { annot: 'For <b>v0=IXYZ</b> & <b>v1=XZIY</b>: positions where both non-I and different → (0: I vs X skip), (1: X≠Z ✓), (2: Y vs I skip), (3: Z vs Y ✓) → count=2 (even) → <b>Commute</b> ✅', pair:[0,1], result:'commute' },
+  { annot: 'For <b>v0=IXYZ</b> & <b>v2=YYXI</b>: pos (1: X≠Y ✓), (2: Y≠X ✓) → count=2 (even) → <b>Commute</b> ✅', pair:[0,2], result:'commute' },
+  { annot: 'For <b>v1=XZIY</b> & <b>v3=ZIIZ</b>: pos (0: X≠Z ✓), (1: Z vs I skip), (3: Y≠Z ✓) → count=2 (even) → <b>Commute</b> ✅. Anti-commuting pairs become edges (cannot share a group). Commuting pairs may share a group if color lists overlap → these form <em>conflict edges</em> in the next phase.', pair:[1,3], result:'commute' },
+];
+
+function drawPauliScene() {
+  const svg = document.getElementById('svg-pauli');
+  svg.innerHTML = '';
+  // Draw all nodes
+  for (let i = 0; i < 4; i++) {
+    const p = pauliPositions[i];
+    drawCircle(svg, p.x, p.y, 32, '#1e2233', '#3a3f55');
+    drawText(svg, p.x, p.y - 6, `v${i}`, 11, '#8b8fa3');
+    drawText(svg, p.x, p.y + 10, paulis[i], 13, '#e0e0e6', 'middle', '600');
+  }
+
+  // Draw edges up to current step
+  const drawnEdges = [];
+  for (let s = 1; s <= pauliStepIdx; s++) {
+    const step = pauliSteps[s];
+    if (!step.pair) continue;
+    const [a, b] = step.pair;
+    const pa = pauliPositions[a], pb = pauliPositions[b];
+    const color = step.result === 'commute' ? '#34d399' : '#f87171';
+    const dash = step.result === 'commute' ? '6,4' : '';
+    drawLine(svg, pa.x, pa.y, pb.x, pb.y, color, 2, dash);
+    // Label
+    const mx = (pa.x+pb.x)/2, my = (pa.y+pb.y)/2;
+    const label = step.result === 'commute' ? '✅ commute' : '✗ anti-commute';
+    drawText(svg, mx, my - 12, label, 10, color);
+  }
+
+  // Highlight current pair
+  if (pauliStepIdx > 0 && pauliSteps[pauliStepIdx].pair) {
+    const [a,b] = pauliSteps[pauliStepIdx].pair;
+    const pa = pauliPositions[a], pb = pauliPositions[b];
+    drawCircle(svg, pa.x, pa.y, 36, 'none', '#6c8cff');
+    drawCircle(svg, pb.x, pb.y, 36, 'none', '#6c8cff');
+  }
+
+  document.getElementById('p0-info').textContent = `Step ${pauliStepIdx+1} / ${pauliSteps.length}`;
+  document.getElementById('p0-annot').innerHTML = pauliSteps[pauliStepIdx].annot;
+  document.getElementById('p0-prev').disabled = pauliStepIdx === 0;
+  document.getElementById('p0-next').disabled = pauliStepIdx === pauliSteps.length - 1;
+}
+
+function pauliStep(d) {
+  pauliStepIdx = Math.max(0, Math.min(pauliSteps.length-1, pauliStepIdx + d));
+  drawPauliScene();
+}
+
+// ========== PHASE 1: Palette Assignment ==========
+let paletteStepIdx = 0;
+const palSize = 6;
+const vertexLists = [[0,2,4],[1,3,5],[0,1,3],[2,4,5]]; // T=3 colors each
+const paletteSteps = [
+  { annot: 'Global palette has <b>palSize=6</b> colors: {0,1,2,3,4,5}. Each vertex will get <b>T=3</b> random colors.' },
+  { annot: '<b>v0</b> draws 3 unique random colors from the palette using MT19937: gets <b>{0, 2, 4}</b>.', vertex: 0 },
+  { annot: '<b>v1</b> draws 3 unique random colors: gets <b>{1, 3, 5}</b>.', vertex: 1 },
+  { annot: '<b>v2</b> draws 3 unique random colors: gets <b>{0, 1, 3}</b>.', vertex: 2 },
+  { annot: '<b>v3</b> draws 3 unique random colors: gets <b>{2, 4, 5}</b>. All vertices now have color lists — sorted for fast intersection.', vertex: 3 },
+];
+
+function drawPaletteScene() {
+  const svg = document.getElementById('svg-palette');
+  svg.innerHTML = '';
+
+  // Draw global palette
+  drawText(svg, 400, 25, 'Global Palette [0, palSize-1]', 13, '#8b8fa3');
+  for (let c = 0; c < palSize; c++) {
+    const x = 200 + c * 80;
+    drawRect(svg, x, 40, 50, 28, COLORS[c]+'30', COLORS[c], 6);
+    drawText(svg, x+25, 54, c, 12, COLORS[c]);
+  }
+
+  // Draw vertices and their lists
+  for (let i = 0; i < 4; i++) {
+    const y = 120 + i * 42;
+    const show = paletteStepIdx > i;
+    const isCurrent = paletteStepIdx === i + 1;
+
+    // vertex label
+    drawText(svg, 80, y+14, `v${i}`, 13, isCurrent ? '#6c8cff' : '#8b8fa3', 'middle', isCurrent ? '700' : '400');
+
+    // list boxes
+    if (show) {
+      for (let j = 0; j < vertexLists[i].length; j++) {
+        const c = vertexLists[i][j];
+        const x = 140 + j * 65;
+        drawRect(svg, x, y, 50, 28, COLORS[c]+'25', isCurrent ? '#6c8cff' : COLORS[c], 6);
+        drawText(svg, x+25, y+14, c, 12, COLORS[c]);
+      }
+    } else {
+      drawText(svg, 200, y+14, '[ ? , ? , ? ]', 12, '#555');
+    }
+  }
+
+  document.getElementById('p1-info').textContent = `Step ${paletteStepIdx+1} / ${paletteSteps.length}`;
+  document.getElementById('p1-annot').innerHTML = paletteSteps[paletteStepIdx].annot;
+  document.getElementById('p1-prev').disabled = paletteStepIdx === 0;
+  document.getElementById('p1-next').disabled = paletteStepIdx === paletteSteps.length - 1;
+}
+
+function paletteStep(d) {
+  paletteStepIdx = Math.max(0, Math.min(paletteSteps.length-1, paletteStepIdx + d));
+  drawPaletteScene();
+}
+
+// ========== PHASE 2: Conflict Graph (COO→CSR) ==========
+let conflictStepIdx = 0;
+// Commuting pairs from phase 0: (0,1), (0,2), (1,3)
+// Check color list overlap:
+// (0,1): {0,2,4} ∩ {1,3,5} = {} → no conflict
+// (0,2): {0,2,4} ∩ {0,1,3} = {0} → conflict!
+// (1,3): {1,3,5} ∩ {2,4,5} = {5} → conflict!
+const conflictSteps = [
+  { annot: 'Check each commuting pair for color-list overlap. Overlap → <b>conflict edge</b>.' },
+  { annot: 'Pair <b>(v0,v1)</b>: lists {0,2,4} ∩ {1,3,5} = <b>∅</b> → No conflict edge.', pair:[0,1], conflict:false },
+  { annot: 'Pair <b>(v0,v2)</b>: lists {0,2,4} ∩ {0,1,3} = <b>{0}</b> → <b>Conflict edge!</b> Added to COO list.', pair:[0,2], conflict:true },
+  { annot: 'Pair <b>(v1,v3)</b>: lists {1,3,5} ∩ {2,4,5} = <b>{5}</b> → <b>Conflict edge!</b> Added to COO list.', pair:[1,3], conflict:true },
+  { annot: 'COO edges: [(0,2),(2,0),(1,3),(3,1)]. Converted to <b>CSR</b> via <code>scipy.sparse.coo_array.tocsr()</code>. Offsets=[0,1,1,2,3], Adj=[2,0,3,1].' },
+];
+
+function drawConflictScene() {
+  const svgCoo = document.getElementById('svg-coo');
+  const svgCsr = document.getElementById('svg-csr');
+  svgCoo.innerHTML = ''; svgCsr.innerHTML = '';
+
+  // COO side: graph
+  drawText(svgCoo, 190, 20, 'Conflict Graph (COO edges)', 12, '#8b8fa3');
+  const gPos = [{x:100,y:100},{x:280,y:100},{x:100,y:260},{x:280,y:260}];
+  // Draw edges
+  const conflictEdges = [];
+  for (let s = 1; s < Math.min(conflictStepIdx+1, conflictSteps.length); s++) {
+    const step = conflictSteps[s];
+    if (!step.pair) continue;
+    const [a,b] = step.pair;
+    if (step.conflict) {
+      conflictEdges.push([a,b]);
+      drawLine(svgCoo, gPos[a].x, gPos[a].y, gPos[b].x, gPos[b].y, '#f87171', 2.5);
+      const mx = (gPos[a].x+gPos[b].x)/2, my = (gPos[a].y+gPos[b].y)/2;
+      drawText(svgCoo, mx + (a===0?-18:18), my, '⚡', 14, '#f87171');
+    } else {
+      drawLine(svgCoo, gPos[a].x, gPos[a].y, gPos[b].x, gPos[b].y, '#2a3a2a', 1.5, '4,4');
+      const mx = (gPos[a].x+gPos[b].x)/2, my = (gPos[a].y+gPos[b].y)/2;
+      drawText(svgCoo, mx, my-12, '∅', 12, '#555');
+    }
+  }
+  // Draw nodes
+  for (let i = 0; i < 4; i++) {
+    const active = conflictStepIdx > 0 && conflictSteps[conflictStepIdx].pair &&
+                   conflictSteps[conflictStepIdx].pair.includes(i);
+    drawCircle(svgCoo, gPos[i].x, gPos[i].y, 24, '#1e2233', active ? '#6c8cff' : '#3a3f55');
+    drawText(svgCoo, gPos[i].x, gPos[i].y, `v${i}`, 12, '#e0e0e6');
+  }
+
+  // CSR side: matrix representation
+  drawText(svgCsr, 190, 20, 'CSR Arrays (scipy.sparse)', 12, '#8b8fa3');
+  if (conflictStepIdx >= 4) {
+    const offsets = [0,1,1,2,3];
+    const adj = [2,0,3,1];
+    // Offsets array
+    drawText(svgCsr, 40, 60, 'offsets:', 11, '#8b8fa3', 'start');
+    for (let i = 0; i < offsets.length; i++) {
+      drawRect(svgCsr, 110 + i*48, 46, 40, 28, '#1e2233', '#3a3f55', 4);
+      drawText(svgCsr, 130 + i*48, 60, offsets[i], 12, '#6c8cff');
+      drawText(svgCsr, 130 + i*48, 84, i, 9, '#555');
+    }
+    // Adj array
+    drawText(svgCsr, 40, 130, 'adj:', 11, '#8b8fa3', 'start');
+    for (let i = 0; i < adj.length; i++) {
+      drawRect(svgCsr, 110 + i*48, 116, 40, 28, '#1e2233', '#3a3f55', 4);
+      drawText(svgCsr, 130 + i*48, 130, `v${adj[i]}`, 12, '#34d399');
+      drawText(svgCsr, 130 + i*48, 154, i, 9, '#555');
+    }
+    // Show neighbor lookup
+    drawText(svgCsr, 40, 190, 'neighbors_of(v0):', 11, '#8b8fa3', 'start');
+    drawText(svgCsr, 200, 190, 'adj[0..1] → [v2]', 11, '#34d399', 'start');
+    drawText(svgCsr, 40, 212, 'neighbors_of(v2):', 11, '#8b8fa3', 'start');
+    drawText(svgCsr, 200, 212, 'adj[1..2] → [v0]', 11, '#34d399', 'start');
+    drawText(svgCsr, 40, 234, 'neighbors_of(v3):', 11, '#8b8fa3', 'start');
+    drawText(svgCsr, 200, 234, 'adj[2..3] → [v1]', 11, '#34d399', 'start');
+
+    // Visual: COO → CSR arrow
+    drawText(svgCsr, 190, 280, 'coo_array((data,(rows,cols))).tocsr()', 10, '#a78bfa');
+  } else {
+    drawText(svgCsr, 190, 170, 'Build COO edges first...', 12, '#555');
+    // Show partial COO list
+    if (conflictStepIdx >= 2) {
+      drawText(svgCsr, 40, 100, 'COO edges so far:', 11, '#8b8fa3', 'start');
+      let y = 125;
+      if (conflictStepIdx >= 2) { drawText(svgCsr, 50, y, '(v0, v2)', 11, '#f87171', 'start'); y += 22; }
+      if (conflictStepIdx >= 3) { drawText(svgCsr, 50, y, '(v1, v3)', 11, '#f87171', 'start'); }
+    }
+  }
+
+  document.getElementById('p2-info').textContent = `Step ${conflictStepIdx+1} / ${conflictSteps.length}`;
+  document.getElementById('p2-annot').innerHTML = conflictSteps[conflictStepIdx].annot;
+  document.getElementById('p2-prev').disabled = conflictStepIdx === 0;
+  document.getElementById('p2-next').disabled = conflictStepIdx === conflictSteps.length - 1;
+}
+
+function conflictStep(d) {
+  conflictStepIdx = Math.max(0, Math.min(conflictSteps.length-1, conflictStepIdx + d));
+  drawConflictScene();
+}
+
+// ========== PHASE 3: Bucket Greedy Coloring ==========
+let bucketStepIdx = 0;
+// Conflict graph: v0–v2, v1–v3
+// Color lists: v0={0,2,4}, v1={1,3,5}, v2={0,1,3}, v3={2,4,5}
+// All lists have 3 colors → all go to bucket[2] (0-indexed)
+// v1 has degree 0 in conflict graph → colored immediately to color 3
+
+const bucketSteps = [
+  {
+    annot: 'Place vertices in buckets by color-list size. All have T=3 → bucket[2]. But <b>v1</b> has degree 0 in conflict graph → colored immediately with random pick from list.',
+    buckets: [[],[],[0,2,3]], colors: {0:-1,1:3,2:-1,3:-1}, highlight: [], lists: {0:[0,2,4],1:[1,3,5],2:[0,1,3],3:[2,4,5]}
+  },
+  {
+    annot: 'Pick random vertex from smallest non-empty bucket → bucket[2] → select <b>v0</b>. Attempt to color: pick random from list {0,2,4} → gets <b>color 2</b>.',
+    buckets: [[],[],[2,3]], colors: {0:2,1:3,2:-1,3:-1}, highlight: [0], lists: {0:[0,2,4],1:[1,3,5],2:[0,1,3],3:[2,4,5]}
+  },
+  {
+    annot: '<code>_fix_buckets(v0, color=2)</code>: Check conflict neighbors of v0. Neighbor <b>v2</b> has list {0,1,3} — color 2 not present → no change.',
+    buckets: [[],[],[2,3]], colors: {0:2,1:3,2:-1,3:-1}, highlight: [], neighborCheck: [2], lists: {0:[0,2,4],1:[1,3,5],2:[0,1,3],3:[2,4,5]}
+  },
+  {
+    annot: 'Pick from smallest bucket → bucket[2] → select <b>v3</b>. Attempt to color: pick random from list {2,4,5} → gets <b>color 4</b>.',
+    buckets: [[],[],[2]], colors: {0:2,1:3,2:-1,3:4}, highlight: [3], lists: {0:[0,2,4],1:[1,3,5],2:[0,1,3],3:[2,4,5]}
+  },
+  {
+    annot: '<code>_fix_buckets(v3, color=4)</code>: Conflict neighbor of v3 is <b>v1</b>. But v1 is already colored → skip.',
+    buckets: [[],[],[2]], colors: {0:2,1:3,2:-1,3:4}, highlight: [], lists: {0:[0,2,4],1:[1,3,5],2:[0,1,3],3:[2,4,5]}
+  },
+  {
+    annot: 'Pick from bucket[2] → select <b>v2</b>. Attempt to color: pick random from list {0,1,3} → gets <b>color 1</b>.',
+    buckets: [[],[],[]], colors: {0:2,1:3,2:1,3:4}, highlight: [2], lists: {0:[0,2,4],1:[1,3,5],2:[0,1,3],3:[2,4,5]}
+  },
+  {
+    annot: '<code>_fix_buckets(v2, color=1)</code>: Conflict neighbor <b>v0</b> is already colored → skip. No more uncolored neighbors.',
+    buckets: [[],[],[]], colors: {0:2,1:3,2:1,3:4}, highlight: [], lists: {0:[0,2,4],1:[1,3,5],2:[0,1,3],3:[2,4,5]}
+  },
+  {
+    annot: '<b>All vertices colored!</b> Final: v0=2, v1=3, v2=1, v3=4. No invalid vertices → no recursion needed. Uses 5 colors (0–4).',
+    buckets: [[],[],[]], colors: {0:2,1:3,2:1,3:4}, highlight: [0,1,2,3], lists: {0:[0,2,4],1:[1,3,5],2:[0,1,3],3:[2,4,5]}
+  },
+];
+
+function drawBucketScene() {
+  const svg = document.getElementById('svg-bucket');
+  svg.innerHTML = '';
+  const step = bucketSteps[bucketStepIdx];
+
+  // Draw buckets on the left
+  drawText(svg, 100, 20, 'Buckets (by list size)', 12, '#8b8fa3');
+  for (let b = 0; b < 3; b++) {
+    const y = 50 + b * 55;
+    drawRect(svg, 20, y, 180, 42, '#1a1d28', '#2a2e3a', 6);
+    drawText(svg, 30, y + 21, `[${b}]`, 10, '#555', 'start');
+    const verts = step.buckets[b];
+    for (let j = 0; j < verts.length; j++) {
+      const v = verts[j];
+      drawRect(svg, 60 + j * 50, y + 6, 40, 30, '#1e2233', '#3a3f55', 4);
+      drawText(svg, 80 + j * 50, y + 21, `v${v}`, 11, '#e0e0e6');
+    }
+    if (verts.length === 0) {
+      drawText(svg, 120, y + 21, 'empty', 10, '#333');
+    }
+  }
+
+  // Draw graph in the center
+  const gx = 400, gy = 200;
+  const nodePos = [{x:gx-80,y:gy-70},{x:gx+80,y:gy-70},{x:gx-80,y:gy+70},{x:gx+80,y:gy+70}];
+  // Conflict edges: 0-2, 1-3
+  drawLine(svg, nodePos[0].x, nodePos[0].y, nodePos[2].x, nodePos[2].y, '#f8717140', 2);
+  drawLine(svg, nodePos[1].x, nodePos[1].y, nodePos[3].x, nodePos[3].y, '#f8717140', 2);
+  drawText(svg, gx, 25, 'Conflict Graph', 12, '#8b8fa3');
+
+  for (let i = 0; i < 4; i++) {
+    const col = step.colors[i];
+    const isHighlight = step.highlight && step.highlight.includes(i);
+    const isNeighborCheck = step.neighborCheck && step.neighborCheck.includes(i);
+    let fill = '#1e2233', stroke = '#3a3f55';
+    if (col >= 0) { fill = COLORS[col] + '30'; stroke = COLORS[col]; }
+    if (isHighlight) { stroke = '#34d399'; }
+    if (isNeighborCheck) { stroke = '#fbbf24'; }
+    drawCircle(svg, nodePos[i].x, nodePos[i].y, 28, fill, stroke);
+    drawText(svg, nodePos[i].x, nodePos[i].y - 7, `v${i}`, 10, '#8b8fa3');
+    if (col >= 0) {
+      drawText(svg, nodePos[i].x, nodePos[i].y + 9, `c=${col}`, 11, COLORS[col], 'middle', '600');
+    } else {
+      drawText(svg, nodePos[i].x, nodePos[i].y + 9, '?', 12, '#555');
+    }
+  }
+
+  // Draw color lists on the right
+  drawText(svg, 650, 25, 'Color Lists', 12, '#8b8fa3');
+  for (let i = 0; i < 4; i++) {
+    const y = 50 + i * 55;
+    const crossed = step.colors[i] >= 0;
+    drawText(svg, 570, y + 21, `v${i}:`, 11, crossed ? '#555' : '#8b8fa3', 'start');
+    const list = step.lists[i];
+    for (let j = 0; j < list.length; j++) {
+      const c = list[j];
+      const isCurrent = step.colors[i] === c;
+      drawRect(svg, 600 + j * 50, y + 4, 38, 28, isCurrent ? COLORS[c]+'40' : '#1e2233',
+               isCurrent ? COLORS[c] : '#2a2e3a', 4);
+      drawText(svg, 619 + j * 50, y + 18, c, 11, isCurrent ? COLORS[c] : (crossed ? '#444' : '#e0e0e6'));
+    }
+    if (crossed) {
+      drawText(svg, 760, y + 21, '✓', 14, '#34d399', 'start');
+    }
+  }
+
+  // Legend arrow for conflict edge
+  drawText(svg, 330, 395, '— conflict edge', 10, '#f87171', 'start');
+  drawLine(svg, 310, 395, 328, 395, '#f87171', 2);
+
+  document.getElementById('p3-info').textContent = `Step ${bucketStepIdx+1} / ${bucketSteps.length}`;
+  document.getElementById('p3-annot').innerHTML = bucketSteps[bucketStepIdx].annot;
+  document.getElementById('p3-prev').disabled = bucketStepIdx === 0;
+  document.getElementById('p3-next').disabled = bucketStepIdx === bucketSteps.length - 1;
+}
+
+function bucketStep(d) {
+  bucketStepIdx = Math.max(0, Math.min(bucketSteps.length-1, bucketStepIdx + d));
+  drawBucketScene();
+}
+
+// ========== PHASE 4: Recursion (static diagram) ==========
+function drawRecurseScene() {
+  const svg = document.getElementById('svg-recurse');
+  svg.innerHTML = '';
+
+  const levels = [
+    { label: 'Level 0', desc: 'All n vertices', palette: '[0, palSz)', color: '#6c8cff', y: 40 },
+    { label: 'Level 1', desc: 'Invalid vertices', palette: '[nColors₀, nColors₀ + newPal)', color: '#a78bfa', y: 130 },
+    { label: 'Level 2', desc: 'Still invalid', palette: '[nColors₁, …)', color: '#f472b6', y: 220 },
+  ];
+
+  for (let i = 0; i < levels.length; i++) {
+    const l = levels[i];
+    // Box for level
+    drawRect(svg, 40, l.y, 200, 60, l.color + '10', l.color, 8);
+    drawText(svg, 140, l.y + 18, l.label, 13, l.color, 'middle', '600');
+    drawText(svg, 140, l.y + 40, l.desc, 10, '#8b8fa3');
+
+    // Arrow phases
+    const phases = ['Assign\nLists', 'Build\nConflict', 'Bucket\nColor'];
+    for (let p = 0; p < 3; p++) {
+      const x = 300 + p * 140;
+      drawRect(svg, x, l.y + 5, 100, 50, '#1e2233', '#2a2e3a', 6);
+      drawText(svg, x + 50, l.y + 22, phases[p].split('\n')[0], 10, '#e0e0e6');
+      drawText(svg, x + 50, l.y + 38, phases[p].split('\n')[1] || '', 10, '#8b8fa3');
+      if (p < 2) {
+        drawArrow(svg, x + 104, l.y + 30, x + 136, l.y + 30, '#555');
+      }
+    }
+    // Arrow connecting phases to level
+    drawArrow(svg, 244, l.y + 30, 296, l.y + 30, l.color);
+
+    // "invalids" arrow going down
+    if (i < levels.length - 1) {
+      const nx = 680;
+      drawText(svg, nx + 30, l.y + 30, 'invalids ↓', 10, '#f87171');
+      drawArrow(svg, nx + 30, l.y + 50, nx + 30, levels[i+1].y + 10, '#f87171');
+    }
+  }
+
+  // Naive fallback
+  drawRect(svg, 40, 290, 200, 28, '#fbbf2420', '#fbbf24', 6);
+  drawText(svg, 140, 304, 'Naive Greedy Fallback', 11, '#fbbf24', 'middle', '600');
+  drawArrow(svg, 710, 270, 244, 304, '#fbbf24');
+  drawText(svg, 480, 280, '≤ n_inv remaining', 10, '#fbbf24');
+}
+
+// ========== Init ==========
+drawPauliScene();
+drawPaletteScene();
+drawConflictScene();
+drawBucketScene();
+drawRecurseScene();
+</script>
+</body>
+</html>

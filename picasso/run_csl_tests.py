@@ -561,7 +561,7 @@ def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1):
 
 
 def generate_color_lists(pe_data, num_verts, palette_size, list_size, seed=123,
-                         offset=0, vertex_subset=None):
+                         offset=0, vertex_subset=None, kernel_stride=None):
     """Generate random per-vertex color lists for Picasso palette coloring.
 
     Each vertex gets a random subset of size `list_size` from
@@ -575,9 +575,16 @@ def generate_color_lists(pe_data, num_verts, palette_size, list_size, seed=123,
         seed: RNG seed (same as golden for reproducibility)
         offset: starting color index (for recursion levels)
         vertex_subset: set of GIDs to generate lists for (None = all)
+        kernel_stride: compile-time max_list_size used by the kernel
+            to index into the flat color_list array.  When cur_T < max_list_size
+            at deeper recursion levels, the host must pad each vertex's
+            entries to this stride so the layout matches the kernel.
+            If None, defaults to list_size (no extra padding).
     """
     import random
     rng = random.Random(seed)
+
+    stride = kernel_stride if kernel_stride is not None else list_size
 
     # Generate global color list for each vertex (by GID)
     target_gids = range(num_verts) if vertex_subset is None else vertex_subset
@@ -598,15 +605,15 @@ def generate_color_lists(pe_data, num_verts, palette_size, list_size, seed=123,
             if gid in global_lists:
                 lst = global_lists[gid]
                 list_len.append(len(lst))
-                padded = lst + [0] * (list_size - len(lst))
+                padded = lst + [0] * (stride - len(lst))
                 color_list.extend(padded)
             else:
                 # Keep existing list (vertex already colored)
                 list_len.append(0)
-                color_list.extend([0] * list_size)
+                color_list.extend([0] * stride)
         pe['color_list'] = color_list
         pe['list_len'] = list_len
-        pe['max_list_size'] = list_size
+        pe['max_list_size'] = stride
 
 
 # ---------------------------------------------------------------------------
@@ -1243,25 +1250,16 @@ def main():
     # Use a conservative max_relay estimate for early warning.
     # This runs on raw edges before any partitioning work.
     print("Pre-partition relay overflow prediction:")
-    any_overflow = False
     for td in test_data_list:
         early = predict_relay_overflow(
             td['num_verts'], td['edges'], num_cols, num_rows,
-            max_relay=256)
-        print(f"  [{td['name']}] peak relay: {early['max_load']}, "
-              f"boundary wavelets: {early['total_boundary']}")
-        if early['overflow_pes']:
-            any_overflow = True
-            print(f"    OVERFLOW at max_relay=256: "
-                  f"{len(early['overflow_pes'])} PE-direction pairs affected")
-            print(f"    Minimum safe max_relay: {early['max_load']}")
-            sram = early['max_load'] * 4 * 4
-            print(f"    SRAM cost: {sram:,} bytes ({sram/1024:.1f} KB)")
-    if any_overflow:
-        print()
-        print("  Some tests will overflow at default buffer size.")
-        print("  Proceeding — relay overflow leads to lossy rounds, "
-              "not crashes.")
+            max_relay=100000)  # large value to find actual peak
+        td['relay_peak'] = early['max_load']
+        print(f"  [{td['name']}] peak relay (×headroom): {early['max_load']}, "
+              f"boundary={early['total_boundary']}")
+        relay_sram = early['max_load'] * 4 * 4
+        print(f"    Required max_relay: {early['max_load']} "
+              f"(SRAM cost: {relay_sram:,} bytes, {relay_sram/1024:.1f} KB)")
     print()
 
     # Partition every test and estimate per-PE SRAM usage.
@@ -1291,15 +1289,16 @@ def main():
         #   list_len:             max_lv * 4
         #   boundary arrays (6):  max_bnd * 4 * 6
         #   send bufs (4):        max_bnd * 4 * 4
-        #   relay bufs (4):       256 * 4 * 4
+        #   relay bufs (4):       relay_peak * 4 * 4
+        td_relay = td.get('relay_peak', 1)
         max_ls_est = max(1, int(args.alpha * math.log(max(td['num_verts'], 2))))
         sram_est = (PE_FIXED_OVERHEAD
                     + td_max_le * 4                # csr_adj
                     + (td_max_lv + 1) * 4          # csr_offsets
                     + td_max_lv * 4 * 5            # colors, tentative, gids, list_len, forbidden
                     + td_max_lv * max_ls_est * 4   # color_list
-                    + td_max_bnd * 4 * 10          # boundary + send bufs
-                    + 256 * 4 * 4)                 # relay bufs
+                    + td_max_bnd * 4 * 8           # boundary (4) + send bufs (4)
+                    + td_relay * 4 * 4)            # relay bufs (actual peak)
 
         td['sram_est'] = sram_est
         if sram_est > PE_SRAM_BUDGET:
@@ -1325,9 +1324,8 @@ def main():
     test_data_list = fitting_tests
 
     # max_relay: relay buffer size for checkerboard SW relay.
-    # Bounded by PE memory (~48KB). Each relay entry is 4 bytes × 4 directions.
-    # Use min(generous_estimate, memory_limit).
-    max_relay = min(max_bnd * max(num_cols - 1, 1), 256)
+    # Use the actual peak relay load from predict_relay_overflow.
+    max_relay = max(td.get('relay_peak', 1) for td in test_data_list)
 
     # Compute max_list_size (T) for Picasso color lists
     max_n = max(td['num_verts'] for td in test_data_list)
@@ -1469,9 +1467,13 @@ def main():
 
                 # Generate color lists in RELATIVE mode [0, cur_pal).
                 # Host tracks offset and adds it when reading back.
+                # kernel_stride must match the compile-time max_list_size
+                # so the flat array layout aligns with the kernel's indexing
+                # (base = v * max_list_size).
                 generate_color_lists(pe_data, num_verts, cur_pal,
                                      cur_T, seed=123 + level, offset=0,
-                                     vertex_subset=remaining)
+                                     vertex_subset=remaining,
+                                     kernel_stride=max_list_size)
 
                 # Update pe_data: reset colors for invalid vertices to -1.
                 # For already-colored vertices, upload cur_pal as sentinel:
@@ -1487,6 +1489,44 @@ def main():
                                 pe['upload_colors'][i] = -1
                             elif all_colors[gid] is not None:
                                 pe['upload_colors'][i] = cur_pal  # sentinel
+
+                # Recompute expected_data_recv and expected_done_recv for
+                # this level.  The kernel now skips sending wavelets for
+                # already-colored vertices (color >= pal_threshold), so
+                # the receiver must expect fewer wavelets.
+                if level > 0:
+                    colored_gids = set(gid for gid in range(num_verts)
+                                       if all_colors[gid] is not None
+                                       and gid not in remaining)
+                    total_pes = num_cols * num_rows
+                    gid_to_pe_fn = lambda g: g & (total_pes - 1)
+                    recv_counts = [0] * total_pes
+                    done_sources = [set() for _ in range(total_pes)]
+                    for src_pe_idx in range(total_pes):
+                        pe = pe_data[src_pe_idx]
+                        gids = pe['global_ids']
+                        bnd_local = pe['boundary_local_idx']
+                        bnd_nbr = pe['boundary_neighbor_gid']
+                        for bi in range(len(bnd_nbr)):
+                            li = bnd_local[bi]
+                            gid = gids[li] if li < len(gids) else -1
+                            if gid in colored_gids:
+                                continue  # kernel will skip this send
+                            dst_pe = gid_to_pe_fn(bnd_nbr[bi])
+                            if dst_pe != src_pe_idx:
+                                recv_counts[dst_pe] += 1
+                                done_sources[dst_pe].add(src_pe_idx)
+                    for pe_idx in range(total_pes):
+                        pe_data[pe_idx]['expected_data_recv'] = recv_counts[pe_idx]
+                        pe_data[pe_idx]['expected_done_recv'] = len(done_sources[pe_idx])
+
+                    # Debug: print expected recv counts per PE
+                    edr_str = ' '.join(
+                        f"PE{pi}:data={pe_data[pi]['expected_data_recv']}"
+                        f",done={pe_data[pi]['expected_done_recv']}"
+                        for pi in range(total_pes))
+                    print(f"  expected_recv: {edr_str}")
+                    print(f"  colored_gids={len(colored_gids)} remaining={len(remaining)}")
 
                 if args.mode == 'appliance':
                     result_data = run_single_test_appliance(

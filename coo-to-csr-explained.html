@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>COO → CSR Conversion — Step by Step</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', Arial, sans-serif; background: #0d1117; color: #c9d1d9; }
+
+.header {
+  text-align: center; padding: 18px; background: #161b22;
+  border-bottom: 1px solid #30363d;
+}
+.header h1 { font-size: 1.5em; color: #58a6ff; }
+.header p { color: #8b949e; font-size: 0.9em; margin-top: 4px; }
+
+.controls {
+  display: flex; justify-content: center; gap: 10px; padding: 12px;
+  background: #161b22; border-bottom: 1px solid #30363d;
+}
+.controls button {
+  padding: 8px 20px; border: 1px solid #30363d; border-radius: 6px;
+  background: #21262d; color: #c9d1d9; cursor: pointer; font-size: 0.9em;
+}
+.controls button:hover { background: #30363d; }
+.controls button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+.controls button.primary:hover { background: #2ea043; }
+.controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.step-indicator {
+  text-align: center; padding: 8px; font-size: 0.85em; color: #8b949e;
+  background: #0d1117;
+}
+.step-indicator .phase {
+  display: inline-block; padding: 3px 12px; border-radius: 12px; margin: 0 4px;
+  background: #21262d; color: #8b949e; font-size: 0.85em;
+}
+.step-indicator .phase.active {
+  background: #1f6feb; color: #fff;
+}
+
+.main {
+  display: grid; grid-template-columns: 300px 1fr; gap: 0;
+  height: calc(100vh - 140px);
+}
+
+/* Left panel - graph */
+.graph-panel {
+  background: #161b22; border-right: 1px solid #30363d;
+  display: flex; flex-direction: column;
+}
+.graph-panel h2 {
+  padding: 10px 14px; font-size: 1em; color: #58a6ff;
+  border-bottom: 1px solid #30363d;
+}
+.graph-panel svg { flex: 1; }
+
+/* Right panel */
+.right-panel {
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+.data-area {
+  flex: 1; overflow-y: auto; padding: 16px;
+}
+
+/* Array visualization */
+.array-section {
+  margin-bottom: 20px;
+}
+.array-section h3 {
+  font-size: 0.95em; color: #d2a8ff; margin-bottom: 8px;
+}
+.array-section .desc {
+  font-size: 0.8em; color: #8b949e; margin-bottom: 8px;
+}
+
+.array-row {
+  display: flex; align-items: center; margin-bottom: 6px; gap: 4px;
+}
+.array-label {
+  font-size: 0.75em; color: #8b949e; width: 80px; text-align: right;
+  padding-right: 8px; flex-shrink: 0;
+}
+.array-cell {
+  width: 44px; height: 36px; display: flex; align-items: center;
+  justify-content: center; border: 1px solid #30363d; border-radius: 4px;
+  background: #21262d; font-size: 0.85em; font-family: 'Consolas', monospace;
+  transition: all 0.3s ease; position: relative; flex-shrink: 0;
+}
+.array-cell.highlight {
+  background: #1f6feb; border-color: #58a6ff; color: #fff;
+  box-shadow: 0 0 8px rgba(31,111,235,0.4);
+}
+.array-cell.writing {
+  background: #238636; border-color: #2ea043; color: #fff;
+  box-shadow: 0 0 8px rgba(35,134,54,0.5);
+}
+.array-cell.reading {
+  background: #9e6a03; border-color: #d29922; color: #fff;
+}
+.array-cell.empty {
+  color: #484f58;
+}
+.array-cell .index {
+  position: absolute; top: -14px; font-size: 0.65em; color: #484f58;
+}
+
+/* COO edge list */
+.coo-list {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px;
+}
+.coo-edge {
+  padding: 6px 12px; background: #21262d; border: 1px solid #30363d;
+  border-radius: 6px; font-family: 'Consolas', monospace; font-size: 0.85em;
+  transition: all 0.3s ease;
+}
+.coo-edge.active {
+  background: #1f6feb; border-color: #58a6ff; color: #fff;
+  box-shadow: 0 0 8px rgba(31,111,235,0.4);
+}
+.coo-edge.processed {
+  background: #238636; border-color: #2ea043; color: #fff;
+}
+.coo-edge.dimmed { opacity: 0.35; }
+
+/* Step log */
+.step-log {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+  padding: 12px; margin-top: 12px; max-height: 200px; overflow-y: auto;
+}
+.step-log h3 {
+  font-size: 0.9em; color: #f0883e; margin-bottom: 8px;
+}
+.log-entry {
+  font-size: 0.8em; padding: 4px 0; border-bottom: 1px solid #21262d;
+  font-family: 'Consolas', monospace; line-height: 1.5;
+}
+.log-entry:last-child { border-bottom: none; }
+.log-entry .action { color: #7ee787; }
+.log-entry .value { color: #79c0ff; }
+.log-entry .note { color: #8b949e; }
+
+/* Narration box */
+.narration {
+  background: #1c2333; border: 1px solid #1f6feb; border-radius: 8px;
+  padding: 14px; margin-bottom: 16px; font-size: 0.9em; line-height: 1.6;
+  color: #e6edf3;
+}
+.narration strong { color: #58a6ff; }
+.narration code {
+  background: #21262d; padding: 1px 5px; border-radius: 3px;
+  font-family: 'Consolas', monospace; color: #79c0ff; font-size: 0.9em;
+}
+
+/* Degree table */
+.degree-table {
+  display: flex; gap: 2px; margin-bottom: 8px;
+}
+.degree-cell {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+}
+.degree-cell .vtx {
+  font-size: 0.7em; color: #8b949e;
+}
+.degree-cell .val {
+  width: 40px; height: 32px; display: flex; align-items: center;
+  justify-content: center; border: 1px solid #30363d; border-radius: 4px;
+  background: #21262d; font-family: 'Consolas', monospace; font-size: 0.85em;
+  transition: all 0.3s ease;
+}
+.degree-cell .val.highlight {
+  background: #1f6feb; border-color: #58a6ff; color: #fff;
+}
+.degree-cell .val.writing {
+  background: #238636; border-color: #2ea043; color: #fff;
+}
+
+/* SVG styles */
+.graph-edge { stroke: #30363d; stroke-width: 2; }
+.graph-edge.active { stroke: #f0883e; stroke-width: 3; }
+.graph-edge.processed { stroke: #238636; stroke-width: 2.5; }
+.graph-node { fill: #21262d; stroke: #58a6ff; stroke-width: 2; }
+.graph-node.active { fill: #1f6feb; stroke: #79c0ff; stroke-width: 3; }
+.graph-node-label { fill: #e6edf3; font-size: 14px; font-weight: bold; text-anchor: middle; dominant-baseline: central; }
+
+/* Arrow connector */
+.arrow-section {
+  text-align: center; padding: 8px; font-size: 1.5em; color: #484f58;
+}
+
+.bracket {
+  font-size: 0.7em; color: #484f58; font-family: 'Consolas', monospace;
+}
+
+/* CSR lookup demo */
+.lookup-demo {
+  background: #1c2333; border: 1px solid #d2a8ff; border-radius: 8px;
+  padding: 14px; margin-top: 12px;
+}
+.lookup-demo h4 { color: #d2a8ff; margin-bottom: 8px; font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>COO → CSR Conversion — Step by Step</h1>
+  <p>How GPUs build a conflict graph: from unordered edge pairs to efficient neighbor lists</p>
+</div>
+
+<div class="controls">
+  <button onclick="reset()">⟲ Reset</button>
+  <button onclick="prevStep()">← Back</button>
+  <button class="primary" onclick="nextStep()">Next Step →</button>
+  <button onclick="autoPlay()">▶ Auto</button>
+  <span style="color:#8b949e; font-size:0.85em; align-self:center; margin-left:8px;">
+    Step <span id="stepNum">0</span> / <span id="totalSteps">0</span>
+  </span>
+</div>
+
+<div class="step-indicator">
+  <span class="phase active" id="phase0">Setup</span>
+  <span class="phase" id="phase1">Step 1: Build COO + Count Degrees</span>
+  <span class="phase" id="phase2">Step 2: Prefix Sum</span>
+  <span class="phase" id="phase3">Step 3: Scatter to CSR</span>
+  <span class="phase" id="phase4">Done: Use CSR</span>
+</div>
+
+<div class="main">
+  <!-- Left: Graph -->
+  <div class="graph-panel">
+    <h2>Example Graph (5 vertices, 5 edges)</h2>
+    <svg id="graphSvg" viewBox="0 0 280 350"></svg>
+  </div>
+
+  <!-- Right: Data -->
+  <div class="right-panel">
+    <div class="data-area" id="dataArea">
+      <!-- Populated by JS -->
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// Graph definition: 5 vertices, 5 undirected edges
+// ============================================================
+const VERTICES = [0, 1, 2, 3, 4];
+const EDGES = [
+  [0, 1],
+  [0, 3],
+  [1, 2],
+  [1, 3],
+  [2, 4]
+];
+const N = 5;
+
+// Positions for drawing
+const POS = {
+  0: {x:140, y:50},
+  1: {x:60,  y:150},
+  2: {x:220, y:150},
+  3: {x:80,  y:280},
+  4: {x:200, y:280}
+};
+
+// Colors for vertices
+const VCOLORS = ['#f47067','#dcbdfb','#7ee787','#79c0ff','#f0883e'];
+
+// ============================================================
+// Steps
+// ============================================================
+let steps = [];
+let currentStep = -1;
+let autoTimer = null;
+
+function buildSteps() {
+  steps = [];
+
+  // Phase 0: Setup
+  steps.push({
+    phase: 0,
+    narration: `<strong>The Goal:</strong> We have a graph with <code>${N}</code> vertices and <code>${EDGES.length}</code> edges. On a GPU, thousands of threads check vertex pairs in parallel. When a thread finds a conflict edge, it writes it immediately — but threads finish in <strong>arbitrary order</strong>. So the GPU naturally produces edges in <strong>COO format</strong> (an unordered list of edge pairs).
+
+<br><br>We need to convert this to <strong>CSR format</strong> so the coloring algorithm can efficiently ask: <em>"What are vertex v's neighbors?"</em>`,
+    activeEdges: [],
+    activeVerts: [],
+    cooState: [],
+    degrees: ['-','-','-','-','-'],
+    offsets: null,
+    neighbors: null,
+    counters: null,
+    log: []
+  });
+
+  // Phase 1: Build COO + count degrees, one edge at a time
+  let cooSoFar = [];
+  let degSoFar = [0,0,0,0,0];
+
+  for (let i = 0; i < EDGES.length; i++) {
+    let [u, v] = EDGES[i];
+    let newDeg = [...degSoFar];
+    newDeg[u]++;
+    newDeg[v]++;
+
+    let newCoo = [...cooSoFar, {u, v, status: 'active'}];
+
+    steps.push({
+      phase: 1,
+      narration: `<strong>GPU Thread finds edge (${u}, ${v})</strong><br><br>
+1. Write <code>(${u}, ${v})</code> to the COO list at position <code>${i}</code> using <code>atomicAdd(nConflicts, 1)</code><br>
+2. Increment degree of vertex <code>${u}</code>: <code>${degSoFar[u]}</code> → <code>${newDeg[u]}</code> using <code>atomicAdd(&offsets[${u}], 1)</code><br>
+3. Increment degree of vertex <code>${v}</code>: <code>${degSoFar[v]}</code> → <code>${newDeg[v]}</code> using <code>atomicAdd(&offsets[${v}], 1)</code>
+<br><br><em class="note">On GPU these happen in parallel — we show them one at a time for clarity.</em>`,
+      activeEdges: [i],
+      activeVerts: [u, v],
+      cooState: newCoo.map((e,idx) => ({...e, status: idx === i ? 'active' : 'processed'})),
+      degrees: newDeg.map(String),
+      degHighlight: [u, v],
+      offsets: null,
+      neighbors: null,
+      counters: null,
+      log: [`Thread found edge (${u},${v}) → COO[${i}], deg[${u}]=${newDeg[u]}, deg[${v}]=${newDeg[v]}`]
+    });
+
+    cooSoFar.push({u, v, status: 'processed'});
+    degSoFar = newDeg;
+  }
+
+  // Summary of phase 1
+  steps.push({
+    phase: 1,
+    narration: `<strong>COO build complete!</strong><br><br>
+We have <code>${EDGES.length}</code> edges in the COO list, and the degree array:<br>
+<code>degrees = [${degSoFar.join(', ')}]</code><br><br>
+Vertex 0: degree ${degSoFar[0]} (edges to 1,3)<br>
+Vertex 1: degree ${degSoFar[1]} (edges to 0,2,3)<br>
+Vertex 2: degree ${degSoFar[2]} (edges to 1,4)<br>
+Vertex 3: degree ${degSoFar[3]} (edges to 0,1)<br>
+Vertex 4: degree ${degSoFar[4]} (edges to 2)<br><br>
+Total directed entries needed: <code>2 × ${EDGES.length} = ${EDGES.length*2}</code> (each undirected edge becomes two directed entries).
+<br><br>Next: <strong>Prefix Sum</strong> to compute CSR offsets.`,
+    activeEdges: [],
+    activeVerts: [],
+    cooState: cooSoFar,
+    degrees: degSoFar.map(String),
+    offsets: null,
+    neighbors: null,
+    counters: null,
+    log: [`All ${EDGES.length} COO edges built, degrees = [${degSoFar.join(',')}]`]
+  });
+
+  // Phase 2: Prefix Sum
+  // degrees = [2, 3, 2, 2, 1]
+  // prefix sum = [0, 2, 5, 7, 9, 10]
+  let prefix = [0];
+  for (let i = 0; i < N; i++) {
+    prefix.push(prefix[i] + degSoFar[i]);
+  }
+
+  // Show prefix sum building step by step
+  let partialPrefix = [0];
+  for (let i = 0; i < N; i++) {
+    partialPrefix.push(partialPrefix[i] + degSoFar[i]);
+    let filledOffsets = [];
+    for (let j = 0; j <= N; j++) {
+      if (j < partialPrefix.length) filledOffsets.push(partialPrefix[j]);
+      else filledOffsets.push('?');
+    }
+    steps.push({
+      phase: 2,
+      narration: `<strong>Exclusive Prefix Sum — step ${i+1}/${N}</strong><br><br>
+<code>offsets[${i+1}] = offsets[${i}] + degrees[${i}] = ${partialPrefix[i]} + ${degSoFar[i]} = ${partialPrefix[i+1]}</code><br><br>
+This means vertex <code>${i}</code>'s neighbors will be stored in <code>neighbors[${partialPrefix[i]}..${partialPrefix[i+1]-1}]</code> — that's <code>${degSoFar[i]}</code> slots.
+${i === N-1 ? '<br><br>The last value <code>offsets[5] = ' + partialPrefix[N] + '</code> is the total size of the neighbors array.' : ''}`,
+      activeEdges: [],
+      activeVerts: [i],
+      cooState: cooSoFar,
+      degrees: degSoFar.map(String),
+      offsets: filledOffsets,
+      offsetHighlight: [i, i+1],
+      neighbors: null,
+      counters: null,
+      log: [`offsets[${i+1}] = offsets[${i}] + deg[${i}] = ${partialPrefix[i]} + ${degSoFar[i]} = ${partialPrefix[i+1]}`]
+    });
+  }
+
+  // Prefix sum complete
+  steps.push({
+    phase: 2,
+    narration: `<strong>Prefix Sum complete!</strong><br><br>
+<code>offsets = [${prefix.join(', ')}]</code><br><br>
+Now we know exactly where each vertex's neighbors go:<br>
+• Vertex 0 → <code>neighbors[0..1]</code> (2 slots)<br>
+• Vertex 1 → <code>neighbors[2..4]</code> (3 slots)<br>
+• Vertex 2 → <code>neighbors[5..6]</code> (2 slots)<br>
+• Vertex 3 → <code>neighbors[7..8]</code> (2 slots)<br>
+• Vertex 4 → <code>neighbors[9..9]</code> (1 slot)<br><br>
+Next: <strong>Scatter</strong> each COO edge into its correct CSR slot.`,
+    activeEdges: [],
+    activeVerts: [],
+    cooState: cooSoFar,
+    degrees: degSoFar.map(String),
+    offsets: prefix,
+    neighbors: new Array(prefix[N]).fill('_'),
+    counters: [0,0,0,0,0],
+    log: [`Prefix sum done: offsets = [${prefix.join(',')}]`, `Neighbors array: ${prefix[N]} slots allocated`]
+  });
+
+  // Phase 3: Scatter COO → CSR
+  let curNeighbors = new Array(prefix[N]).fill('_');
+  let curCounters = [0,0,0,0,0];
+  let scatterCoo = cooSoFar.map(e => ({...e, status: 'processed'}));
+
+  for (let i = 0; i < EDGES.length; i++) {
+    let [u, v] = EDGES[i];
+
+    // Write v into u's slot
+    let uPos = prefix[u] + curCounters[u];
+    let newNeighbors1 = [...curNeighbors];
+    newNeighbors1[uPos] = v;
+    let newCounters1 = [...curCounters];
+    newCounters1[u]++;
+
+    let scatterCoo1 = scatterCoo.map((e,idx) => ({...e, status: idx === i ? 'active' : idx < i ? 'dimmed' : 'processed'}));
+
+    steps.push({
+      phase: 3,
+      narration: `<strong>Scatter COO edge #${i}: (${u}, ${v}) — part 1 of 2</strong><br><br>
+Place <code>${v}</code> into vertex <code>${u}</code>'s neighbor list:<br>
+• Position = <code>offsets[${u}] + counter[${u}] = ${prefix[u]} + ${curCounters[u]} = ${uPos}</code><br>
+• Write: <code>neighbors[${uPos}] = ${v}</code><br>
+• Increment: <code>counter[${u}]</code>: <code>${curCounters[u]}</code> → <code>${newCounters1[u]}</code>`,
+      activeEdges: [i],
+      activeVerts: [u],
+      cooState: scatterCoo1,
+      degrees: degSoFar.map(String),
+      offsets: prefix,
+      neighbors: newNeighbors1,
+      neighborsHighlight: [uPos],
+      counters: newCounters1,
+      counterHighlight: [u],
+      log: [`Edge (${u},${v}): neighbors[${uPos}] = ${v}, counter[${u}] = ${newCounters1[u]}`]
+    });
+
+    // Write u into v's slot
+    let vPos = prefix[v] + newCounters1[v];
+    let newNeighbors2 = [...newNeighbors1];
+    newNeighbors2[vPos] = u;
+    let newCounters2 = [...newCounters1];
+    newCounters2[v]++;
+
+    steps.push({
+      phase: 3,
+      narration: `<strong>Scatter COO edge #${i}: (${u}, ${v}) — part 2 of 2</strong><br><br>
+Place <code>${u}</code> into vertex <code>${v}</code>'s neighbor list:<br>
+• Position = <code>offsets[${v}] + counter[${v}] = ${prefix[v]} + ${newCounters1[v]} = ${vPos}</code><br>
+• Write: <code>neighbors[${vPos}] = ${u}</code><br>
+• Increment: <code>counter[${v}]</code>: <code>${newCounters1[v]}</code> → <code>${newCounters2[v]}</code>`,
+      activeEdges: [i],
+      activeVerts: [v],
+      cooState: scatterCoo1,
+      degrees: degSoFar.map(String),
+      offsets: prefix,
+      neighbors: newNeighbors2,
+      neighborsHighlight: [vPos],
+      counters: newCounters2,
+      counterHighlight: [v],
+      log: [`Edge (${u},${v}): neighbors[${vPos}] = ${u}, counter[${v}] = ${newCounters2[v]}`]
+    });
+
+    curNeighbors = newNeighbors2;
+    curCounters = newCounters2;
+    scatterCoo = scatterCoo1.map(e => ({...e, status: e.status === 'active' ? 'dimmed' : e.status}));
+  }
+
+  // Phase 4: Done
+  steps.push({
+    phase: 4,
+    narration: `<strong>CSR construction complete! 🎉</strong><br><br>
+<code>offsets &nbsp;= [${prefix.join(', ')}]</code><br>
+<code>neighbors = [${curNeighbors.join(', ')}]</code><br><br>
+<strong>Try a lookup:</strong> "What are vertex 1's neighbors?"<br>
+→ Read <code>offsets[1] = ${prefix[1]}</code> and <code>offsets[2] = ${prefix[2]}</code><br>
+→ Neighbors are <code>neighbors[${prefix[1]}..${prefix[2]-1}]</code> = <code>[${curNeighbors.slice(prefix[1], prefix[2]).join(', ')}]</code> ✓<br><br>
+This is O(1) to find where to start reading, and O(degree) to read the neighbors — <em>exactly</em> what the greedy coloring algorithm needs.`,
+    activeEdges: [],
+    activeVerts: [],
+    cooState: cooSoFar,
+    degrees: degSoFar.map(String),
+    offsets: prefix,
+    neighbors: curNeighbors,
+    counters: curCounters,
+    log: ['CSR construction complete!']
+  });
+
+  document.getElementById('totalSteps').textContent = steps.length - 1;
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function drawGraph(activeEdges, activeVerts) {
+  const svg = document.getElementById('graphSvg');
+  let html = '';
+
+  // Draw edges
+  EDGES.forEach(([u,v], i) => {
+    let cls = 'graph-edge';
+    if (activeEdges.includes(i)) cls += ' active';
+    html += `<line class="${cls}" x1="${POS[u].x}" y1="${POS[u].y}" x2="${POS[v].x}" y2="${POS[v].y}"/>`;
+    // Edge label
+    let mx = (POS[u].x + POS[v].x)/2;
+    let my = (POS[u].y + POS[v].y)/2;
+    let opacity = activeEdges.includes(i) ? 1 : 0.5;
+    html += `<text x="${mx+8}" y="${my-4}" fill="#8b949e" font-size="10" opacity="${opacity}">(${u},${v})</text>`;
+  });
+
+  // Draw vertices
+  VERTICES.forEach(v => {
+    let cls = activeVerts.includes(v) ? 'graph-node active' : 'graph-node';
+    let fill = activeVerts.includes(v) ? VCOLORS[v] : '#21262d';
+    let stroke = VCOLORS[v];
+    html += `<circle class="${cls}" cx="${POS[v].x}" cy="${POS[v].y}" r="22" fill="${fill}" stroke="${stroke}"/>`;
+    html += `<text class="graph-node-label" x="${POS[v].x}" y="${POS[v].y}">${v}</text>`;
+  });
+
+  svg.innerHTML = html;
+}
+
+function renderStep(step) {
+  const area = document.getElementById('dataArea');
+  let html = '';
+
+  // Narration
+  html += `<div class="narration">${step.narration}</div>`;
+
+  // COO list
+  if (step.cooState && step.cooState.length > 0) {
+    html += `<div class="array-section"><h3>📋 COO Edge List (unordered pairs)</h3>`;
+    html += `<div class="coo-list">`;
+    step.cooState.forEach((e, i) => {
+      html += `<div class="coo-edge ${e.status}">#${i}: (${e.u}, ${e.v})</div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  // Degrees
+  if (step.degrees) {
+    html += `<div class="array-section"><h3>📊 Degree Count (offsets[] during build)</h3>`;
+    html += `<div class="degree-table">`;
+    step.degrees.forEach((d, i) => {
+      let cls = 'val';
+      if (step.degHighlight && step.degHighlight.includes(i)) cls += ' writing';
+      html += `<div class="degree-cell"><span class="vtx">v${i}</span><span class="${cls}">${d}</span></div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  // Offsets array
+  if (step.offsets) {
+    html += `<div class="array-section"><h3>📍 offsets[] (size n+1 = ${N+1})</h3>`;
+    html += `<div class="desc">offsets[v] = start position of vertex v's neighbors in the neighbors array</div>`;
+    html += `<div class="array-row">`;
+    html += `<span class="array-label">index:</span>`;
+    step.offsets.forEach((val, i) => {
+      let cls = 'array-cell';
+      if (step.offsetHighlight && step.offsetHighlight.includes(i)) cls += ' highlight';
+      html += `<div class="${cls}"><span class="index">${i}</span>${val}</div>`;
+    });
+    html += `</div>`;
+    // Show vertex labels below
+    html += `<div class="array-row"><span class="array-label"></span>`;
+    for (let i = 0; i <= N; i++) {
+      html += `<div style="width:44px;text-align:center;font-size:0.65em;color:#484f58;flex-shrink:0;">${i < N ? '↑ v'+i : '↑ end'}</div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Neighbors array
+  if (step.neighbors) {
+    html += `<div class="array-section"><h3>📦 neighbors[] (size ${step.neighbors.length})</h3>`;
+    html += `<div class="desc">Packed neighbor lists — read neighbors[offsets[v] .. offsets[v+1]-1] for vertex v's neighbors</div>`;
+    html += `<div class="array-row">`;
+    html += `<span class="array-label">index:</span>`;
+    step.neighbors.forEach((val, i) => {
+      let cls = 'array-cell';
+      if (val === '_') cls += ' empty';
+      if (step.neighborsHighlight && step.neighborsHighlight.includes(i)) cls += ' writing';
+      html += `<div class="${cls}"><span class="index">${i}</span>${val}</div>`;
+    });
+    html += `</div>`;
+
+    // Show bracket markers for which vertex owns which range
+    if (step.offsets && step.phase >= 3) {
+      html += `<div class="array-row"><span class="array-label"></span>`;
+      let offsets = step.offsets;
+      for (let i = 0; i < step.neighbors.length; i++) {
+        let owner = -1;
+        for (let v = 0; v < N; v++) {
+          if (i >= offsets[v] && i < offsets[v+1]) { owner = v; break; }
+        }
+        let color = owner >= 0 ? VCOLORS[owner] : '#484f58';
+        html += `<div style="width:44px;text-align:center;font-size:0.6em;color:${color};flex-shrink:0;">v${owner}</div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Counters
+  if (step.counters) {
+    html += `<div class="array-section"><h3>🔢 counter[] (how many neighbors placed so far)</h3>`;
+    html += `<div class="degree-table">`;
+    step.counters.forEach((c, i) => {
+      let cls = 'val';
+      if (step.counterHighlight && step.counterHighlight.includes(i)) cls += ' writing';
+      html += `<div class="degree-cell"><span class="vtx">v${i}</span><span class="${cls}">${c}</span></div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  // CSR lookup demo on final step
+  if (step.phase === 4) {
+    html += `<div class="lookup-demo"><h4>🔍 Try CSR Lookups</h4>`;
+    for (let v = 0; v < N; v++) {
+      let start = step.offsets[v];
+      let end = step.offsets[v+1];
+      let nbrs = step.neighbors.slice(start, end);
+      html += `<div style="margin:4px 0;font-size:0.85em;">
+        <span style="color:${VCOLORS[v]};font-weight:bold;">Vertex ${v}</span>:
+        neighbors[${start}..${end-1}] = [<strong>${nbrs.join(', ')}</strong>]
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Log
+  if (step.log && step.log.length > 0) {
+    html += `<div class="step-log"><h3>📝 Log</h3>`;
+    step.log.forEach(l => {
+      html += `<div class="log-entry">${l}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  area.innerHTML = html;
+
+  // Update graph
+  drawGraph(step.activeEdges || [], step.activeVerts || []);
+
+  // Update phase indicators
+  for (let i = 0; i <= 4; i++) {
+    document.getElementById('phase'+i).className = 'phase' + (i === step.phase ? ' active' : '');
+  }
+
+  // Update step number
+  document.getElementById('stepNum').textContent = currentStep;
+}
+
+// ============================================================
+// Controls
+// ============================================================
+function nextStep() {
+  if (currentStep < steps.length - 1) {
+    currentStep++;
+    renderStep(steps[currentStep]);
+  }
+}
+
+function prevStep() {
+  if (currentStep > 0) {
+    currentStep--;
+    renderStep(steps[currentStep]);
+  }
+}
+
+function reset() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  currentStep = 0;
+  renderStep(steps[0]);
+}
+
+function autoPlay() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; return; }
+  autoTimer = setInterval(() => {
+    if (currentStep >= steps.length - 1) {
+      clearInterval(autoTimer);
+      autoTimer = null;
+    } else {
+      nextStep();
+    }
+  }, 2000);
+}
+
+// Keyboard support
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); nextStep(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); prevStep(); }
+  if (e.key === 'r') reset();
+});
+
+// ============================================================
+// Init
+// ============================================================
+buildSteps();
+currentStep = 0;
+renderStep(steps[0]);
+</script>
+</body>
+</html>

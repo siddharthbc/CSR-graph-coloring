@@ -1,12 +1,11 @@
+# Build outputs
+Picasso_golden/
+csl_compiled_out/
 __pycache__/
 *.pyc
+
+# Virtual environment
 .venv/
-
-# Cloned golden reference repo
-Picasso_golden/
-
-# CSL compiled output
-csl_compiled_out/
 
 # LaTeX intermediates
 *.aux

@@ -1,18 +1,19 @@
 // Picasso Graph Coloring on Cerebras WSE
 // Layout: 1D or 2D grid of PEs for speculative parallel graph coloring
-// with on-fabric wavelet exchange and global sync barrier.
+// with on-fabric wavelet exchange and global hardware barrier.
 //
 // Architecture:
 //   - 8 fabric colors (0-7) for E/W/N/S data exchange (checkerboard routing)
-//     * Alternating send/recv colors by parity prevents send-recv collision.
-//     * Each wavelet travels one hop; software relay forwards to next hop.
-//     * Wavelet encoding varies by mode (HW filter vs SW relay); see pe_program.csl.
+//     * In 1D mode, E/W recv colors use HARDWARE FILTERS for point-to-point
+//       delivery: wavelets pass through intermediate PEs at wire speed
+//       (~1 cycle/hop) and only the destination PE's task fires.
+//     * Wavelet format: [31:16]=dest_PE (filter key), [15:0]=data payload.
 //   - 3 fabric colors (8-10) for global sync barrier (1D mode only):
 //       C8,C9: row-reduce (last PE → first PE, even/odd alternation)
 //       C10:   broadcast from P(0,0) to all PEs eastward
 //   - In 2D mode, queues 4,5 are occupied by N/S data → no barrier
 //
-// BSP round: Speculate → Send → Recv (relay) → BARRIER → Detect/Resolve → loop
+// BSP round: Speculate → Send → Recv (hw filter) → BARRIER → Detect/Resolve → loop
 
 param num_cols: i16;
 param num_rows: i16;          // 1 for 1D, >1 for 2D
@@ -20,8 +21,7 @@ param max_local_verts: i16;
 param max_local_edges: i16;
 param max_boundary: i16;
 param max_relay: i16;
-param max_palette_size: i16;  // compile-time max (sizes forbidden[] array)
-param max_list_size: i16;     // T: max colors per vertex list (Picasso)
+param palette_size: i16;
 
 // East/West fabric colors (always used)
 const east_color_0: color = @get_color(0);
@@ -70,9 +70,14 @@ layout {
       const is_north = (row == 0);
       const is_south = (row == num_rows - 1);
 
-      // E/W checkerboard colors — same pattern for 1D and 2D.
-      // Alternating send/recv colors by parity prevents send-recv collision.
-      const ew_colors = if (parity == 0) .{
+      // E/W colors: In 1D filter mode, single color per direction (no checkerboard).
+      // In 2D mode, checkerboard alternation avoids send/recv collision.
+      const ew_colors = if (num_rows == 1) .{
+        .send_east_color  = east_color_0,
+        .send_west_color  = west_color_0,
+        .recv_east_color  = east_color_0,
+        .recv_west_color  = west_color_0,
+      } else if (parity == 0) .{
         .send_east_color  = east_color_0,
         .send_west_color  = west_color_1,
         .recv_east_color  = west_color_0,
@@ -107,12 +112,12 @@ layout {
           .max_local_edges = max_local_edges,
           .max_boundary    = max_boundary,
           .max_relay       = max_relay,
-          .max_palette_size = max_palette_size,
-          .max_list_size   = max_list_size,
+          .palette_size    = palette_size,
           .is_west_edge    = is_west,
           .is_east_edge    = is_east,
           .is_north_edge   = is_north,
           .is_south_edge   = is_south,
+          .use_hw_filter   = (num_rows == 1),
         }, ew_colors),
         ns_colors),
         // Sync barrier params (1D only)
@@ -129,19 +134,72 @@ layout {
         },
       ));
 
-      // ── E/W route configs: checkerboard routing (1D and 2D) ──
-      // Even-parity PEs send on color_0, recv on color_1; odd PEs swap.
-      // Each wavelet travels one hop; software relay forwards to next hop.
-      if (parity == 0) {
-        @set_color_config(col, row, east_color_0, .{ .routes = RX_R_TX_E });
-        @set_color_config(col, row, east_color_1, .{ .routes = RX_W_TX_R });
-        @set_color_config(col, row, west_color_0, .{ .routes = RX_E_TX_R });
-        @set_color_config(col, row, west_color_1, .{ .routes = RX_R_TX_W });
+      // ── E/W route configs with hardware filters (1D) ──
+      // In 1D mode, recv colors use range filters keyed on bits [31:16] = dest_pe.
+      // Non-destination PEs pass wavelets through at wire speed (no software relay).
+      // In 2D mode (num_rows > 1), filters are not used (no pass-through).
+      const pe_filter = .{
+        .kind = .{ .range = true },
+        .min_idx = pe_idx,
+        .max_idx = pe_idx,
+      };
+
+      if (num_rows == 1) {
+        // 1D mode: filtered pass-through routing.
+        // Each PE uses a single color per direction.
+        // east_color_0 = eastward traffic, west_color_0 = westward traffic.
+        //
+        // Filter applies to incoming wavelets from fabric (rx direction).
+        // fabout_dsd sends go directly to tx (EAST/WEST), bypassing filter.
+        //
+        // Eastward: fabric input from WEST, deliver to RAMP if filter matches, forward EAST
+        if (is_east) {
+          @set_color_config(col, row, east_color_0, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+            .filter = pe_filter,
+          });
+        } else if (is_west) {
+          // West edge: nothing arrives from WEST, just send east
+          @set_color_config(col, row, east_color_0, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+          });
+        } else {
+          @set_color_config(col, row, east_color_0, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP, EAST } },
+            .filter = pe_filter,
+          });
+        }
+
+        // Westward: fabric input from EAST, deliver to RAMP if filter matches, forward WEST
+        if (is_west) {
+          @set_color_config(col, row, west_color_0, .{
+            .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP } },
+            .filter = pe_filter,
+          });
+        } else if (is_east) {
+          // East edge: nothing arrives from EAST, just send west
+          @set_color_config(col, row, west_color_0, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST } },
+          });
+        } else {
+          @set_color_config(col, row, west_color_0, .{
+            .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP, WEST } },
+            .filter = pe_filter,
+          });
+        }
       } else {
-        @set_color_config(col, row, east_color_0, .{ .routes = RX_W_TX_R });
-        @set_color_config(col, row, east_color_1, .{ .routes = RX_R_TX_E });
-        @set_color_config(col, row, west_color_0, .{ .routes = RX_R_TX_W });
-        @set_color_config(col, row, west_color_1, .{ .routes = RX_E_TX_R });
+        // 2D mode: original checkerboard routing (no filters)
+        if (parity == 0) {
+          @set_color_config(col, row, east_color_0, .{ .routes = RX_R_TX_E });
+          @set_color_config(col, row, east_color_1, .{ .routes = RX_W_TX_R });
+          @set_color_config(col, row, west_color_0, .{ .routes = RX_E_TX_R });
+          @set_color_config(col, row, west_color_1, .{ .routes = RX_R_TX_W });
+        } else {
+          @set_color_config(col, row, east_color_0, .{ .routes = RX_W_TX_R });
+          @set_color_config(col, row, east_color_1, .{ .routes = RX_R_TX_E });
+          @set_color_config(col, row, west_color_0, .{ .routes = RX_R_TX_W });
+          @set_color_config(col, row, west_color_1, .{ .routes = RX_E_TX_R });
+        }
       }
 
       // ── N/S route configs (only when 2D) ──
@@ -214,12 +272,10 @@ layout {
   @export_name("boundary_local_idx",     [*]i32, true);
   @export_name("boundary_neighbor_gid",  [*]i32, true);
   @export_name("boundary_direction",     [*]i32, true);
-  @export_name("runtime_config",         [*]i32, true);
+  @export_name("verts_per_pe",           [*]i32, true);
   @export_name("num_boundary",           [*]i32, true);
   @export_name("coloring_timer",         [*]f32, true);
   @export_name("perf_counters",          [*]i32, true);
-  @export_name("expected_recv",          [*]i32, true);
-  @export_name("color_list",             [*]i32, true);
-  @export_name("list_len",               [*]i32, true);
+  @export_name("expected_total_recv",    [*]i32, true);
   @export_name("start_coloring",         fn()void);
 }

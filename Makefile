@@ -334,7 +334,7 @@ clean: golden-clean
 help:
 	@echo "Targets:"
 	@echo "  make test               run Python against golden outputs (default config)"
-	@echo "  make test-normal        run Python against golden_normal (P=12.5%%|V|, α=2, inv=8)"
+	@echo "  make test-normal        run Python against golden_normal (P=12.5%%|V|, α=2, inv=P)"
 	@echo "  make test-csl           run Cerebras simulator against golden (default config)"
 	@echo "  make test-csl-normal    run Cerebras simulator against golden_normal"
 	@echo "  make test-all           run all test suites"
