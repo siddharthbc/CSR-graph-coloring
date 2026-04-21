@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from contextlib import nullcontext
 
 import numpy as np
@@ -33,6 +34,97 @@ if _repo_root not in sys.path:
 
 # Import the actual picasso module (with matching MT19937 RNG)
 from picasso.pipeline import PicassoColoring
+
+
+class _TeeStream:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, 'isatty', lambda: False)()
+                   for stream in self._streams)
+
+
+def _sanitize_run_token(value):
+    token = []
+    for char in value.lower():
+        if char.isalnum():
+            token.append(char)
+        else:
+            token.append('-')
+    sanitized = ''.join(token).strip('-')
+    while '--' in sanitized:
+        sanitized = sanitized.replace('--', '-')
+    return sanitized or 'run'
+
+
+def _default_run_scope(args):
+    if args.mode == 'appliance':
+        return 'hardware' if args.hardware else 'appliance'
+    return 'local'
+
+
+def _default_run_id(args, total_pes):
+    date_prefix = datetime.now().strftime('%Y%m%d')
+    routing = _sanitize_run_token(args.routing)
+    pe_part = f"{total_pes}pe"
+    if args.test:
+        selector = _sanitize_run_token(args.test)
+    elif args.test_range:
+        selector = f"tests-{_sanitize_run_token(args.test_range)}"
+    else:
+        selector = 'suite'
+    return f"{date_prefix}-{routing}-{pe_part}-{selector}"
+
+
+def resolve_run_paths(root_dir, args, total_pes):
+    run_scope = args.run_scope or _default_run_scope(args)
+    run_id = args.run_id or _default_run_id(args, total_pes)
+
+    if args.output_dir:
+        explicit_output_dir = os.path.abspath(args.output_dir)
+        if os.path.basename(explicit_output_dir) == 'results':
+            run_dir = os.path.dirname(explicit_output_dir)
+            results_dir = explicit_output_dir
+        else:
+            run_dir = explicit_output_dir
+            results_dir = os.path.join(run_dir, 'results')
+    else:
+        run_dir = os.path.join(root_dir, 'runs', run_scope, run_id)
+        results_dir = os.path.join(run_dir, 'results')
+
+    stdout_log = os.path.abspath(
+        args.stdout_log or os.path.join(run_dir, 'stdout.log')
+    )
+
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(stdout_log), exist_ok=True)
+
+    return {
+        'run_scope': run_scope,
+        'run_id': run_id,
+        'run_dir': run_dir,
+        'results_dir': results_dir,
+        'stdout_log': stdout_log,
+    }
+
+
+def install_stdout_log(stdout_log_path):
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    log_handle = open(stdout_log_path, 'a', buffering=1)
+    sys.stdout = _TeeStream(original_stdout, log_handle)
+    sys.stderr = _TeeStream(original_stderr, log_handle)
+    return log_handle, original_stdout, original_stderr
 
 # ---------------------------------------------------------------------------
 # Pauli commutativity (ported from picasso/pauli.py)
@@ -910,11 +1002,12 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
                 max_boundary, max_relay, max_palette_size, max_list_size,
                 routing_mode, output_dir):
     """Compile the CSL program with cslc.
-    
+
     max_palette_size: compile-time upper bound (sizes the forbidden[] array).
     The actual palette_size is uploaded at runtime per test.
-    routing_mode: 0 = SW relay, 1 = HW filter (1D only).
-    
+    routing_mode: 0 = SW relay, 1 = HW filter (1D only),
+                  2 = pipelined-LWW (1D, num_cols<=5, broadcast+filter).
+
     Runs from the repo root so the singularity container bind covers
     both the CSL sources and the output directory.  The layout file is
     referenced by its path relative to the repo root.
@@ -927,11 +1020,42 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
     output_dir = os.path.abspath(output_dir)
     csl_dir = os.path.abspath(csl_dir)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    # Path to layout.csl relative to the repo root
-    layout_rel = os.path.relpath(os.path.join(csl_dir, 'layout.csl'), repo_root)
+    # Layout file is chosen per routing mode.  Pipelined-LWW uses a
+    # separate (layout_lww.csl, pe_program_lww.csl) pair so the SW-relay /
+    # HW-filter kernel can stay untouched during the 2c.2a bring-up.
+    if routing_mode == 2:
+        layout_name = 'layout_lww.csl'
+    else:
+        layout_name = 'layout.csl'
+    layout_rel = os.path.relpath(os.path.join(csl_dir, layout_name), repo_root)
 
     fabric_w = num_cols + 8
     fabric_h = num_rows + 2
+
+    if routing_mode == 2:
+        # layout_lww.csl takes a narrower parameter set (no max_relay,
+        # no routing_mode — single-segment bidirectional 1D).
+        params = (
+            f'num_cols:{num_cols},'
+            f'num_rows:{num_rows},'
+            f'max_local_verts:{max_local_verts},'
+            f'max_local_edges:{max_local_edges},'
+            f'max_boundary:{max_boundary},'
+            f'max_palette_size:{max_palette_size},'
+            f'max_list_size:{max_list_size}'
+        )
+    else:
+        params = (
+            f'num_cols:{num_cols},'
+            f'num_rows:{num_rows},'
+            f'max_local_verts:{max_local_verts},'
+            f'max_local_edges:{max_local_edges},'
+            f'max_boundary:{max_boundary},'
+            f'max_relay:{max_relay},'
+            f'max_palette_size:{max_palette_size},'
+            f'max_list_size:{max_list_size},'
+            f'routing_mode:{routing_mode}'
+        )
 
     cmd = [
         cslc, layout_rel,
@@ -939,16 +1063,10 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
         f'--fabric-offsets=4,1',
         '--memcpy', '--channels=1',
         '-o', output_dir,
-        f'--params=num_cols:{num_cols},'
-        f'num_rows:{num_rows},'
-        f'max_local_verts:{max_local_verts},'
-        f'max_local_edges:{max_local_edges},'
-        f'max_boundary:{max_boundary},'
-        f'max_relay:{max_relay},'
-        f'max_palette_size:{max_palette_size},'
-        f'max_list_size:{max_list_size},'
-        f'routing_mode:{routing_mode}',
+        f'--params={params}',
     ]
+    if routing_mode == 2:
+        cmd.append('--arch=wse3')
     print(f"  Compiling: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_root)
     if result.returncode != 0:
@@ -1165,13 +1283,30 @@ def main():
     parser.add_argument('--compiled-dir', type=str, default=None,
                         help='Pre-compiled CSL output dir (skip recompilation)')
     parser.add_argument('--output-dir', type=str, default=None,
-                        help='Directory to write per-test Cerebras run output '
-                             '(default: tests/cerebras-runs)')
+                        help='Run directory or results directory for this run. '
+                             'If omitted, the runner creates '
+                             'runs/<scope>/<run_id>/results automatically.')
+    parser.add_argument('--run-scope', type=str, default=None,
+                        help='Run scope for managed outputs '
+                             '(default: local, appliance, or hardware based on mode)')
+    parser.add_argument('--run-id', type=str, default=None,
+                        help='Run identifier for managed outputs '
+                             '(default: date + routing + PE count + test selector)')
+    parser.add_argument('--stdout-log', type=str, default=None,
+                        help='Path to captured runner stdout/stderr log '
+                             '(default: runs/<scope>/<run_id>/stdout.log)')
     parser.add_argument('--routing', type=str, default='sw-relay',
-                        choices=['sw-relay', 'hw-filter'],
-                        help='Routing mode: sw-relay (default) or hw-filter '
-                             '(1D only, uses hardware filter for wire-speed '
-                             'wavelet delivery)')
+                        choices=['sw-relay', 'hw-filter', 'pipelined-lww'],
+                        help='Routing mode: sw-relay (default), hw-filter '
+                             '(1D only, HW wire-speed — blocked on WSE-3), or '
+                             'pipelined-lww (1D only, num_cols <= 5, '
+                             'broadcast + local-filter with per-direction '
+                             'source colors).')
+    parser.add_argument('--skip-h2', action='store_true',
+                        help='Skip the H2_631g_89nodes test (too large for '
+                             'simulator)')
+    parser.add_argument('--test-range', type=str, default=None,
+                        help='Run only tests in this range, e.g. "1-13" or "1,3,5"')
     args = parser.parse_args()
 
     # --- Appliance mode: load compile artifact ---
@@ -1187,11 +1322,11 @@ def main():
         artifact_path = compile_info['artifact_path']
         # Cross-check routing_mode: artifact must match --routing flag
         artifact_rm = compile_info.get('routing_mode', 0)
-        requested_rm = 1 if args.routing == 'hw-filter' else 0
+        requested_rm = {'sw-relay': 0, 'hw-filter': 1, 'pipelined-lww': 2}[args.routing]
         if artifact_rm != requested_rm:
             sys.exit(f"ERROR: artifact was compiled with routing_mode={artifact_rm} "
-                     f"but --routing={'hw-filter' if requested_rm else 'sw-relay'} "
-                     f"(routing_mode={requested_rm}) was requested. Recompile.")
+                     f"but --routing={args.routing} (routing_mode={requested_rm}) "
+                     f"was requested. Recompile.")
         # Use artifact dims unless explicitly overridden
         if args.num_pes == 2 and args.grid_rows == 1:
             num_cols = compile_info['num_cols']
@@ -1214,6 +1349,19 @@ def main():
         sys.exit("ERROR: --routing hw-filter requires 1D layout (num_rows=1); "
                  f"got num_rows={num_rows}. Use --routing sw-relay for 2D.")
 
+    # Pipelined-LWW guards: 1D only, num_cols <= 5 (WSE-3 queue budget:
+    # 2 tx + (num_cols-1) rx <= 6 user queues after memcpy).
+    if args.routing == 'pipelined-lww':
+        if num_rows > 1:
+            sys.exit("ERROR: --routing pipelined-lww requires 1D layout "
+                     f"(num_rows=1); got num_rows={num_rows}. "
+                     "Multi-segment / 2D is deferred to Step 2c.2b.")
+        if num_cols > 5:
+            sys.exit("ERROR: --routing pipelined-lww caps num_cols <= 5 "
+                     "(WSE-3 queue budget: 2 tx + (num_cols-1) rx <= 6). "
+                     f"Got num_cols={num_cols}. Multi-segment bridging comes "
+                     "in Step 2c.2b.")
+
     # HW-filter is blocked on WSE-3: interior PEs cannot both receive from
     # fabric (rx=WEST) and inject from RAMP on the same color — WSE-3 allows
     # only 1 rx direction per color.  All SDK multi-sender examples use 1-hop
@@ -1226,6 +1374,10 @@ def main():
                  "fabric.  Use --routing sw-relay instead.")
 
     root_dir = args.root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    run_paths = resolve_run_paths(root_dir, args, total_pes)
+    stdout_log_handle, original_stdout, original_stderr = install_stdout_log(
+        run_paths['stdout_log']
+    )
     inputs_dir = os.path.join(root_dir, 'tests', 'inputs')
     golden_dir = args.golden_dir or os.path.join(root_dir, 'tests', 'golden')
 
@@ -1235,10 +1387,29 @@ def main():
 
     # Discover tests
     test_files = sorted(f for f in os.listdir(inputs_dir) if f.endswith('.json'))
+    if args.skip_h2:
+        test_files = [f for f in test_files if not f.upper().startswith('H2')]
     if args.test:
         test_files = [f for f in test_files if args.test in f]
         if not test_files:
             print(f"ERROR: no test matching '{args.test}'")
+            sys.exit(1)
+    if args.test_range:
+        # Parse "1-13" or "1,3,5" into a set of test numbers
+        allowed = set()
+        for part in args.test_range.split(','):
+            if '-' in part:
+                lo, hi = part.split('-', 1)
+                allowed.update(range(int(lo), int(hi) + 1))
+            else:
+                allowed.add(int(part))
+        def _test_num(fname):
+            import re
+            m = re.match(r'test(\d+)', fname)
+            return int(m.group(1)) if m else None
+        test_files = [f for f in test_files if _test_num(f) in allowed]
+        if not test_files:
+            print(f"ERROR: no tests matching --test-range '{args.test_range}'")
             sys.exit(1)
 
     if args.mode == 'appliance':
@@ -1249,6 +1420,9 @@ def main():
     print(f"CSL Speculative Parallel Coloring — Test Suite ({mode_str})")
     print(f"  PEs: {total_pes} ({num_cols}x{num_rows})")
     print(f"  Tests: {len(test_files)}")
+    print(f"  Run dir: {run_paths['run_dir']}")
+    print(f"  Results dir: {run_paths['results_dir']}")
+    print(f"  Stdout log: {run_paths['stdout_log']}")
     print()
 
     # Pre-load all test graphs to compute max dimensions for compilation
@@ -1368,15 +1542,41 @@ def main():
     test_data_list = fitting_tests
 
     # max_relay: relay buffer size for checkerboard SW relay.
-    # HW filter mode: no relay needed, use minimal allocation.
-    routing_mode = 1 if args.routing == 'hw-filter' else 0
-    if routing_mode == 1:
-        max_relay = 1  # minimal — relay queues unused in HW filter mode
-    else:
+    # HW filter / pipelined-LWW: no relay needed, use minimal allocation.
+    routing_mode = {'sw-relay': 0, 'hw-filter': 1, 'pipelined-lww': 2}[args.routing]
+    if routing_mode == 0:
         max_relay = max(td.get('relay_peak', 1) for td in test_data_list)
+    else:
+        max_relay = 1  # relay queues unused in hw-filter / pipelined-lww modes
 
-    # Compute max_list_size (T) for Picasso color lists
+    # Compute max_list_size (T) for Picasso color lists.
+    #
+    # The kernel allocates color_list[max_local_verts * max_list_size] at
+    # compile time.  At runtime, the host uploads cur_T entries per vertex
+    # at each level (see the per-level cur_T computation below).  If the
+    # compile-time max_list_size is smaller than any runtime cur_T, the
+    # H2D upload overruns color_list[] and corrupts adjacent symbols,
+    # causing start_coloring to wedge in the simulator (CPU spin, no
+    # progress, no readback).  To avoid this, derive max_list_size from
+    # the largest cur_T that any test will ever request, mirroring the
+    # exact per-level rules below (formula → palette cap → small-palette
+    # boost when cur_pal <= 4).
     max_n = max(td['num_verts'] for td in test_data_list)
+
+    def _per_test_max_T(num_verts):
+        if args.palette_size is not None:
+            cur_pal_l0 = args.palette_size
+        else:
+            cur_pal_l0 = max(2, int(args.palette_frac * num_verts))
+        formula = max(1, int(args.alpha * math.log(max(num_verts, 2))))
+        cur_T = min(formula, cur_pal_l0)
+        if cur_pal_l0 <= 4:
+            # Small-palette boost: matches the per-level rule below.
+            cur_T = cur_pal_l0
+        return cur_T
+
+    derived_T = max(_per_test_max_T(td['num_verts']) for td in test_data_list)
+
     if args.palette_size is not None:
         max_palette = args.palette_size
     else:
@@ -1384,9 +1584,13 @@ def main():
     if args.list_size is not None:
         max_list_size = args.list_size
     else:
-        max_list_size = max(1, int(args.alpha * math.log(max_n)))
-    if max_list_size > max_palette:
-        max_list_size = max_palette
+        max_list_size = derived_T
+    # Floor max_list_size at derived_T so the compile-time array always
+    # covers the largest runtime cur_T.  Never cap below derived_T just
+    # because max_palette is small — that cap is what caused the L0
+    # color_list overrun on tiny graphs (e.g. N=4, palette=2, T=2).
+    if max_list_size < derived_T:
+        max_list_size = derived_T
 
     print(f"Max dimensions: local_verts={max_lv}, local_edges={max_le}, "
           f"boundary={max_bnd}, relay={max_relay}, list_size={max_list_size}")
@@ -1404,6 +1608,10 @@ def main():
         # wraps to 0 in lower 5 bits, colliding with the done sentinel).
         # Cap instead of rounding to power-of-2.
         max_palette_size = min(max(max_palette_size, 2), 30)
+    elif routing_mode == 2:
+        # Pipelined-LWW: 8-bit color encoding caps at 255; done sentinel
+        # uses bit 31, so no collision with data payloads (bit 31 = 0).
+        max_palette_size = min(max(max_palette_size, 2), 255)
     else:
         # Round up to next power of 2 for alignment, minimum 32
         mps = 32
@@ -1424,6 +1632,18 @@ def main():
             sys.exit(f"ERROR: HW-filter encoding caps global vertex ID at 2047 "
                      f"(got max vertex count={max_gid_per_pe}). "
                      f"Use more PEs or --routing sw-relay.")
+
+    # Pipelined-LWW encoding cap checks:
+    #   color in 8 bits → max 255
+    #   sender_gid in 23 bits → max GID 8_388_607
+    if routing_mode == 2:
+        if max_palette_size > 255:
+            sys.exit(f"ERROR: pipelined-lww encoding caps color at 255 "
+                     f"(got max_palette_size={max_palette_size}).")
+        max_gid = max(td['num_verts'] for td in test_data_list)
+        if max_gid > (1 << 23) - 1:
+            sys.exit(f"ERROR: pipelined-lww encoding caps vertex GID at "
+                     f"{(1<<23)-1}; got max vertex count={max_gid}.")
 
     compiled_dir = None
     if args.mode == 'appliance':
@@ -1633,6 +1853,10 @@ def main():
                         sub_edges += 1
                 color_state = ' '.join(str(c) if c is not None else '-1'
                                        for c in all_colors)
+                level_cyc = int(result_data.get('max_cycles', 0)) \
+                    if isinstance(result_data, dict) else 0
+                level_ms  = float(result_data.get('elapsed_ms', 0.0)) \
+                    if isinstance(result_data, dict) else 0.0
                 level_info.append({
                     'num_nodes': cur_n,
                     'num_edges': sub_edges,
@@ -1641,10 +1865,13 @@ def main():
                     'invalid': len(invalids),
                     'colors_so_far': cur_ncolors,
                     'color_state': color_state,
+                    'max_cycles': level_cyc,
+                    'elapsed_ms': level_ms,
                 })
                 print(f"  Level {level}: pal={cur_pal} T={cur_T} "
                       f"remaining={cur_n} invalid={len(invalids)} "
-                      f"colors_so_far={cur_ncolors}")
+                      f"colors_so_far={cur_ncolors} "
+                      f"cyc={level_cyc:,}")
                 print(f"  Color state: {color_state}")
 
                 total_levels += 1
@@ -1672,7 +1899,7 @@ def main():
             rounds = total_levels
 
             # Write per-test output file for manual diffing
-            out_dir = args.output_dir or os.path.join(root_dir, 'tests', 'cerebras-runs')
+            out_dir = run_paths['results_dir']
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, f"{name}_cerebras.txt")
             with open(out_path, 'w') as fout:
@@ -1708,11 +1935,23 @@ def main():
                     fout.write(f"  vertex {gid}: color {c}\n")
             print(f"  Output: {out_path}")
 
-            # Display timing from last level if available
+            # Display timing: total across all levels + per-level breakdown.
+            total_cycles_csl = sum(int(li.get('max_cycles', 0))
+                                   for li in level_info)
+            total_ms_csl = sum(float(li.get('elapsed_ms', 0.0))
+                               for li in level_info)
+            per_level_cyc = ', '.join(
+                f"L{i}={int(li.get('max_cycles', 0)):,}"
+                for i, li in enumerate(level_info))
+            print(f"  Timing (total across {len(level_info)} level"
+                  f"{'s' if len(level_info) != 1 else ''}): "
+                  f"{total_cycles_csl:,} cycles, "
+                  f"{total_ms_csl:.3f} ms  [{per_level_cyc}]")
             if result_data and 'max_cycles' in result_data:
                 max_cycles = result_data['max_cycles']
                 elapsed_ms = result_data['elapsed_ms']
-                print(f"  Timing (last level): {max_cycles:,} cycles, {elapsed_ms:.3f} ms")
+                print(f"  Timing (last level):  "
+                      f"{max_cycles:,} cycles, {elapsed_ms:.3f} ms")
 
             # --- Parse golden + run Picasso module ref ---
             ref = {'nodes': None, 'edges': None, 'colors': None,
@@ -1840,6 +2079,10 @@ def main():
 
     print()
     print(f"Results: {passed}/{passed + failed} passed, {failed} failed")
+    stdout_log_handle.flush()
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+    stdout_log_handle.close()
     if failed > 0:
         sys.exit(1)
 
