@@ -1,25 +1,40 @@
-// Picasso Graph Coloring — Pipelined LWW transport (Step 2c.2a).
+// Picasso Graph Coloring — Pipelined LWW transport, EAST-ONLY (Step 2c.2b.i).
 //
-// 1D-only, bidirectional, single-segment (no bridges yet).
-// Each PE owns two source colors: one east-going (c_k_E) and one
-// west-going (c_k_W). Every PE broadcasts its colored vertices on
-// both directions; downstream receivers scan boundary[] to accept
-// only wavelets whose sender_gid matches a known remote neighbor.
+// 1D-only, single-segment. Westbound DATA colors are gone entirely;
+// the BSP barrier is the dedicated reduce-chain on sync_reduce_c0/c1
+// and the eastbound broadcast on sync_bcast (the same colors that
+// `csl/layout.csl` uses for the 2D dedicated barrier).
 //
-// Queue budget (WSE-3, 6 usable after memcpy):
-//   tx_east_oq + tx_west_oq                               = 2 queues
-//   rx c_j_E (for j<col, up to num_cols-1)                = ≤4 queues
-//   rx c_j_W (for j>col, up to num_cols-1-col)            = ≤4 queues
-//   Sum for PE k: 2 + (num_cols-1) ≤ 6 iff num_cols ≤ 5.
-// Hence this layout caps num_cols at 5. Multi-segment with bridges
-// comes in 2c.2b.
+// Correctness rests on Path C: the host runner uses contiguous-GID
+// monotone block partition under `--routing pipelined-lww`, which
+// enforces `gid_a < gid_b ⇒ pe(gid_a) ≤ pe(gid_b)`. Combined with the
+// "lower-GID wins" conflict rule, the eastern PE always loses
+// cross-PE conflicts, so westbound data is provably redundant.
 //
-// Colors (1D only — num_rows must equal 1):
+// Queue budget (WSE-3, 6 hardware queues — Q0/Q1 free during coloring):
+//   tx_east_oq (data)                      = 1 queue
+//   tx_reduce_oq (barrier west send)       = 1 queue
+//   bcast_send_oq (PE0 only)               = 1 queue (shares pool but
+//                                            non-PE0 PEs don't allocate)
+//   rx_iq_0..3 (data slots, ≤4)            = ≤4 queues
+//   reduce_recv_iq (barrier rx)            = 1 queue
+//   bcast_recv_iq (PE0 doesn't allocate)   = 1 queue
+//
+//   Interior PE (worst case): 2 tx + 4 rx_data + 2 rx_barrier = 8.
+//   Park barrier queues on Q0/Q1 → effective data budget Q2..Q5 = 4.
+//   Hence single-segment cap is num_cols ≤ 5 with slot_count_max = 4
+//   under the same physical queue indexing as the bidirectional kernel.
+//   Bring-up will validate at num_cols = 4 first; num_cols = 5 may need
+//   queue-sharing tricks.
+//
+// Colors:
 //   0..4   east-going source colors c_0_E .. c_4_E
-//   8,9,10 1D sync barrier (reduce even, reduce odd, broadcast)
-//   11..15 west-going source colors c_0_W .. c_4_W
+//   8,9,10 dedicated barrier (reduce even, reduce odd, broadcast)
+//   (no west data colors)
 //
-// BSP round: speculate → send_boundary → inject_data+recv → barrier → detect/resolve
+// BSP round: speculate → send_boundary → (inject + recv data) →
+//            reduce-chain barrier (eastmost injects, PE0 originates bcast)
+//            → detect/resolve
 
 param num_cols: i16;
 param num_rows: i16;                   // must be 1
@@ -28,7 +43,6 @@ param max_local_edges: i16;
 param max_boundary: i16;
 param max_palette_size: i16;
 param max_list_size: i16;
-param east_only_flag: i16;
 
 // East-going source colors (col k injects c_k_E if k < num_cols - 1)
 const c_0_E: color = @get_color(0);
@@ -37,15 +51,9 @@ const c_2_E: color = @get_color(2);
 const c_3_E: color = @get_color(3);
 const c_4_E: color = @get_color(4);
 
-// West-going source colors (col k injects c_k_W if k > 0)
-const c_0_W: color = @get_color(11);
-const c_1_W: color = @get_color(12);
-const c_2_W: color = @get_color(13);
-const c_3_W: color = @get_color(14);
-const c_4_W: color = @get_color(15);
-
-// Sync barrier colors (identical to the SW-relay layout so we can
-// reuse the barrier implementation unchanged).
+// Dedicated reduce-chain barrier colors. Shared with `csl/layout.csl`'s
+// 2D dedicated barrier so the kernel-side OR-reduce logic is the same
+// pattern.
 const sync_reduce_c0: color = @get_color(8);
 const sync_reduce_c1: color = @get_color(9);
 const sync_bcast:     color = @get_color(10);
@@ -63,22 +71,12 @@ fn east_color_of(j: i16) color {
   return c_4_E;
 }
 
-fn west_color_of(j: i16) color {
-  if (j == 0) return c_0_W;
-  if (j == 1) return c_1_W;
-  if (j == 2) return c_2_W;
-  if (j == 3) return c_3_W;
-  return c_4_W;
-}
-
-// For PE at `col`, slot `s` (0..num_cols-2) listens to one upstream
-// source color. Slots 0..col-1 listen to east-going c_0_E..c_{col-1}_E;
-// slots col..num_cols-2 listen to west-going c_{col+1}_W..c_{num_cols-1}_W.
-// Unused slots (s >= slot_count) are filled with c_0_E as a safe placeholder;
-// the kernel never binds/initializes them, so the value is never observed.
+// For PE at `col`, slot `s` (0..pe_id-1) listens to east-going
+// c_s_E from PE s. Unused slots (s >= slot_count) are filled with
+// c_0_E as a safe placeholder; the kernel never binds/initializes them.
 fn slot_color_at(col: i16, s: i16) color {
   if (s < col) return east_color_of(s);
-  return west_color_of(s + 1);
+  return c_0_E;
 }
 
 layout {
@@ -89,7 +87,7 @@ layout {
     const is_east_edge: bool = (col == num_cols - 1);
     const mp = memcpy.get_params(col);
 
-    @set_tile_code(col, 0, "pe_program_lww.csl", .{
+    @set_tile_code(col, 0, "pe_program_lww_east.csl", .{
       .memcpy_params    = mp,
       .pe_id            = col,
       .num_cols         = num_cols,
@@ -100,27 +98,26 @@ layout {
       .max_list_size    = max_list_size,
       .is_west_edge     = is_west_edge,
       .is_east_edge     = is_east_edge,
-      .east_only        = (east_only_flag != 0),
 
-      // Source colors: pass all five slots; kernel only uses those
-      // with index < num_cols.
+      // East source colors only.
       .c_0_E = c_0_E, .c_1_E = c_1_E, .c_2_E = c_2_E,
       .c_3_E = c_3_E, .c_4_E = c_4_E,
-      .c_0_W = c_0_W, .c_1_W = c_1_W, .c_2_W = c_2_W,
-      .c_3_W = c_3_W, .c_4_W = c_4_W,
 
-      // Own source colors (pre-selected by layout for the send path).
+      // Own east source color (this PE's data tx color).
       .my_east_color = east_color_of(col),
-      .my_west_color = west_color_of(col),
 
-      // Upstream slot colors (up to 4) this PE listens on.
+      // Upstream slot colors (up to 4) this PE listens on for data.
       .slot0_color = slot_color_at(col, 0),
       .slot1_color = slot_color_at(col, 1),
       .slot2_color = slot_color_at(col, 2),
       .slot3_color = slot_color_at(col, 3),
-      .slot_count  = num_cols - 1,
+      .slot_count  = col,   // pe_id PEs west of me each contribute one slot
 
-      // Barrier colors (1D reduce chain + east-bound broadcast).
+      // Barrier colors. Even-indexed PEs receive on c0 / send on c1;
+      // odd-indexed PEs receive on c1 / send on c0. Matches the
+      // 1D reduce-chain layout in csl/layout_lww.csl (which is
+      // declared but unused under the bidirectional kernel) and
+      // csl/layout.csl's 2D dedicated barrier.
       .sync_reduce_recv_color =
         if (col % 2 == 0) sync_reduce_c0 else sync_reduce_c1,
       .sync_reduce_send_color =
@@ -130,8 +127,9 @@ layout {
 
     // ── East-going source color routes ──
     // For each j in 0..num_cols-1, color c_j_E is configured on PEs
-    // with col >= j.  Injector: rx=RAMP, tx=EAST.  Downstream: rx=WEST,
-    // tx=EAST+RAMP, except the last PE which terminates (rx=WEST, tx=RAMP).
+    // with col >= j. Injector: rx=RAMP, tx=EAST. Downstream:
+    // rx=WEST, tx=EAST+RAMP, except the last PE which terminates
+    // (rx=WEST, tx=RAMP).
     for (@range(i16, num_cols)) |j| {
       const cj: color = east_color_of(j);
       if (col == j and !is_east_edge) {
@@ -153,48 +151,38 @@ layout {
       // col == j and is_east_edge: injector with no east neighbors → no route
     }
 
-    // ── West-going source color routes (mirror of above) ──
-    for (@range(i16, num_cols)) |j| {
-      const cj: color = west_color_of(j);
-      if (col == j and !is_west_edge) {
-        @set_color_config(col, 0, cj, .{
-          .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST } },
-        });
-      } else if (col < j) {
-        if (is_west_edge) {
-          @set_color_config(col, 0, cj, .{
-            .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP } },
-          });
-        } else {
-          @set_color_config(col, 0, cj, .{
-            .routes = .{ .rx = .{ EAST }, .tx = .{ WEST, RAMP } },
-          });
-        }
-      }
-    }
-
-    // ── Sync barrier routes (1D reduce-chain + east-bound broadcast) ──
+    // ── Dedicated reduce-chain + east-bound broadcast barrier routes ──
+    // Reduce flows EAST→WEST: eastmost injects on its outgoing reduce
+    // color, each interior PE receives on its incoming reduce color
+    // and re-injects on its outgoing color (alternating c0/c1), PE0
+    // (westmost) terminates and originates the broadcast.
+    // Broadcast flows WEST→EAST: PE0 originates, all interior PEs
+    // forward + deliver to RAMP, eastmost terminates.
     const is_px_even: bool = (col % 2 == 0);
     if (is_west_edge and is_east_edge) {
-      // Single PE: self-loop broadcast; reduce is no-op.
+      // Single PE — no barrier needed; route bcast as self-loop so
+      // @initialize_queue doesn't orphan a color.
       @set_color_config(col, 0, sync_bcast,
         .{ .routes = .{ .rx = .{RAMP}, .tx = .{RAMP} } });
     } else if (is_east_edge) {
-      // Eastmost: reduce sender.
+      // Eastmost: reduce injector (sends on its outgoing color), bcast
+      // terminator (rx from west, deliver to RAMP).
       @set_color_config(col, 0,
         if (is_px_even) sync_reduce_c1 else sync_reduce_c0,
         .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
       @set_color_config(col, 0, sync_bcast,
         .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
     } else if (is_west_edge) {
-      // Westmost P(0,0): reduce root + broadcast origin.
+      // Westmost (PE0): reduce sink (rx from east, deliver to RAMP),
+      // bcast originator (rx from RAMP, send east).
       @set_color_config(col, 0,
         if (is_px_even) sync_reduce_c0 else sync_reduce_c1,
         .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
       @set_color_config(col, 0, sync_bcast,
         .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
     } else {
-      // Interior: reduce relay + broadcast forward.
+      // Interior: reduce relay (rx incoming from east → RAMP; CE OR-
+      // injects onto outgoing color → WEST). Bcast forward+deliver.
       @set_color_config(col, 0,
         if (is_px_even) sync_reduce_c0 else sync_reduce_c1,
         .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
@@ -206,7 +194,9 @@ layout {
     }
   }
 
-  // Host ↔ device exports (same set as SW-relay kernel).
+  // Host ↔ device exports (same set as the bidirectional LWW kernel
+  // minus expected_recv: the dedicated barrier no longer needs per-PE
+  // expected_done counts).
   @export_name("csr_offsets",            [*]i32, true);
   @export_name("csr_adj",                [*]i32, true);
   @export_name("colors",                 [*]i32, true);
@@ -217,10 +207,10 @@ layout {
   @export_name("boundary_direction",     [*]i32, true);
   @export_name("runtime_config",         [*]i32, true);
   @export_name("num_boundary",           [*]i32, true);
+  @export_name("expected_recv",          [*]i32, true);
   @export_name("coloring_timer",         [*]f32, true);
   @export_name("perf_counters",          [*]i32, true);
-  @export_name("expected_recv",          [*]i32, true);
   @export_name("color_list",             [*]i32, true);
   @export_name("list_len",               [*]i32, true);
-  @export_name("start_coloring",         fn()void);
+  @export_name("start_coloring", fn()void);
 }

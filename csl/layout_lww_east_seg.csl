@@ -1,0 +1,286 @@
+// Picasso Graph Coloring — Pipelined LWW transport, EAST-ONLY + segmented (Step 2c.2b.ii).
+//
+// Extends layout_lww_east.csl by partitioning the row into B = ceil(W/S)
+// segments of size S, with B-1 bridge PEs at positions S-1, 2S-1, ...
+// Source colors c_0..c_{S-1} are reused inside every segment; bridge
+// PEs (the last PE of every non-last segment) re-inject every received
+// wavelet onto a per-segment bridge color so segment N+1 hears the
+// merged stream of all upstream voices.
+//
+// This is the chained-bridge pattern validated in
+// spikes/experiments/pipelined_lww_1d_seg{,2}_spike, lifted into the
+// Picasso BSP kernel.
+//
+// Color map (S = 4 fixed for now):
+//   0..3  source colors c_0..c_3       (reused per segment)
+//   4,5   bridge colors c_be, c_bo     (alternated between consecutive
+//                                        bridges; reused once terminated
+//                                        at the next bridge — same way
+//                                        source colors are reused per
+//                                        segment, so num_cols is unbounded)
+//   8/9/10 dedicated barrier colors    (unchanged from east-only kernel)
+//
+// Queue budget per PE (interior seg-N, N>0, local_x = S-1 = 3):
+//   OQ2 tx_east + OQ3 tx_reduce             = 2 OQs
+//   IQ2 reduce_recv + IQ3 bcast_recv
+//     + IQ4..7 data slots (4 = bridge + 3 in-seg) = 6 IQs
+//   Fits the 6-user-queue WSE-3 cap exactly.
+
+param num_cols: i16;
+param num_rows: i16;                   // must be 1
+param max_local_verts: i16;
+param max_local_edges: i16;
+param max_boundary: i16;
+param max_palette_size: i16;
+param max_list_size: i16;
+param S: i16;                          // segment size (1..4)
+
+// Source colors c_0..c_3 (reused per segment).
+const c_0: color = @get_color(0);
+const c_1: color = @get_color(1);
+const c_2: color = @get_color(2);
+const c_3: color = @get_color(3);
+
+// Bridge colors: only 2 needed thanks to span-disjoint reuse. bridge_k
+// uses c_be when k is even, c_bo when k is odd. c_b{even} is alive only
+// from bridge_0 .. bridge_1 (then terminated), so bridge_2 can reuse it
+// safely; same for c_bo between bridge_1 .. bridge_2 vs bridge_3.
+const c_be: color = @get_color(4);
+const c_bo: color = @get_color(5);
+
+// Dedicated reduce-chain barrier colors.
+const sync_reduce_c0: color = @get_color(8);
+const sync_reduce_c1: color = @get_color(9);
+const sync_bcast:     color = @get_color(10);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width  = num_cols,
+  .height = 1,
+});
+
+fn source_color_of(j: i16) color {
+  if (j == 0) return c_0;
+  if (j == 1) return c_1;
+  if (j == 2) return c_2;
+  return c_3;
+}
+
+fn bridge_color_of(seg: i16) color {
+  // bridge_seg uses c_be if seg is even, c_bo if seg is odd. The previous
+  // bridge (seg-1) used the OPPOSITE color, which was terminated at
+  // bridge_seg, so reuse is safe across any number of segments.
+  if (seg % 2 == 0) return c_be;
+  return c_bo;
+}
+
+layout {
+  @set_rectangle(num_cols, 1);
+
+  // Number of segments (B = ceil(num_cols / S)).
+  const num_segs: i16 = (num_cols + S - 1) / S;
+
+  for (@range(i16, num_cols)) |col| {
+    const is_west_edge: bool = (col == 0);
+    const is_east_edge: bool = (col == num_cols - 1);
+    const mp = memcpy.get_params(col);
+
+    const seg_idx: i16 = col / S;
+    const local_x: i16 = col - seg_idx * S;
+    const is_bridge: bool = (seg_idx < num_segs - 1) and (local_x == S - 1);
+
+    // Own east-going color: bridge → its bridge color; else source[local_x].
+    const my_east_color: color =
+      if (is_bridge) bridge_color_of(seg_idx) else source_color_of(local_x);
+
+    // Slot mapping. Slot 0 is the cross-segment bridge (if seg_idx > 0),
+    // slots 1..local_upstream are in-seg source colors c_0..c_{local_upstream-1}.
+    // For bridge: in-seg upstream count = S-1 (rx c_0..c_{S-2}).
+    // For non-bridge: in-seg upstream count = local_x.
+    const local_upstream: i16 = if (is_bridge) (S - 1) else local_x;
+    const has_cross_bridge: bool = (seg_idx > 0);
+    const cross_bridge_color: color =
+      if (has_cross_bridge) bridge_color_of(seg_idx - 1) else c_0;
+    const slot_count: i16 = local_upstream + (if (has_cross_bridge) @as(i16, 1) else @as(i16, 0));
+
+    // Slot color assignments. The kernel's rx_task_X are bound to
+    // slot k iff k < slot_count. We pack the bridge slot first (slot 0)
+    // when present, then in-seg sources in ascending color order.
+    const slot0_color: color =
+      if (has_cross_bridge) cross_bridge_color
+      else if (local_upstream > 0) source_color_of(0)
+      else c_0;
+    const slot1_color: color =
+      if (has_cross_bridge and local_upstream > 0) source_color_of(0)
+      else if (!has_cross_bridge and local_upstream > 1) source_color_of(1)
+      else c_0;
+    const slot2_color: color =
+      if (has_cross_bridge and local_upstream > 1) source_color_of(1)
+      else if (!has_cross_bridge and local_upstream > 2) source_color_of(2)
+      else c_0;
+    const slot3_color: color =
+      if (has_cross_bridge and local_upstream > 2) source_color_of(2)
+      else if (!has_cross_bridge and local_upstream > 3) source_color_of(3)
+      else c_0;
+
+    // Expected count of data-done sentinels per round.
+    // = S*seg_idx (cross-bridge merged stream from earlier segments)
+    // + local_upstream (in-segment upstream sources)
+    const expected_data_done: i16 = S * seg_idx + local_upstream;
+
+    @set_tile_code(col, 0, "pe_program_lww_east_seg.csl", .{
+      .memcpy_params    = mp,
+      .pe_id            = col,
+      .num_cols         = num_cols,
+      .max_local_verts  = max_local_verts,
+      .max_local_edges  = max_local_edges,
+      .max_boundary     = max_boundary,
+      .max_palette_size = max_palette_size,
+      .max_list_size    = max_list_size,
+      .is_west_edge     = is_west_edge,
+      .is_east_edge     = is_east_edge,
+      .is_bridge        = is_bridge,
+      .my_east_color    = my_east_color,
+      .slot0_color      = slot0_color,
+      .slot1_color      = slot1_color,
+      .slot2_color      = slot2_color,
+      .slot3_color      = slot3_color,
+      .slot_count       = slot_count,
+      .expected_data_done_param = expected_data_done,
+      .sync_reduce_recv_color =
+        if (col % 2 == 0) sync_reduce_c0 else sync_reduce_c1,
+      .sync_reduce_send_color =
+        if (col % 2 == 0) sync_reduce_c1 else sync_reduce_c0,
+      .sync_bcast_color = sync_bcast,
+    });
+
+    // ── Source color routes (c_0..c_{S-1} reused per segment) ──
+    // Within a segment of size S occupying PEs [seg*S .. seg*S+S-1]:
+    //   - Source PE at local_x = j (j in 0..S-2 for non-last seg, 0..S-1
+    //     for last seg) injects c_j: rx=RAMP, tx=EAST.
+    //   - Downstream PEs in the same segment (local_x > j, not bridge):
+    //     forward c_j: rx=WEST, tx={EAST,RAMP}.
+    //   - Bridge PE (local_x = S-1, non-last seg): TERMINATES every
+    //     upstream c_j (j in 0..S-2): rx=WEST, tx=RAMP. (Bridge consumes
+    //     them and re-emits via its bridge color.)
+    //   - Last PE of last segment terminates: rx=WEST, tx=RAMP.
+    //   - PEs outside this segment: c_j is unconfigured (no traffic crosses
+    //     segment boundaries on source colors — bridges carry it).
+    var j: i16 = 0;
+    while (j < S) : (j += 1) {
+      const cj: color = source_color_of(j);
+      // Determine this PE's relationship to segment-local source j.
+      if (local_x == j and !is_bridge) {
+        // Injector (non-bridge owns its source color).
+        if (col == num_cols - 1 or local_x == S - 1) {
+          // Last PE of last segment AND happens to be local source (only
+          // when is_last_seg and local_x = S-1). No east neighbor → no route
+          // (kernel won't transmit). Skip configuration to avoid orphans.
+        } else {
+          @set_color_config(col, 0, cj, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+          });
+        }
+      } else if (local_x > j) {
+        // Downstream in same segment.
+        if (is_bridge) {
+          // Bridge terminates every in-seg upstream source.
+          @set_color_config(col, 0, cj, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+          });
+        } else if (col == num_cols - 1) {
+          // Last PE of last segment terminates.
+          @set_color_config(col, 0, cj, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+          });
+        } else {
+          // Forward east + deliver to ramp.
+          @set_color_config(col, 0, cj, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } },
+          });
+        }
+      }
+      // local_x < j: this PE is upstream of source j within its segment;
+      //              source j hasn't been emitted yet here. Unconfigured.
+    }
+
+    // ── Bridge color routes (c_b0..c_b{B-2}) ──
+    // c_bN carries the merged stream out of segment N (= bridge_N's
+    // re-injected upstream + bridge_N's own data) into segment N+1
+    // (and beyond, until another bridge sinks it). Each bridge color
+    // terminates at the next segment's bridge (or at the eastmost PE
+    // if this is the second-to-last segment).
+    var k: i16 = 0;
+    while (k < num_segs - 1) : (k += 1) {
+      const ck: color = bridge_color_of(k);
+      const inj_pe: i16 = (k + 1) * S - 1;       // bridge_k position
+      const sink_pe: i16 =                        // next bridge OR last PE
+        if (k + 2 < num_segs) (k + 2) * S - 1
+        else num_cols - 1;
+      if (col == inj_pe) {
+        // Bridge injector.
+        @set_color_config(col, 0, ck, .{
+          .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+        });
+      } else if (col > inj_pe and col <= sink_pe) {
+        // Listeners between bridge_k and its sink.
+        if (col == sink_pe) {
+          @set_color_config(col, 0, ck, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+          });
+        } else {
+          @set_color_config(col, 0, ck, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } },
+          });
+        }
+      }
+      // col < inj_pe or col > sink_pe: unconfigured.
+    }
+
+    // ── Dedicated reduce-chain + east-bound broadcast barrier routes ──
+    // (Identical to layout_lww_east.csl.)
+    const is_px_even: bool = (col % 2 == 0);
+    if (is_west_edge and is_east_edge) {
+      @set_color_config(col, 0, sync_bcast,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{RAMP} } });
+    } else if (is_east_edge) {
+      @set_color_config(col, 0,
+        if (is_px_even) sync_reduce_c1 else sync_reduce_c0,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+      @set_color_config(col, 0, sync_bcast,
+        .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+    } else if (is_west_edge) {
+      @set_color_config(col, 0,
+        if (is_px_even) sync_reduce_c0 else sync_reduce_c1,
+        .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+      @set_color_config(col, 0, sync_bcast,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+    } else {
+      @set_color_config(col, 0,
+        if (is_px_even) sync_reduce_c0 else sync_reduce_c1,
+        .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+      @set_color_config(col, 0,
+        if (is_px_even) sync_reduce_c1 else sync_reduce_c0,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+      @set_color_config(col, 0, sync_bcast,
+        .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST, RAMP} } });
+    }
+  }
+
+  // Host ↔ device exports (same set as east-only kernel).
+  @export_name("csr_offsets",            [*]i32, true);
+  @export_name("csr_adj",                [*]i32, true);
+  @export_name("colors",                 [*]i32, true);
+  @export_name("local_num_verts",        [*]i32, true);
+  @export_name("global_vertex_ids",      [*]i32, true);
+  @export_name("boundary_local_idx",     [*]i32, true);
+  @export_name("boundary_neighbor_gid",  [*]i32, true);
+  @export_name("boundary_direction",     [*]i32, true);
+  @export_name("runtime_config",         [*]i32, true);
+  @export_name("num_boundary",           [*]i32, true);
+  @export_name("expected_recv",          [*]i32, true);
+  @export_name("coloring_timer",         [*]f32, true);
+  @export_name("perf_counters",          [*]i32, true);
+  @export_name("color_list",             [*]i32, true);
+  @export_name("list_len",               [*]i32, true);
+  @export_name("start_coloring", fn()void);
+}

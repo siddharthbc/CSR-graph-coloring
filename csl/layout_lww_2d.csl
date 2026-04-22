@@ -1,0 +1,297 @@
+// Picasso Graph Coloring — Pipelined LWW transport, 2D EAST+SOUTH+W (back-channel)
+// (Step 4a iteration 2).
+//
+// Iter 1 (east+south only, NO back-channel) was the narrowest 2D
+// falsifier and FAILED 9/12 tests at 2×2 — confirming that anti-diagonal
+// cross-PE pairs (e.g. PE1↔PE2) cannot be reconciled without a westbound
+// channel, AND that a forwarding hop is needed so PE0 reaches PE3.
+//
+// Iter 2 adds at 2×2:
+//   * east→south forwarding on PE1 (c_E_data arrivals re-emitted on c_S_data)
+//   * a new row-1 westbound color c_W_data_r1: PE3 forwards every south
+//     arrival west to PE2.
+//   * row bcast goes IN-BAND on c_E_data (drops c_bcast_E_r0/r1 OQ/IQ usage)
+//     to free queues for the back-channel IQ on PE2.
+//
+// Topology (2×2):
+//
+//     PE(0,0) ──E──> PE(0,1)
+//        │   (in-band      │
+//        S    row_bcast)     S
+//        ↓                   ↓
+//     PE(1,0) <─W── PE(1,1)   ← NEW back-channel c_W_data_r1
+//             ==E==>
+//
+// Path C contract preserved: "lower-GID wins" + row-major monotone
+// block partition ⇒ east-loses on rows, south-loses on cols. The
+// new west channel only carries forwarded data so the SW PE can SEE
+// the NE PE's color (and resolve its own loss) — it does NOT change
+// the conflict rule.
+//
+// Colors (9 total, c_bcast_E_r0/r1 unused but kept for now):
+//   0  c_E_data           per-row east data pipeline (also carries row_bcast in-band)
+//   1  c_S_data           per-col south data pipeline
+//   2  c_red_E_r0         row-0 reduce E→W (PE(0,1) → PE(0,0))
+//   3  c_red_E_r1         row-1 reduce E→W (PE(1,1) → PE(1,0))
+//   4  c_red_S_c0         col-0 reduce S→N (PE(1,0) → PE(0,0))
+//   5  c_bcast_S_c0       col-0 bcast N→S (PE(0,0) → PE(1,0))
+//   6  c_bcast_E_r0       (UNUSED in iter 2)
+//   7  c_bcast_E_r1       (UNUSED in iter 2)
+//   8  c_W_data_r1        row-1 back-channel W (PE(1,1) → PE(1,0))
+//
+// Queue allocation per PE (Q0/Q1 reserved by memcpy on WSE-3):
+//
+//   PE0 (0,0):  Q2 OQ tx_q2(c_E_data),    Q3 OQ tx_q3(c_S_data),
+//               Q4 IQ rx_back(c_red_S_c0), Q6 OQ tx_south_bcast(c_bcast_S_c0),
+//               Q7 IQ rx_red_E(c_red_E_r0).                          [5 queues]
+//   PE1 (0,1):  Q3 OQ tx_q3(c_S_data) (own + forwarded from east),
+//               Q4 OQ tx_back(c_red_E_r0 W),
+//               Q5 IQ rx_q5(c_E_data) (data, data-done, in-band row_bcast).
+//                                                                    [3 queues]
+//   PE2 (1,0):  Q2 OQ tx_q2(c_E_data) (own + in-band row_bcast east),
+//               Q3 IQ rx_col_bcast(c_bcast_S_c0),
+//               Q4 OQ tx_back(c_red_S_c0 N),
+//               Q5 IQ rx_q5(c_W_data_r1) ← NEW back-channel,
+//               Q6 IQ rx_data_s(c_S_data),
+//               Q7 IQ rx_red_E(c_red_E_r1).                          [6 queues]
+//   PE3 (1,1):  Q4 OQ tx_back(c_red_E_r1 W),
+//               Q5 IQ rx_q5(c_E_data) (data, data-done, in-band row_bcast),
+//               Q6 IQ rx_data_s(c_S_data),
+//               Q7 OQ tx_west(c_W_data_r1) ← NEW back-channel origin.
+//                                                                    [4 queues]
+//
+// All ≤ 6 active queues per PE.
+
+param num_cols: i16;
+param num_rows: i16;                   // must be 2 for iteration 2
+param max_local_verts: i16;
+param max_local_edges: i16;
+param max_boundary: i16;
+param max_palette_size: i16;
+param max_list_size: i16;
+
+const c_E_data:        color = @get_color(0);
+const c_S_data:        color = @get_color(1);
+const c_red_E_r0:      color = @get_color(2);
+const c_red_E_r1:      color = @get_color(3);
+const c_red_S_c0:      color = @get_color(4);
+const c_bcast_S_c0:    color = @get_color(5);
+const c_bcast_E_r0:    color = @get_color(6);
+const c_bcast_E_r1:    color = @get_color(7);
+const c_W_data_r1:     color = @get_color(8);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width  = num_cols,
+  .height = num_rows,
+});
+
+fn row_red_color_of(row: i16) color {
+  if (row == 0) return c_red_E_r0;
+  return c_red_E_r1;
+}
+
+fn row_bcast_color_of(row: i16) color {
+  if (row == 0) return c_bcast_E_r0;
+  return c_bcast_E_r1;
+}
+
+layout {
+  @set_rectangle(num_cols, num_rows);
+
+  for (@range(i16, num_rows)) |row| {
+    for (@range(i16, num_cols)) |col| {
+      const pe_idx: i16 = row * num_cols + col;
+      const is_west_edge:  bool = (col == 0);
+      const is_east_edge:  bool = (col == num_cols - 1);
+      const is_north_edge: bool = (row == 0);
+      const is_south_edge: bool = (row == num_rows - 1);
+      const is_pe0:        bool = is_west_edge and is_north_edge;
+      const mp = memcpy.get_params(col);
+
+      const my_row_red:   color = row_red_color_of(row);
+      const my_row_bcast: color = row_bcast_color_of(row);
+
+      @set_tile_code(col, row, "pe_program_lww_2d.csl", .{
+        .memcpy_params    = mp,
+        .pe_id            = pe_idx,
+        .my_row           = row,
+        .my_col           = col,
+        .num_cols         = num_cols,
+        .num_rows         = num_rows,
+        .max_local_verts  = max_local_verts,
+        .max_local_edges  = max_local_edges,
+        .max_boundary     = max_boundary,
+        .max_palette_size = max_palette_size,
+        .max_list_size    = max_list_size,
+        .is_west_edge     = is_west_edge,
+        .is_east_edge     = is_east_edge,
+        .is_north_edge    = is_north_edge,
+        .is_south_edge    = is_south_edge,
+        .is_pe0           = is_pe0,
+
+        // Data axis colors (referenced unconditionally; only initialized
+        // on the PEs that actually need them).
+        .c_E_data         = c_E_data,
+        .c_S_data         = c_S_data,
+        .c_W_data_r1      = c_W_data_r1,
+
+        // Per-row barrier colors (this row's reduce + bcast).
+        // row_bcast_color is now sent IN-BAND on c_E_data; the dedicated
+        // bcast color is unused but kept as a placeholder so the kernel's
+        // param signature is unchanged.
+        .row_red_color    = my_row_red,
+        .row_bcast_color  = my_row_bcast,
+
+        // Col-0 barrier colors (col-reduce / col-bcast). PEs not on col 0
+        // get them as placeholders and never bind.
+        .col_red_color    = c_red_S_c0,
+        .col_bcast_color  = c_bcast_S_c0,
+
+        // Per-axis data-done expectation.
+        // east axis: 1 upstream (col-0 PE on this row) for non-col-0 PEs.
+        // south axis: PE on (R>0, C) sees 1 own + C forwarded (east→south
+        //   relay at PE(0,C) for C>0) = C+1 dones. At col 0 just 1.
+        // west axis: PE on (R>0, col 0) sees PE(R, num_cols-1)'s south
+        //   stream forwarded west = (num_cols-1)+1 = num_cols dones.
+        //   At 2x2 only PE2 receives this (col 0, row 1). Other PEs = 0.
+        .expected_data_done_e = if (is_west_edge)  @as(i16, 0) else @as(i16, 1),
+        .expected_data_done_s = if (is_north_edge) @as(i16, 0)
+                                else if (col == 0) @as(i16, 1)
+                                else @as(i16, 1 + col),
+        .expected_data_done_w = if (is_west_edge and !is_north_edge)
+                                  @as(i16, num_cols)
+                                else @as(i16, 0),
+      });
+
+      // ── Data routes ──
+
+      // East data c_E_data: origin on col-0 (rx=RAMP, tx=EAST), recv on col=col-1
+      // (rx=WEST, tx=RAMP). Interior cols (3+) would do tx={EAST,RAMP}; not at 2×2.
+      if (is_west_edge and !is_east_edge) {
+        @set_color_config(col, row, c_E_data,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+      } else if (is_east_edge and !is_west_edge) {
+        @set_color_config(col, row, c_E_data,
+          .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+      } else if (!is_west_edge and !is_east_edge) {
+        @set_color_config(col, row, c_E_data,
+          .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST, RAMP} } });
+      }
+      // (single-col case: no east route)
+
+      // South data c_S_data: origin on row-0, recv on row=last.
+      if (is_north_edge and !is_south_edge) {
+        @set_color_config(col, row, c_S_data,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+      } else if (is_south_edge and !is_north_edge) {
+        @set_color_config(col, row, c_S_data,
+          .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+      } else if (!is_north_edge and !is_south_edge) {
+        @set_color_config(col, row, c_S_data,
+          .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} } });
+      }
+
+      // ── Barrier routes ──
+
+      // Row reduce (E→W) on this row's color my_row_red:
+      //   east-end:    rx=RAMP, tx=WEST  (origin)
+      //   interior:    rx=EAST, tx=WEST  (relay; OR injected via RAMP also? in 2x2
+      //                this branch unused — covered for future generalization)
+      //   west-end:    rx=EAST, tx=RAMP  (sink: col-0 PE delivers to RAMP)
+      if (is_east_edge and !is_west_edge) {
+        @set_color_config(col, row, my_row_red,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+      } else if (is_west_edge and !is_east_edge) {
+        @set_color_config(col, row, my_row_red,
+          .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+      } else if (!is_west_edge and !is_east_edge) {
+        // Interior row PE: receive from east, OR-and-forward via RAMP injection.
+        // Same pattern as 1D dedicated barrier: rx EAST → tx RAMP (kernel
+        // re-injects on a paired send color). At 2×2 unused.
+        @set_color_config(col, row, my_row_red,
+          .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+      }
+
+      // Row bcast (W→E) on this row's color my_row_bcast:
+      //   west-end:  rx=RAMP, tx=EAST  (origin)
+      //   east-end:  rx=WEST, tx=RAMP  (sink)
+      //   interior:  rx=WEST, tx={EAST, RAMP} (forward + deliver)
+      if (is_west_edge and !is_east_edge) {
+        @set_color_config(col, row, my_row_bcast,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+      } else if (is_east_edge and !is_west_edge) {
+        @set_color_config(col, row, my_row_bcast,
+          .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+      } else if (!is_west_edge and !is_east_edge) {
+        @set_color_config(col, row, my_row_bcast,
+          .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST, RAMP} } });
+      }
+
+      // Col reduce (S→N) and col bcast (N→S): only configured on col 0.
+      if (is_west_edge) {
+        // col_red_S_c0
+        if (is_south_edge and !is_north_edge) {
+          @set_color_config(col, row, c_red_S_c0,
+            .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+        } else if (is_north_edge and !is_south_edge) {
+          @set_color_config(col, row, c_red_S_c0,
+            .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+        } else if (!is_north_edge and !is_south_edge) {
+          @set_color_config(col, row, c_red_S_c0,
+            .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+        }
+
+        // c_bcast_S_c0
+        if (is_north_edge and !is_south_edge) {
+          @set_color_config(col, row, c_bcast_S_c0,
+            .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+        } else if (is_south_edge and !is_north_edge) {
+          @set_color_config(col, row, c_bcast_S_c0,
+            .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+        } else if (!is_north_edge and !is_south_edge) {
+          @set_color_config(col, row, c_bcast_S_c0,
+            .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} } });
+        }
+      }
+
+      // Back-channel west on non-row-0 rows (iter 2).
+      // c_W_data_r1 is shared by all rows for this routing pattern (we
+      // only have one non-row-0 row at 2x2, so the color name is
+      // historical — generalizing to multi-row will need per-row colors).
+      // Routing on row R > 0:
+      //   east-end:  rx=RAMP, tx=WEST  (origin: PE3 forwards south arrivals west)
+      //   interior:  rx=EAST, tx=WEST,RAMP  (relay + deliver locally; unused at 2x2)
+      //   west-end:  rx=EAST, tx=RAMP  (sink: PE2 receives back-channel)
+      if (!is_north_edge) {
+        if (is_east_edge and !is_west_edge) {
+          @set_color_config(col, row, c_W_data_r1,
+            .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+        } else if (is_west_edge and !is_east_edge) {
+          @set_color_config(col, row, c_W_data_r1,
+            .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+        } else if (!is_west_edge and !is_east_edge) {
+          @set_color_config(col, row, c_W_data_r1,
+            .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST, RAMP} } });
+        }
+      }
+    }
+  }
+
+  // Host ↔ device exports (same set as east-only kernel).
+  @export_name("csr_offsets",            [*]i32, true);
+  @export_name("csr_adj",                [*]i32, true);
+  @export_name("colors",                 [*]i32, true);
+  @export_name("local_num_verts",        [*]i32, true);
+  @export_name("global_vertex_ids",      [*]i32, true);
+  @export_name("boundary_local_idx",     [*]i32, true);
+  @export_name("boundary_neighbor_gid",  [*]i32, true);
+  @export_name("boundary_direction",     [*]i32, true);
+  @export_name("runtime_config",         [*]i32, true);
+  @export_name("num_boundary",           [*]i32, true);
+  @export_name("expected_recv",          [*]i32, true);
+  @export_name("coloring_timer",         [*]f32, true);
+  @export_name("perf_counters",          [*]i32, true);
+  @export_name("color_list",             [*]i32, true);
+  @export_name("list_len",               [*]i32, true);
+  @export_name("start_coloring", fn()void);
+}

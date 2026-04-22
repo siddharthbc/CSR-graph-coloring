@@ -628,8 +628,20 @@ def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
                     dc = nbr_col - pe_col  # positive=east, negative=west
                     dr = nbr_row - pe_row  # positive=south, negative=north
 
-                    # Initial send direction (horizontal-first for Manhattan)
-                    if dc > 0:
+                    # Direction encoding rules:
+                    #   * 'hash' mode: Manhattan horizontal-first (legacy
+                    #     bidirectional kernel uses all 4 dirs).
+                    #   * 'block' mode (pipelined-lww): Path C invariant
+                    #     means only nbr_pe > my_pe needs to send. The
+                    #     2D LWW kernel routes data on east + south +
+                    #     row-1-westbound back-channel. For an
+                    #     anti-diagonal SW receiver (dr>0, dc<0) the
+                    #     winner-PE must send SOUTH so the east-edge
+                    #     forwarder can relay west to the loser. Picking
+                    #     dir=1 (west) drops the wavelet entirely.
+                    if mode == 'block' and dr > 0 and dc < 0:
+                        d = 2   # south (back-channel via E-edge forwarder)
+                    elif dc > 0:
                         d = 0   # east
                     elif dc < 0:
                         d = 1   # west
@@ -1027,13 +1039,21 @@ def find_tool(name):
 
 def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
                 max_boundary, max_relay, max_palette_size, max_list_size,
-                routing_mode, output_dir):
+                routing_mode, output_dir, lww_east_only=False,
+                lww_layout='bidir'):
     """Compile the CSL program with cslc.
 
     max_palette_size: compile-time upper bound (sizes the forbidden[] array).
     The actual palette_size is uploaded at runtime per test.
     routing_mode: 0 = SW relay, 1 = HW filter (1D only),
                   2 = pipelined-LWW (1D, num_cols<=5, broadcast+filter).
+    lww_layout: 'bidir' (default) selects layout_lww.csl + pe_program_lww.csl.
+                'east'  selects layout_lww_east.csl + pe_program_lww_east.csl
+                (Step 2c.2b.i: east-only data + dedicated reduce-chain barrier).
+                'east_seg' selects layout_lww_east_seg.csl +
+                pe_program_lww_east_seg.csl (Step 2c.2b.ii: same as 'east'
+                plus per-segment bridge PEs lifting the num_cols<=4 cap).
+                Only honored when routing_mode == 2.
 
     Runs from the repo root so the singularity container bind covers
     both the CSL sources and the output directory.  The layout file is
@@ -1051,7 +1071,14 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
     # separate (layout_lww.csl, pe_program_lww.csl) pair so the SW-relay /
     # HW-filter kernel can stay untouched during the 2c.2a bring-up.
     if routing_mode == 2:
-        layout_name = 'layout_lww.csl'
+        if lww_layout == '2d':
+            layout_name = 'layout_lww_2d.csl'
+        elif lww_layout == 'east_seg':
+            layout_name = 'layout_lww_east_seg.csl'
+        elif lww_layout == 'east':
+            layout_name = 'layout_lww_east.csl'
+        else:
+            layout_name = 'layout_lww.csl'
     else:
         layout_name = 'layout.csl'
     layout_rel = os.path.relpath(os.path.join(csl_dir, layout_name), repo_root)
@@ -1060,9 +1087,11 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
     fabric_h = num_rows + 2
 
     if routing_mode == 2:
-        # layout_lww.csl takes a narrower parameter set (no max_relay,
-        # no routing_mode — single-segment bidirectional 1D).
-        params = (
+        # layout_lww.csl / layout_lww_east.csl take a narrower parameter
+        # set (no max_relay, no routing_mode — single-segment 1D).
+        # The east-only layout drops east_only_flag (the variant IS
+        # east-only by construction).
+        base_params = (
             f'num_cols:{num_cols},'
             f'num_rows:{num_rows},'
             f'max_local_verts:{max_local_verts},'
@@ -1071,6 +1100,18 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
             f'max_palette_size:{max_palette_size},'
             f'max_list_size:{max_list_size}'
         )
+        if lww_layout == 'east_seg':
+            # Segmented east-only kernel: same base params plus segment
+            # size S (1..4 currently; queue budget caps slot_count at 4).
+            params = base_params + ',S:4'
+        elif lww_layout == 'east':
+            params = base_params
+        elif lww_layout == '2d':
+            # 2D east+south-only kernel (Step 4a iter 1). num_rows is
+            # already in base_params; no extra params required.
+            params = base_params
+        else:
+            params = base_params + f',east_only_flag:{1 if lww_east_only else 0}'
     else:
         params = (
             f'num_cols:{num_cols},'
@@ -1329,6 +1370,30 @@ def main():
                              'pipelined-lww (1D only, num_cols <= 5, '
                              'broadcast + local-filter with per-direction '
                              'source colors).')
+    parser.add_argument('--lww-east-only', action='store_true',
+                        help='Path C probe: under --routing pipelined-lww, '
+                             'suppress westbound DATA wavelets while keeping '
+                             'westbound DONE sentinels (the OR-reduce barrier '
+                             'rides the done sentinel under the bidirectional '
+                             'kernel). Only meaningful with --lww-layout bidir.')
+    parser.add_argument('--lww-layout', type=str, default='bidir',
+                        choices=['bidir', 'east', 'east_seg', '2d'],
+                        help='Pipelined-LWW kernel variant: bidir (default, '
+                             'csl/layout_lww.csl + csl/pe_program_lww.csl) '
+                             'or east (Step 2c.2b.i, csl/layout_lww_east.csl '
+                             '+ csl/pe_program_lww_east.csl — east-only data '
+                             'with dedicated reduce-chain barrier) '
+                             'or east_seg (Step 2c.2b.ii, '
+                             'csl/layout_lww_east_seg.csl + '
+                             'csl/pe_program_lww_east_seg.csl — east-only '
+                             'with per-segment bridges, S=4 fixed, '
+                             'lifts num_cols<=4 cap to <=20) '
+                             'or 2d (Step 4a iter 1, '
+                             'csl/layout_lww_2d.csl + '
+                             'csl/pe_program_lww_2d.csl — 2D east+south-only '
+                             'with hierarchical 2D barrier, NO back-channel; '
+                             '2x2 only at iter 1, narrowest 2D falsifier). '
+                             'Only meaningful with --routing pipelined-lww.')
     parser.add_argument('--skip-h2', action='store_true',
                         help='Skip the H2_631g_89nodes test (too large for '
                              'simulator)')
@@ -1376,18 +1441,50 @@ def main():
         sys.exit("ERROR: --routing hw-filter requires 1D layout (num_rows=1); "
                  f"got num_rows={num_rows}. Use --routing sw-relay for 2D.")
 
-    # Pipelined-LWW guards: 1D only, num_cols <= 5 (WSE-3 queue budget:
-    # 2 tx + (num_cols-1) rx <= 6 user queues after memcpy).
+    # Pipelined-LWW guards: 1D only EXCEPT for --lww-layout 2d (Step 4a),
+    # num_cols <= 5 (WSE-3 queue budget) for 1D variants.
     if args.routing == 'pipelined-lww':
-        if num_rows > 1:
+        if num_rows > 1 and args.lww_layout != '2d':
             sys.exit("ERROR: --routing pipelined-lww requires 1D layout "
-                     f"(num_rows=1); got num_rows={num_rows}. "
-                     "Multi-segment / 2D is deferred to Step 2c.2b.")
-        if num_cols > 5:
+                     f"(num_rows=1) for --lww-layout {args.lww_layout}; "
+                     f"got num_rows={num_rows}. Use --lww-layout 2d for 2D.")
+        if args.lww_layout == '2d':
+            # Step 4a iter 1: only 2x2 supported until barrier generalizes.
+            if num_rows != 2 or num_cols != 2:
+                sys.exit("ERROR: --lww-layout 2d is currently capped at "
+                         f"2x2 during Step 4a iter 1 bring-up. "
+                         f"Got num_rows={num_rows}, num_cols={num_cols}.")
+        elif num_cols > 5 and args.lww_layout != 'east_seg':
             sys.exit("ERROR: --routing pipelined-lww caps num_cols <= 5 "
                      "(WSE-3 queue budget: 2 tx + (num_cols-1) rx <= 6). "
                      f"Got num_cols={num_cols}. Multi-segment bridging comes "
                      "in Step 2c.2b.")
+        if args.lww_layout == 'east' and args.lww_east_only:
+            sys.exit("ERROR: --lww-east-only is a probe on the bidirectional "
+                     "kernel and cannot be combined with --lww-layout east "
+                     "(the east layout has no westbound data colors at all).")
+        if args.lww_layout == 'east_seg' and args.lww_east_only:
+            sys.exit("ERROR: --lww-east-only is a probe on the bidirectional "
+                     "kernel and cannot be combined with --lww-layout east_seg.")
+        if args.lww_layout == '2d' and args.lww_east_only:
+            sys.exit("ERROR: --lww-east-only is a probe on the bidirectional "
+                     "kernel and cannot be combined with --lww-layout 2d.")
+        # Step 2c.2b.i bring-up cap: validate east-only layout at <=4 PE
+        # first (queue budget S+3 <= 6 with barrier on Q0/Q1).
+        if args.lww_layout == 'east' and num_cols > 4:
+            sys.exit("ERROR: --lww-layout east is currently capped at "
+                     f"num_cols <= 4 during Step 2c.2b.i bring-up. "
+                     f"Got num_cols={num_cols}. S=5 needs queue-sharing "
+                     "investigation; see LWW_PIPELINE_PLAN.md.")
+        # Step 2c.2b.ii: east_seg supports arbitrary W. Bridge colors
+        # alternate between c_be/c_bo and are reused on span-disjoint
+        # downstream segments (each color is terminated at the next
+        # bridge before being re-emitted further east). Source colors
+        # c_0..c_{S-1} are reused per segment as before. The only true
+        # caps are S <= 4 (queue budget) and the host runner's memory
+        # for very large graphs.
+    elif args.lww_layout in ('east', 'east_seg', '2d'):
+        sys.exit(f"ERROR: --lww-layout {args.lww_layout} requires --routing pipelined-lww.")
 
     # HW-filter is blocked on WSE-3: interior PEs cannot both receive from
     # fabric (rx=WEST) and inject from RAMP on the same color — WSE-3 allows
@@ -1702,7 +1799,9 @@ def main():
         compiled_dir = os.path.join(root_dir, 'csl_compiled_out')
         ok = compile_csl(csl_dir, num_cols, num_rows, max_lv, max_le,
                          max_bnd, max_relay, max_palette_size,
-                         max_list_size, routing_mode, compiled_dir)
+                         max_list_size, routing_mode, compiled_dir,
+                         lww_east_only=args.lww_east_only,
+                         lww_layout=args.lww_layout)
         if not ok:
             sys.exit(1)
     print()

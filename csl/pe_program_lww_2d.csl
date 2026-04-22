@@ -1,0 +1,1145 @@
+// Picasso Graph Coloring — Pipelined LWW kernel, 2D EAST+SOUTH+W back-channel
+// (Step 4a iteration 2).
+//
+// Iter 1 (east+south only) was the narrowest 2D falsifier and FAILED
+// 9/12 tests at 2×2 because anti-diagonal cross-PE adjacencies
+// (e.g. PE1↔PE2) had no path. Iter 2 fixes both structural bugs:
+//
+//   1. Forward east→south on row 0 PEs (PE1 at 2×2): every wavelet
+//      arriving on c_E_data is also re-emitted on c_S_data so PE3
+//      receives PE0's data via PE1's south stream. (No new color
+//      — reuses tx_q3_oq.)
+//   2. New row-1 westbound color c_W_data_r1: PE3 forwards every
+//      south arrival west to PE2 via tx_west_oq. PE2 receives on
+//      rx_q5_iq (formerly used for east data on PE1/PE3 — the const
+//      is shared across PEs with different colors).
+//
+// Queue budget (PE2 was 6/6 in iter 1) is freed by moving row bcast
+// IN-BAND on c_E_data: drop tx_east_bcast_oq (Q5 OQ) and the rx_beta
+// row_bcast IQ on PE1/PE3. PE0/PE2 send row bcast as a wavelet on
+// tx_q2_oq (c_E_data) with a row_bcast opcode bit; PE1/PE3's
+// rx_q5_iq dispatcher inspects the opcode and either delivers to
+// the barrier sync_buf or processes as data.
+//
+// Per-axis FIFO data-done sentinel still gates barrier entry. New
+// counts:
+//   * expected_data_done_e on non-col-0 PEs = 1 (col-0 PE on this row).
+//   * expected_data_done_s on non-row-0 PEs = 1 + my_col
+//     (1 own + my_col forwarded via row-0 east→south relay).
+//   * expected_data_done_w on (col 0, row > 0) PEs = num_cols
+//     (PE3's south stream count = num_cols, all forwarded west).
+//
+// Boundary direction encoding (host-computed):
+//   0 = east  → east_send_buf
+//   1 = west  → DROPPED (Path C: lower-GID wins, west neighbor doesn't lose)
+//   2 = south → south_send_buf
+//   3 = north → DROPPED (Path C: lower-GID wins, north neighbor doesn't lose)
+//
+// Wavelet encoding on data-axis colors (c_E_data, c_S_data, c_W_data_r1):
+//   Data:      [31]=0, [30]=round_parity, [29:8]=sender_gid, [7:0]=color
+//   Data-done: [31]=1, [30]=round_parity, [29]=0
+//   Row-bcast: [31]=1, [30]=round_parity, [29]=1, [0]=global_OR_value
+//              (in-band on c_E_data only; classified by [29] in rx_q5_task)
+
+param memcpy_params: comptime_struct;
+param pe_id:    i16;
+param my_row:   i16;
+param my_col:   i16;
+param num_cols: i16;
+param num_rows: i16;
+param max_local_verts: i16;
+param max_local_edges: i16;
+param max_boundary:    i16;
+param max_palette_size: i16;
+param max_list_size:   i16;
+
+param is_west_edge:  bool;
+param is_east_edge:  bool;
+param is_north_edge: bool;
+param is_south_edge: bool;
+param is_pe0:        bool;
+
+// Data colors.
+param c_E_data:    color;
+param c_S_data:    color;
+param c_W_data_r1: color;
+
+// Per-row barrier colors (passed for layout symmetry).
+// row_red_color is still used for the dedicated row-reduce wavelet.
+// row_bcast_color is now an UNUSED placeholder — row bcast goes
+// in-band on c_E_data in iter 2.
+param row_red_color:   color;
+param row_bcast_color: color;
+
+// Col-0 barrier colors. Ignored on PEs with !is_west_edge.
+param col_red_color:   color;
+param col_bcast_color: color;
+
+// Per-axis upstream sender count (data-done expectation).
+param expected_data_done_e: i16;
+param expected_data_done_s: i16;
+param expected_data_done_w: i16;
+
+// Comptime per-PE roles (derived once at compile time).
+const is_east_to_south_relay: bool =
+  (!is_west_edge) and is_north_edge and (!is_south_edge);
+const is_back_chan_relay: bool =
+  (!is_north_edge) and is_east_edge and (!is_west_edge);
+const is_back_chan_sink: bool =
+  is_west_edge and (!is_north_edge);
+
+// ========== Queues ==========
+//
+// IMPORTANT: each output queue is bound to ONE fabric color via
+// @initialize_queue. To support different colors on different PEs at
+// the same Q index, we use ONE const per Q index and let each PE
+// init it to its own color. The dispatcher binds different handlers.
+//
+// Q2 OQ tx_q2_oq:    c_E_data on col-0 PEs (PE0, PE2). Carries data
+//                    AND row-bcast in-band (iter 2).
+// Q3 OQ tx_q3_oq:    c_S_data on row-0 PEs (PE0, PE1). On PE3-like
+//                    (back-chan relay) UNUSED here — PE3 uses Q7 OQ
+//                    for its westbound back-channel (see below).
+// Q4 OQ tx_back_oq:  row_red_color on row-east-end (PE1, PE3) OR
+//                    col_red_color on col-0 south-end (PE2).
+//                    On PE0 the same Q index is IQ rx_back_iq for col_red.
+// Q5 OQ tx_east_bcast_oq: UNUSED in iter 2 (row bcast in-band on c_E_data).
+//                    Const kept so we don't reflow code.
+// Q6 OQ tx_south_bcast_oq: PE0 col_bcast originator.
+// Q7 OQ tx_west_oq:  c_W_data_r1 on PE3-like (back-chan relay origin).
+//                    On PE0/PE2 the same Q index is IQ rx_beta_iq for row_red sink.
+//
+// IQs:
+// Q3 IQ rx_col_bcast_iq: PE2 (c_bcast_S_c0).
+// Q4 IQ rx_back_iq:      PE0 (col_red sink).
+// Q5 IQ rx_q5_iq:        PE1/PE3 → c_E_data (data + in-band row_bcast).
+//                        PE2 → c_W_data_r1 (back-channel sink).
+//                        Per-PE handler binding distinguishes the role.
+// Q6 IQ rx_data_s_iq:    PE2/PE3 (c_S_data).
+// Q7 IQ rx_beta_iq:      PE0/PE2 (row_red sink). PE1/PE3 do NOT bind
+//                        (row_bcast comes in-band on rx_q5_iq).
+
+const tx_q2_oq:          output_queue = @get_output_queue(2);
+const tx_q3_oq:          output_queue = @get_output_queue(3);
+const tx_back_oq:        output_queue = @get_output_queue(4);
+const tx_east_bcast_oq:  output_queue = @get_output_queue(5);   // unused (kept)
+const tx_south_bcast_oq: output_queue = @get_output_queue(6);
+const tx_west_oq:        output_queue = @get_output_queue(7);
+
+const rx_col_bcast_iq:   input_queue  = @get_input_queue(3);
+const rx_back_iq:        input_queue  = @get_input_queue(4);
+const rx_q5_iq:          input_queue  = @get_input_queue(5);   // c_E_data OR c_W_data_r1 per PE
+const rx_data_s_iq:      input_queue  = @get_input_queue(6);
+const rx_beta_iq:        input_queue  = @get_input_queue(7);   // row_red sink only (PE0/PE2)
+
+// ========== Task IDs ==========
+
+const speculate_task_id:      local_task_id = @get_local_task_id(15);
+const send_boundary_task_id:  local_task_id = @get_local_task_id(16);
+const detect_resolve_task_id: local_task_id = @get_local_task_id(17);
+const exit_task_id:           local_task_id = @get_local_task_id(18);
+const send_wavelet_task_id:   local_task_id = @get_local_task_id(19);
+
+const rx_col_bcast_id: data_task_id = @get_data_task_id(rx_col_bcast_iq);
+const rx_back_id:      data_task_id = @get_data_task_id(rx_back_iq);
+const rx_q5_id:        data_task_id = @get_data_task_id(rx_q5_iq);
+const rx_data_s_id:    data_task_id = @get_data_task_id(rx_data_s_iq);
+const rx_beta_id:      data_task_id = @get_data_task_id(rx_beta_iq);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tsc     = @import_module("<time>");
+
+// ===== Timer + perf =====
+var tsc_start_buf = @zeros([tsc.tsc_size_words]u16);
+var tsc_end_buf   = @zeros([tsc.tsc_size_words]u16);
+var coloring_timer = @zeros([3]f32);
+var coloring_timer_ptr: [*]f32 = &coloring_timer;
+var perf_counters = @zeros([8]i32);
+var perf_counters_ptr: [*]i32 = &perf_counters;
+
+inline fn start_timing() void {
+  tsc.enable_tsc();
+  tsc.get_timestamp(&tsc_start_buf);
+}
+
+inline fn stop_timing() void {
+  tsc.get_timestamp(&tsc_end_buf);
+  tsc.disable_tsc();
+  var lo_: u16 = 0;
+  var hi_: u16 = 0;
+  lo_ = tsc_start_buf[0]; hi_ = tsc_start_buf[1];
+  coloring_timer[0] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+  lo_ = tsc_start_buf[2]; hi_ = tsc_end_buf[0];
+  coloring_timer[1] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+  lo_ = tsc_end_buf[1]; hi_ = tsc_end_buf[2];
+  coloring_timer[2] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+}
+
+// ===== Host-loaded graph =====
+var csr_offsets:       [max_local_verts + 1]i32;
+var csr_adj:           [max_local_edges]i32;
+var colors:            [max_local_verts]i32;
+var local_num_verts:   [1]i32;
+var global_vertex_ids: [max_local_verts]i32;
+
+var boundary_local_idx:    [max_boundary]i32;
+var boundary_neighbor_gid: [max_boundary]i32;
+var boundary_direction:    [max_boundary]i32;
+var num_boundary:          [1]i32;
+
+var tentative: [max_local_verts]i32;
+var forbidden: [max_palette_size]i32;
+
+var runtime_config:     [2]i32;
+var remote_recv_color:  [max_boundary]i32;
+var remote_recv_color_next: [max_boundary]i32;
+
+var color_list: [max_local_verts * max_list_size]i32;
+var list_len:   [max_local_verts]i32;
+
+// ===== Per-axis send buffers =====
+var east_send_buf:  [max_boundary]u32;
+var south_send_buf: [max_boundary]u32;
+var east_count:  u16 = 0;
+var south_count: u16 = 0;
+// Send phase progresses: 0 = drain east, 1 = east-done sentinel, 2 = drain south,
+//                        3 = south-done sentinel, 4 = idle.
+var send_phase: u16 = 0;
+var send_idx:   u16 = 0;
+var send_tmp = @zeros([1]u32);
+var local_send_done: bool = false;
+var phase_complete:  bool = false;
+
+// ===== Per-axis recv state =====
+var data_recv_count: i32 = 0;   // telemetry only
+var expected_data_done_e_i32: i32 = 0;
+var expected_data_done_s_i32: i32 = 0;
+var expected_data_done_w_i32: i32 = 0;
+var data_done_e_recv_count: i32 = 0;
+var data_done_e_recv_next:  i32 = 0;
+var data_done_e_present:    bool = false;
+var data_done_s_recv_count: i32 = 0;
+var data_done_s_recv_next:  i32 = 0;
+var data_done_s_present:    bool = false;
+var data_done_w_recv_count: i32 = 0;
+var data_done_w_recv_next:  i32 = 0;
+var data_done_w_present:    bool = false;
+
+// ===== Barrier state (2D hierarchical) =====
+//
+// Per-PE roles (derived from edge flags at start_coloring):
+//   row reduce origin = is_east_edge && !is_west_edge
+//   row reduce sink   = is_west_edge && !is_east_edge
+//   col reduce origin = is_west_edge && is_south_edge && !is_north_edge
+//   col reduce sink   = is_pe0
+//   col bcast origin  = is_pe0
+//   col bcast sink    = is_west_edge && !is_pe0
+//   row bcast origin  = is_west_edge
+//   row bcast sink    = !is_west_edge
+var sync_buf = @zeros([2]u32);
+var current_round: i32 = 0;
+var barrier_done:        bool = false;
+var local_done_for_round: bool = false;
+
+var row_red_pending_value:    u32 = 0;
+var row_red_pending_present:  bool = false;
+var col_red_pending_value:    u32 = 0;
+var col_red_pending_present:  bool = false;
+var col_bcast_pending_value:  u32 = 0;
+var col_bcast_pending_present: bool = false;
+
+// Latch flags — true after this PE has executed the corresponding
+// stage in this round.
+var row_red_done_for_round:   bool = false;
+var col_red_done_for_round:   bool = false;
+var col_bcast_done_for_round: bool = false;
+var row_bcast_done_for_round: bool = false;
+
+var reduce_tmp = @zeros([1]u32);
+var bcast_tmp  = @zeros([1]u32);
+
+// ===== Host symbol pointers =====
+var csr_offsets_ptr:            [*]i32 = &csr_offsets;
+var csr_adj_ptr:                [*]i32 = &csr_adj;
+var colors_ptr:                 [*]i32 = &colors;
+var local_num_verts_ptr:        [*]i32 = &local_num_verts;
+var global_vertex_ids_ptr:      [*]i32 = &global_vertex_ids;
+var boundary_local_idx_ptr:     [*]i32 = &boundary_local_idx;
+var boundary_neighbor_gid_ptr:  [*]i32 = &boundary_neighbor_gid;
+var boundary_direction_ptr:     [*]i32 = &boundary_direction;
+var num_boundary_ptr:           [*]i32 = &num_boundary;
+var color_list_ptr:             [*]i32 = &color_list;
+var list_len_ptr:               [*]i32 = &list_len;
+var runtime_config_ptr:         [*]i32 = &runtime_config;
+
+var expected_recv: [2]i32;
+var expected_recv_ptr: [*]i32 = &expected_recv;
+
+// =====================================================================
+// Helpers (verbatim from east-only kernel)
+// =====================================================================
+
+fn global_to_local(gid: i32) i32 {
+  perf_counters[5] += 1;
+  const n = local_num_verts[0];
+  var i: i16 = 0;
+  while (i < max_local_verts) : (i += 1) {
+    if (@as(i32, i) >= n) break;
+    if (global_vertex_ids[i] == gid) return @as(i32, i);
+  }
+  return -1;
+}
+
+fn find_min_available_color() i32 {
+  const ps = @as(i16, runtime_config[1]);
+  var c: i16 = 0;
+  while (c < ps) : (c += 1) {
+    if (forbidden[c] == 0) return @as(i32, c);
+  }
+  return -1;
+}
+
+fn find_list_color(v: i16) i32 {
+  const base = @as(u16, v) * @as(u16, max_list_size);
+  const len = list_len[v];
+  if (len <= 0) return -2;
+  var i: i16 = 0;
+  while (i < max_list_size) : (i += 1) {
+    if (@as(i32, i) >= len) break;
+    const c = color_list[base + @as(u16, i)];
+    if (c >= 0 and c < runtime_config[1] and forbidden[@as(u16, @as(i16, c))] == 0) {
+      return c;
+    }
+  }
+  return -1;
+}
+
+fn remove_from_list(v: i16, col: i32) bool {
+  const base = @as(u16, v) * @as(u16, max_list_size);
+  const len = list_len[v];
+  var i: i16 = 0;
+  while (i < max_list_size) : (i += 1) {
+    if (@as(i32, i) >= len) break;
+    if (color_list[base + @as(u16, i)] == col) {
+      const last_idx = @as(u16, @as(i16, len - 1));
+      color_list[base + @as(u16, i)] = color_list[base + last_idx];
+      list_len[v] -= 1;
+      return (list_len[v] <= 0);
+    }
+  }
+  return false;
+}
+
+fn shrink_color_lists() void {
+  const n = local_num_verts[0];
+  var v: i16 = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= n) break;
+    if (colors[v] != -1) continue;
+    const start = csr_offsets[v];
+    const end_idx = csr_offsets[v + 1];
+    var e: i32 = start;
+    while (e < end_idx) : (e += 1) {
+      const neighbor_gid = csr_adj[@as(u16, @as(i16, e))];
+      const local_idx = global_to_local(neighbor_gid);
+      if (local_idx >= 0) {
+        const nc = colors[@as(u16, @as(i16, local_idx))];
+        if (nc >= 0) {
+          if (remove_from_list(v, nc)) {
+            colors[v] = -2;
+            break;
+          }
+        }
+      }
+    }
+  }
+  const nbnd = num_boundary[0];
+  var b: i16 = 0;
+  while (b < max_boundary) : (b += 1) {
+    if (@as(i32, b) >= nbnd) break;
+    const li = @as(i16, boundary_local_idx[b]);
+    if (colors[@as(u16, li)] != -1) continue;
+    const rc = remote_recv_color[b];
+    if (rc >= 0) {
+      if (remove_from_list(li, rc)) {
+        colors[@as(u16, li)] = -2;
+      }
+    }
+  }
+}
+
+fn process_incoming_wavelet(sender_gid: i32, sender_color: i32) void {
+  perf_counters[4] += 1;
+  const nbnd = num_boundary[0];
+  var b: i16 = 0;
+  while (b < max_boundary) : (b += 1) {
+    if (@as(i32, b) >= nbnd) break;
+    if (boundary_neighbor_gid[b] == sender_gid) {
+      remote_recv_color[b] = sender_color;
+    }
+  }
+}
+
+// ===== Wavelet encoding =====
+// Data:      [31]=0, [30]=parity, [29:8]=gid, [7:0]=color
+// Data-done: [31]=1, [30]=parity, [29]=0
+// Row-bcast: [31]=1, [30]=parity, [29]=1, [0]=value (in-band on c_E_data)
+fn pack_data(gid: i32, col: i32, parity: u32) u32 {
+  const g = @as(u32, @as(u16, @as(i16, gid))) & 0x3FFFFF;
+  const c = @as(u32, @as(u16, @as(i16, col))) & 0xFF;
+  const p = (parity & 0x1) << 30;
+  return p | (g << 8) | c;
+}
+
+fn pack_data_done(parity: u32) u32 {
+  return 0x80000000 | ((parity & 0x1) << 30);
+}
+
+fn pack_row_bcast(parity: u32, value: u32) u32 {
+  // bit 31=1 (sentinel), bit 30=parity, bit 29=1 (row_bcast), bit 0=value
+  return 0x80000000 | ((parity & 0x1) << 30) | (1 << 29) | (value & 0x1);
+}
+
+fn is_sentinel(w: u32) bool { return (w >> 31) != 0; }
+fn is_row_bcast_wavelet(w: u32) bool {
+  return ((w >> 31) != 0) and (((w >> 29) & 1) != 0);
+}
+fn is_data_done(w: u32) bool {
+  return ((w >> 31) != 0) and (((w >> 29) & 1) == 0);
+}
+fn unpack_gid(w: u32) i32 { return @as(i32, (w >> 8) & 0x3FFFFF); }
+fn unpack_color(w: u32) i32 { return @as(i32, w & 0xFF); }
+fn unpack_parity(w: u32) u32 { return (w >> 30) & 0x1; }
+
+// =====================================================================
+// Send helpers
+// =====================================================================
+
+fn send_east(w: u32) void {
+  send_tmp[0] = w;
+  var out = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = c_E_data,
+    .output_queue = tx_q2_oq,
+  });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> send_tmp[i] });
+  @mov32(out, src);
+}
+
+fn send_south(w: u32) void {
+  send_tmp[0] = w;
+  var out = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = c_S_data,
+    .output_queue = tx_q3_oq,
+  });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> send_tmp[i] });
+  @mov32(out, src);
+}
+
+fn send_west(w: u32) void {
+  // Back-channel forwarder. Caller must be is_back_chan_relay; OQ
+  // tx_west_oq is only initialized on those PEs.
+  send_tmp[0] = w;
+  var out = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = c_W_data_r1,
+    .output_queue = tx_west_oq,
+  });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> send_tmp[i] });
+  @mov32(out, src);
+}
+
+fn send_row_red(val: u32) void {
+  reduce_tmp[0] = val;
+  var out = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = row_red_color,
+    .output_queue = tx_back_oq,
+  });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> reduce_tmp[i] });
+  @mov32(out, src);
+}
+
+fn send_col_red(val: u32) void {
+  reduce_tmp[0] = val;
+  var out = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = col_red_color,
+    .output_queue = tx_back_oq,
+  });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> reduce_tmp[i] });
+  @mov32(out, src);
+}
+
+fn send_col_bcast(val: u32) void {
+  bcast_tmp[0] = val;
+  var out = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = col_bcast_color,
+    .output_queue = tx_south_bcast_oq,
+  });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> bcast_tmp[i] });
+  @mov32(out, src);
+}
+
+fn send_row_bcast(val: u32) void {
+  // In-band on c_E_data via tx_q2_oq. Receiver dispatches on bit [29].
+  const par = @as(u32, current_round) & 0x1;
+  send_east(pack_row_bcast(par, val & 0x1));
+}
+
+// =====================================================================
+// Speculate (verbatim from east-only kernel)
+// =====================================================================
+
+task speculate() void {
+  const n = local_num_verts[0];
+  var v: i16 = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= n) break;
+    tentative[v] = -1;
+    if (colors[v] >= 0 or colors[v] == -2) continue;
+
+    const ps = @as(i16, runtime_config[1]);
+    var c: i16 = 0;
+    while (c < ps) : (c += 1) { forbidden[c] = 0; }
+
+    const start = csr_offsets[v];
+    const end_idx = csr_offsets[v + 1];
+    var e: i32 = start;
+    while (e < end_idx) : (e += 1) {
+      perf_counters[6] += 1;
+      const neighbor_gid = csr_adj[@as(u16, @as(i16, e))];
+      const local_idx = global_to_local(neighbor_gid);
+      if (local_idx >= 0) {
+        const nc = colors[@as(u16, @as(i16, local_idx))];
+        if (nc >= 0 and nc < runtime_config[1]) {
+          forbidden[@as(u16, @as(i16, nc))] = 1;
+        }
+      } else {
+        const nbnd = num_boundary[0];
+        var b: i16 = 0;
+        while (b < max_boundary) : (b += 1) {
+          if (@as(i32, b) >= nbnd) break;
+          if (boundary_neighbor_gid[b] == neighbor_gid) {
+            const rc = remote_recv_color[b];
+            if (rc >= 0 and rc < runtime_config[1]) {
+              forbidden[@as(u16, @as(i16, rc))] = 1;
+            }
+          }
+        }
+      }
+    }
+
+    const chosen = if (max_list_size > 0) find_list_color(v) else find_min_available_color();
+    if (chosen == -2) {
+      colors[v] = -2;
+      continue;
+    }
+    tentative[v] = chosen;
+    if (chosen >= 0) colors[v] = chosen;
+  }
+
+  v = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= n) break;
+    if (tentative[v] < 0) continue;
+    const my_gid = global_vertex_ids[v];
+    const start = csr_offsets[v];
+    const end_idx = csr_offsets[v + 1];
+    var e: i32 = start;
+    while (e < end_idx) : (e += 1) {
+      const neighbor_gid = csr_adj[@as(u16, @as(i16, e))];
+      const local_idx = global_to_local(neighbor_gid);
+      if (local_idx < 0) continue;
+      const li = @as(u16, @as(i16, local_idx));
+      if (tentative[li] >= 0 and tentative[li] == tentative[v]) {
+        if (my_gid > neighbor_gid) {
+          colors[v] = -1;
+          tentative[v] = -1;
+          break;
+        }
+      }
+    }
+  }
+
+  perf_counters[0] += 1;
+  @activate(send_boundary_task_id);
+}
+
+// =====================================================================
+// Send boundary — both axes.
+// =====================================================================
+
+task send_boundary() void {
+  const nbnd = num_boundary[0];
+  const pal_threshold = runtime_config[1];
+  const par = @as(u32, current_round) & 0x1;
+  east_count = 0;
+  south_count = 0;
+
+  var b: i16 = 0;
+  while (b < max_boundary) : (b += 1) {
+    if (@as(i32, b) >= nbnd) break;
+    const li = @as(u16, @as(i16, boundary_local_idx[b]));
+    const c = colors[li];
+    if (c >= pal_threshold or c < 0) continue;
+    const dir = boundary_direction[b];
+    const pkt = pack_data(global_vertex_ids[li], c, par);
+    if (dir == 0) {
+      east_send_buf[east_count] = pkt;
+      east_count += 1;
+    } else if (dir == 2) {
+      south_send_buf[south_count] = pkt;
+      south_count += 1;
+    }
+    // dir 1 (west) and dir 3 (north) are dropped — Path C invariant
+    // makes them redundant. If they are NOT redundant (diagonal
+    // adjacency), the test will fail and falsify the strategy.
+  }
+
+  send_phase = 0;
+  send_idx = 0;
+  // Kick the barrier from task context (originators may already be
+  // ready to send their reduce wavelet).
+  try_step_barrier();
+  @activate(send_wavelet_task_id);
+}
+
+// =====================================================================
+// Send wavelet — drains east buffer, east-done, south buffer, south-done.
+// =====================================================================
+
+task send_wavelet() void {
+  perf_counters[1] += 1;
+  if (phase_complete) return;
+
+  // Phase 0: drain east data
+  if (send_phase == 0) {
+    if (!is_east_edge and send_idx < east_count) {
+      send_east(east_send_buf[send_idx]);
+      send_idx += 1;
+      @activate(send_wavelet_task_id);
+      return;
+    }
+    send_phase = 1;
+    send_idx = 0;
+  }
+
+  // Phase 1: east data-done sentinel (skip on east-edge: no east neighbor)
+  if (send_phase == 1) {
+    if (!is_east_edge) {
+      const par = @as(u32, current_round) & 0x1;
+      send_east(pack_data_done(par));
+    }
+    send_phase = 2;
+  }
+
+  // Phase 2: drain south data
+  if (send_phase == 2) {
+    if (!is_south_edge and send_idx < south_count) {
+      send_south(south_send_buf[send_idx]);
+      send_idx += 1;
+      @activate(send_wavelet_task_id);
+      return;
+    }
+    send_phase = 3;
+    send_idx = 0;
+  }
+
+  // Phase 3: south data-done sentinel
+  if (send_phase == 3) {
+    if (!is_south_edge) {
+      const par = @as(u32, current_round) & 0x1;
+      send_south(pack_data_done(par));
+    }
+    send_phase = 4;
+    local_send_done = true;
+    check_completion();
+  }
+}
+
+fn check_completion() void {
+  if (!phase_complete and local_send_done and barrier_done) {
+    phase_complete = true;
+    if (current_round > 0 and sync_buf[0] == 0) {
+      @activate(exit_task_id);
+    } else {
+      @activate(detect_resolve_task_id);
+    }
+  }
+}
+
+// =====================================================================
+// Recv tasks — data axes
+// =====================================================================
+
+fn on_recv_axis(wval: u32, axis: i16) void {
+  // axis: 0=east, 1=south, 2=west.
+  perf_counters[2] += 1;
+  const cur_par = @as(u32, current_round) & 0x1;
+  const dpar = unpack_parity(wval);
+  if (is_data_done(wval)) {
+    if (axis == 0) {
+      if (dpar == cur_par) {
+        data_done_e_recv_count += 1;
+        if (!data_done_e_present and data_done_e_recv_count >= expected_data_done_e_i32) {
+          data_done_e_present = true;
+          try_step_barrier();
+        }
+      } else {
+        data_done_e_recv_next += 1;
+      }
+    } else if (axis == 1) {
+      if (dpar == cur_par) {
+        data_done_s_recv_count += 1;
+        if (!data_done_s_present and data_done_s_recv_count >= expected_data_done_s_i32) {
+          data_done_s_present = true;
+          try_step_barrier();
+        }
+      } else {
+        data_done_s_recv_next += 1;
+      }
+    } else {
+      if (dpar == cur_par) {
+        data_done_w_recv_count += 1;
+        if (!data_done_w_present and data_done_w_recv_count >= expected_data_done_w_i32) {
+          data_done_w_present = true;
+          try_step_barrier();
+        }
+      } else {
+        data_done_w_recv_next += 1;
+      }
+    }
+    return;
+  }
+  const gid = unpack_gid(wval);
+  const col = unpack_color(wval);
+  if (dpar == cur_par) {
+    process_incoming_wavelet(gid, col);
+  } else {
+    const nbnd = num_boundary[0];
+    var b: i16 = 0;
+    while (b < max_boundary) : (b += 1) {
+      if (@as(i32, b) >= nbnd) break;
+      if (boundary_neighbor_gid[b] == gid) {
+        remote_recv_color_next[b] = col;
+      }
+    }
+  }
+  data_recv_count += 1;
+}
+
+// rx_q5 task: bound to either c_E_data (PE1, PE3) or c_W_data_r1 (PE2).
+// Per-PE binding decides which handler runs.
+//
+// East-data handler (PE1, PE3):
+//   * In-band row_bcast (bit[31]=1, bit[29]=1) → deliver global OR to barrier.
+//   * Data / data-done → process locally; on east→south relay PEs (PE1)
+//     also forward the wavelet south.
+task rx_q5_east_task(w: u32) void {
+  if (is_row_bcast_wavelet(w)) {
+    sync_buf[0] = w & 0x1;
+    barrier_done = true;
+    check_completion();
+    return;
+  }
+  if (is_east_to_south_relay) {
+    // Forward east arrival to south so downstream south-recv PEs see
+    // the col-0 originator's data (resolves PE0↔PE3 anti-diagonal).
+    send_south(w);
+  }
+  on_recv_axis(w, 0);
+}
+
+// West back-channel handler (PE2 only). Treats the wavelet as if it
+// came on the south axis from the higher-col PEs (it carries the
+// forwarded south stream from PE3).
+task rx_q5_west_task(w: u32) void {
+  on_recv_axis(w, 2);
+}
+
+// rx_col_bcast task: bound to c_bcast_S_c0 on PE2 only (col bcast sink).
+task rx_col_bcast_task(w: u32) void {
+  col_bcast_pending_value = w;
+  col_bcast_pending_present = true;
+  try_step_barrier();
+}
+
+// rx_data_s task: bound to c_S_data on PE2/PE3.
+// On back-channel relay PEs (PE3), every wavelet is also forwarded
+// west to deliver PE1's color to PE2 (resolves PE1↔PE2 anti-diagonal).
+task rx_data_s_task(w: u32) void {
+  if (is_back_chan_relay) {
+    send_west(w);
+  }
+  on_recv_axis(w, 1);
+}
+
+// rx_beta task: bound to row_red_color on col-0 PEs (PE0/PE2) only in
+// iter 2 (row bcast moved in-band on c_E_data).
+task rx_beta_task(w: u32) void {
+  // Col-0 row-red sink: receives partial OR from east end of row.
+  row_red_pending_value = w;
+  row_red_pending_present = true;
+  try_step_barrier();
+}
+
+// rx_back task: bound to c_red_S_c0 on PE0 only — col reduce sink.
+task rx_back_task(w: u32) void {
+  col_red_pending_value = w;
+  col_red_pending_present = true;
+  try_step_barrier();
+}
+
+// =====================================================================
+// Barrier state machine.
+//
+// Stages, each gated by upstream readiness:
+//   1. Row reduce: east-end origin sends; west-end (col 0) sinks.
+//   2. Col reduce (col 0 only): south-end origin sends; PE0 sinks.
+//   3. Col bcast (col 0 only): PE0 sends south; col-0 non-PE0 receives.
+//   4. Row bcast: col 0 sends east; non-col-0 receives.
+//
+// Each PE walks only the stages relevant to it (early-exits via
+// done_for_round latches).
+// =====================================================================
+
+fn try_step_barrier() void {
+  if (!local_done_for_round) return;
+  if (expected_data_done_e_i32 > 0 and !data_done_e_present) return;
+  if (expected_data_done_s_i32 > 0 and !data_done_s_present) return;
+  if (expected_data_done_w_i32 > 0 and !data_done_w_present) return;
+
+  // ── Stage 1: Row reduce (E→W) ──
+  if (!row_red_done_for_round) {
+    if (is_east_edge and !is_west_edge) {
+      // Row reduce origin: send local sync_buf[0].
+      send_row_red(sync_buf[0]);
+      row_red_done_for_round = true;
+    } else if (is_west_edge and !is_east_edge) {
+      // Row reduce sink (col 0): wait for partial OR from east.
+      if (!row_red_pending_present) return;
+      sync_buf[0] = sync_buf[0] | row_red_pending_value;
+      row_red_pending_present = false;
+      row_red_done_for_round = true;
+    } else if (!is_west_edge and !is_east_edge) {
+      // Interior of row: relay (rx EAST → OR → tx WEST). Unused at 2x2.
+      if (!row_red_pending_present) return;
+      send_row_red(sync_buf[0] | row_red_pending_value);
+      row_red_pending_present = false;
+      row_red_done_for_round = true;
+    } else {
+      // Single-col row (is_west && is_east): nothing to do.
+      row_red_done_for_round = true;
+    }
+  }
+
+  // PEs not on col 0 are done with the barrier upload phase.
+  // They now wait for the row bcast wavelet (handled in rx_beta_task).
+  if (!is_west_edge) return;
+
+  // ── Stage 2: Col reduce (S→N), col 0 only ──
+  if (!col_red_done_for_round) {
+    if (is_south_edge and !is_north_edge) {
+      // Col reduce origin: send sync_buf[0] (already includes row-OR for this row).
+      send_col_red(sync_buf[0]);
+      col_red_done_for_round = true;
+    } else if (is_pe0) {
+      // Col reduce sink: wait for col_red, then OR.
+      if (!col_red_pending_present) return;
+      sync_buf[0] = sync_buf[0] | col_red_pending_value;
+      col_red_pending_present = false;
+      col_red_done_for_round = true;
+    } else {
+      // Col-0 interior: relay (unused at 2x2).
+      if (!col_red_pending_present) return;
+      send_col_red(sync_buf[0] | col_red_pending_value);
+      col_red_pending_present = false;
+      col_red_done_for_round = true;
+    }
+  }
+
+  // ── Stage 3: Col bcast (N→S), col 0 only ──
+  if (!col_bcast_done_for_round) {
+    if (is_pe0) {
+      // Bcast origin: sync_buf[0] now holds the global OR.
+      if (num_rows > 1) send_col_bcast(sync_buf[0]);
+      col_bcast_done_for_round = true;
+    } else {
+      // Bcast sink (col 0, non-PE0): wait for col_bcast wavelet.
+      if (!col_bcast_pending_present) return;
+      sync_buf[0] = col_bcast_pending_value;  // global OR
+      col_bcast_pending_present = false;
+      col_bcast_done_for_round = true;
+    }
+  }
+
+  // ── Stage 4: Row bcast (W→E) origin (col 0) ──
+  if (!row_bcast_done_for_round) {
+    if (num_cols > 1) send_row_bcast(sync_buf[0]);
+    row_bcast_done_for_round = true;
+  }
+
+  // Col-0 PE has fully participated.
+  barrier_done = true;
+  check_completion();
+}
+
+// =====================================================================
+// Detect / resolve / loop
+// =====================================================================
+
+task detect_resolve() void {
+  const nbnd = num_boundary[0];
+  var had_conflict: bool = false;
+  var b: i16 = 0;
+  while (b < max_boundary) : (b += 1) {
+    if (@as(i32, b) >= nbnd) break;
+    const li = @as(u16, @as(i16, boundary_local_idx[b]));
+    const my_gid = global_vertex_ids[li];
+    const nbr_gid = boundary_neighbor_gid[b];
+    const my_color = colors[li];
+    const remote_color = remote_recv_color[b];
+    if (my_color >= 0 and remote_color >= 0 and my_color == remote_color) {
+      if (my_gid > nbr_gid) {
+        colors[li] = -1;
+        had_conflict = true;
+      }
+    }
+  }
+
+  if (max_list_size > 0) shrink_color_lists();
+
+  const n = local_num_verts[0];
+  var has_uncolored: bool = had_conflict;
+  if (!has_uncolored) {
+    var v: i16 = 0;
+    while (v < max_local_verts) : (v += 1) {
+      if (@as(i32, v) >= n) break;
+      if (colors[@as(u16, v)] == -1) {
+        has_uncolored = true;
+        break;
+      }
+    }
+  }
+  const local_flag: u32 = if (has_uncolored) @as(u32, 1) else @as(u32, 0);
+
+  current_round += 1;
+  reset_round_state();
+  sync_buf[0] = local_flag;
+  local_done_for_round = true;
+  try_step_barrier();
+  @activate(speculate_task_id);
+}
+
+fn reset_round_state() void {
+  local_send_done = false;
+  phase_complete = false;
+  data_recv_count = 0;
+  east_count = 0;
+  south_count = 0;
+  send_phase = 0;
+  send_idx = 0;
+
+  // Promote any data wavelets that arrived tagged with the new round's parity.
+  const nbnd = num_boundary[0];
+  var b: i16 = 0;
+  while (b < max_boundary) : (b += 1) {
+    if (@as(i32, b) >= nbnd) break;
+    if (remote_recv_color_next[b] != -1) {
+      remote_recv_color[b] = remote_recv_color_next[b];
+      remote_recv_color_next[b] = -1;
+    }
+  }
+
+  // Promote per-axis early-arriving data-done sentinels.
+  data_done_e_recv_count = data_done_e_recv_next;
+  data_done_e_recv_next = 0;
+  data_done_e_present = (expected_data_done_e_i32 == 0) or
+                        (data_done_e_recv_count >= expected_data_done_e_i32);
+
+  data_done_s_recv_count = data_done_s_recv_next;
+  data_done_s_recv_next = 0;
+  data_done_s_present = (expected_data_done_s_i32 == 0) or
+                        (data_done_s_recv_count >= expected_data_done_s_i32);
+
+  data_done_w_recv_count = data_done_w_recv_next;
+  data_done_w_recv_next = 0;
+  data_done_w_present = (expected_data_done_w_i32 == 0) or
+                        (data_done_w_recv_count >= expected_data_done_w_i32);
+
+  // Barrier reset.
+  if (num_cols == 1 and num_rows == 1) {
+    barrier_done = true;
+    local_done_for_round = true;
+    row_red_done_for_round = true;
+    col_red_done_for_round = true;
+    col_bcast_done_for_round = true;
+    row_bcast_done_for_round = true;
+  } else {
+    barrier_done = false;
+    local_done_for_round = false;
+    row_red_done_for_round = false;
+    col_red_done_for_round = false;
+    col_bcast_done_for_round = false;
+    row_bcast_done_for_round = false;
+    // Pending values explicitly cleared (avoid stale-OR bug like east-only kernel had).
+    row_red_pending_present = false;
+    row_red_pending_value = 0;
+    col_red_pending_present = false;
+    col_red_pending_value = 0;
+    col_bcast_pending_present = false;
+    col_bcast_pending_value = 0;
+  }
+}
+
+// =====================================================================
+// Entry / exit
+// =====================================================================
+
+fn start_coloring() void {
+  start_timing();
+  var b: i16 = 0;
+  while (b < max_boundary) : (b += 1) {
+    remote_recv_color[b] = -1;
+    remote_recv_color_next[b] = -1;
+  }
+  current_round = 0;
+  sync_buf[0] = 0;
+  sync_buf[1] = 0;
+  expected_data_done_e_i32 = @as(i32, expected_data_done_e);
+  expected_data_done_s_i32 = @as(i32, expected_data_done_s);
+  expected_data_done_w_i32 = @as(i32, expected_data_done_w);
+  data_done_e_recv_count = 0;
+  data_done_e_recv_next = 0;
+  data_done_e_present = (expected_data_done_e_i32 == 0);
+  data_done_s_recv_count = 0;
+  data_done_s_recv_next = 0;
+  data_done_s_present = (expected_data_done_s_i32 == 0);
+  data_done_w_recv_count = 0;
+  data_done_w_recv_next = 0;
+  data_done_w_present = (expected_data_done_w_i32 == 0);
+  reset_round_state();
+  // Bootstrap: round 0's local_flag is trivially 0.
+  local_done_for_round = true;
+  @activate(speculate_task_id);
+}
+
+task exit_task() void {
+  stop_timing();
+  sys_mod.unblock_cmd_stream();
+}
+
+// =====================================================================
+// Compile-time wiring
+// =====================================================================
+
+comptime {
+  @bind_local_task(speculate,       speculate_task_id);
+  @bind_local_task(send_boundary,   send_boundary_task_id);
+  @bind_local_task(send_wavelet,    send_wavelet_task_id);
+  @bind_local_task(detect_resolve,  detect_resolve_task_id);
+  @bind_local_task(exit_task,       exit_task_id);
+
+  // ── Data RX bindings ──
+  // rx_q5: c_E_data on PE1/PE3 (east-data + in-band row_bcast),
+  //        c_W_data_r1 on PE2 (back-channel sink). Per-PE handler.
+  if (is_west_edge and is_south_edge and !is_north_edge) {
+    // PE2: bind west back-channel handler.
+    @bind_data_task(rx_q5_west_task, rx_q5_id);
+  } else if (!is_west_edge) {
+    // PE1/PE3: bind east handler (also dispatches in-band row_bcast).
+    @bind_data_task(rx_q5_east_task, rx_q5_id);
+  }
+
+  // rx_col_bcast on PE2 (col 0, south edge).
+  if (is_west_edge and is_south_edge and !is_north_edge) {
+    @bind_data_task(rx_col_bcast_task, rx_col_bcast_id);
+  }
+
+  // rx_data_s: c_S_data on south-recv PEs.
+  if (!is_north_edge) {
+    @bind_data_task(rx_data_s_task, rx_data_s_id);
+  }
+
+  // rx_beta: row_red recv on col 0 sink (PE0, PE2).
+  // Iter 2: row_bcast no longer flows on rx_beta — it's in-band on c_E_data.
+  if (is_west_edge and !is_east_edge) {
+    @bind_data_task(rx_beta_task, rx_beta_id);
+  }
+
+  // rx_back: col_red recv on PE0 only.
+  if (is_pe0 and num_rows > 1) {
+    @bind_data_task(rx_back_task, rx_back_id);
+  }
+
+  if (@is_arch("wse3")) {
+    // ── OQ initialization ──
+    // tx_q2: col-0 PEs originate east data + in-band row_bcast.
+    if (is_west_edge and !is_east_edge) {
+      @initialize_queue(tx_q2_oq, .{ .color = c_E_data });
+    }
+    // tx_q3: row-0 PEs originate south data. PE1 also forwards east
+    // arrivals south (relay) on the same OQ + same color.
+    if (is_north_edge and !is_south_edge) {
+      @initialize_queue(tx_q3_oq, .{ .color = c_S_data });
+    }
+    // tx_back: row-red origin (east-end, !col-0) OR col-red origin (col-0 south-end).
+    if (is_east_edge and !is_west_edge) {
+      @initialize_queue(tx_back_oq, .{ .color = row_red_color });
+    } else if (is_west_edge and is_south_edge and !is_north_edge) {
+      @initialize_queue(tx_back_oq, .{ .color = col_red_color });
+    }
+    // tx_west: back-channel relay origin (east-edge, !west, !north — PE3 at 2x2).
+    if (is_back_chan_relay) {
+      @initialize_queue(tx_west_oq, .{ .color = c_W_data_r1 });
+    }
+    // tx_south_bcast: col bcast originator (PE0 only).
+    if (is_pe0 and num_rows > 1) {
+      @initialize_queue(tx_south_bcast_oq, .{ .color = col_bcast_color });
+    }
+
+    // ── IQ initialization ──
+    // rx_q5 polarity: PE1/PE3 → c_E_data; PE2 → c_W_data_r1.
+    if (is_west_edge and is_south_edge and !is_north_edge) {
+      @initialize_queue(rx_q5_iq, .{ .color = c_W_data_r1 });
+    } else if (!is_west_edge) {
+      @initialize_queue(rx_q5_iq, .{ .color = c_E_data });
+    }
+    // rx_col_bcast: c_bcast_S_c0 on PE2.
+    if (is_west_edge and is_south_edge and !is_north_edge) {
+      @initialize_queue(rx_col_bcast_iq, .{ .color = col_bcast_color });
+    }
+    // rx_data_s: c_S_data on south-recv PEs.
+    if (!is_north_edge) {
+      @initialize_queue(rx_data_s_iq, .{ .color = c_S_data });
+    }
+    // rx_beta: row_red on col-0 sink only (iter 2).
+    if (is_west_edge and !is_east_edge) {
+      @initialize_queue(rx_beta_iq, .{ .color = row_red_color });
+    }
+    // rx_back: col_red on PE0 only.
+    if (is_pe0 and num_rows > 1) {
+      @initialize_queue(rx_back_iq, .{ .color = col_red_color });
+    }
+  }
+
+  @export_symbol(csr_offsets_ptr,           "csr_offsets");
+  @export_symbol(csr_adj_ptr,               "csr_adj");
+  @export_symbol(colors_ptr,                "colors");
+  @export_symbol(local_num_verts_ptr,       "local_num_verts");
+  @export_symbol(global_vertex_ids_ptr,     "global_vertex_ids");
+  @export_symbol(boundary_local_idx_ptr,    "boundary_local_idx");
+  @export_symbol(boundary_neighbor_gid_ptr, "boundary_neighbor_gid");
+  @export_symbol(boundary_direction_ptr,    "boundary_direction");
+  @export_symbol(runtime_config_ptr,        "runtime_config");
+  @export_symbol(num_boundary_ptr,          "num_boundary");
+  @export_symbol(expected_recv_ptr,         "expected_recv");
+  @export_symbol(coloring_timer_ptr,        "coloring_timer");
+  @export_symbol(perf_counters_ptr,         "perf_counters");
+  @export_symbol(color_list_ptr,            "color_list");
+  @export_symbol(list_len_ptr,              "list_len");
+  @export_symbol(start_coloring);
+}

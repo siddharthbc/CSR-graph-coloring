@@ -1,21 +1,33 @@
-// Picasso Graph Coloring — Pipelined LWW kernel (Step 2c.2a).
+// Picasso Graph Coloring — Pipelined LWW kernel, EAST-ONLY (Step 2c.2b.i).
 //
 // Transport model:
-//   * Each PE owns two source colors: my_east_color (tx=EAST) and
-//     my_west_color (tx=WEST). Downstream PEs forward in hardware
-//     (wire-speed switches; no software relay).
-//   * Sends are broadcast with a local-filter at the receiver: each
-//     rx task unpacks (sender_gid, color) and scans boundary[] to
-//     accept only wavelets whose sender matches a known remote neighbor.
-//   * One done sentinel per outgoing direction closes the round. The
-//     done sentinel carries this PE's has_uncolored flag so the barrier
-//     OR-reduce piggy-backs on the data pipeline — no dedicated barrier
-//     queues needed. Each PE expects exactly (num_cols - 1) done
-//     sentinels per round (one from every other PE in the 1D row).
+//   * Each PE owns ONE source color: my_east_color (tx=EAST). Westbound
+//     data colors are GONE entirely. Path C (monotone block partition +
+//     "lower-GID wins" conflict rule) guarantees the eastern PE always
+//     loses cross-PE conflicts, so westbound color packets are
+//     redundant.
+//   * The BSP barrier is a dedicated reduce-chain on
+//     {sync_reduce_recv_color, sync_reduce_send_color} (alternating
+//     even/odd) with an east-bound broadcast on sync_bcast_color. The
+//     barrier no longer piggybacks on done sentinels — done sentinels
+//     are gone entirely.
 //
-// BSP round: speculate → send_boundary → (inject + recv) → detect/resolve
-// Termination: when all expected dones arrive and the OR-reduced flag is 0
-// (every PE reported no uncolored vertex), activate exit_task.
+// BSP round (each PE):
+//   1. speculate                                — pick tentative colors
+//   2. send_boundary → send_wavelet (east only) — push data east
+//   3. reduce-chain barrier:
+//        - eastmost injects sync_buf[0] on its outgoing reduce color
+//        - interior PE rx, OR with sync_buf[0], forward
+//        - PE0 rx final OR, originates broadcast on sync_bcast
+//        - all non-PE0 PEs rx broadcast → sync_buf[0] := bcast value
+//   4. detect_resolve once both local_send_done AND barrier_done
+//   5. If sync_buf[0] == 0 and round > 0 → exit; else loop.
+//
+// Round-parity tagging on data wavelets is RETAINED: a fast neighbor
+// can finish its send and start NEXT round's data before a slow PE has
+// completed previous-round detect_resolve. The barrier serializes
+// round transitions globally, but data wavelets ride independent
+// fabric colors and can arrive cross-round.
 
 param memcpy_params: comptime_struct;
 param pe_id:    i16;
@@ -29,53 +41,52 @@ param max_list_size:   i16;
 param is_west_edge: bool;
 param is_east_edge: bool;
 
-// Path C east-data-only probe: when true, suppress westbound DATA
-// wavelets (the eastern PE always loses cross-PE conflicts under a
-// monotone block partition, so westbound color packets are redundant).
-// Westbound DONE sentinels are still emitted because they carry the
-// per-round has_uncolored flag for the OR-reduce barrier.
-param east_only: bool;
-
-// Source colors (5 east + 5 west) — declared so the layout can drop in
-// any of them via @get_color(...). Only `my_*_color` and the slot colors
-// are actively used inside the kernel.
+// Source colors (5 east only). The layout passes all five so it doesn't
+// have to branch on num_cols; the kernel only references those it owns.
 param c_0_E: color;
 param c_1_E: color;
 param c_2_E: color;
 param c_3_E: color;
 param c_4_E: color;
-param c_0_W: color;
-param c_1_W: color;
-param c_2_W: color;
-param c_3_W: color;
-param c_4_W: color;
 param my_east_color: color;
-param my_west_color: color;
 
-// Upstream slot colors — up to 4 per PE.
+// Upstream slot colors — up to 4 per PE. slot_count = pe_id (number of
+// PEs west of me, each contributing one east-going source color).
 param slot0_color: color;
 param slot1_color: color;
 param slot2_color: color;
 param slot3_color: color;
-param slot_count: i16;   // = num_cols - 1 (kernel invariant)
+param slot_count: i16;
 
-// Barrier colors are still declared for layout symmetry but unused in
-// this piggy-back design. Kept as params so the layout does not have to
-// branch on the kernel variant when calling @set_tile_code.
+// Dedicated barrier colors.
 param sync_reduce_recv_color: color;
 param sync_reduce_send_color: color;
 param sync_bcast_color:       color;
 
-// ========== Queues (WSE-3: 6 usable after memcpy claims 2) ==========
-// Q2: tx east  Q3: tx west  Q4..Q7: up to 4 rx slots.
-// No dedicated barrier queues — OR-reduce piggy-backs on done sentinel.
+// ========== Queues ==========
+// memcpy reserves IQ(0)/IQ(1) and OQ(0)/OQ(1) on WSE-3, so all user
+// queues live in indices 2..7. Each PE only @initialize_queue's the
+// ones that match its role (PE0 / interior / eastmost), so the
+// per-PE active queue count stays within the 4-user-queue budget.
+//
+// OQ index map:
+//   2: tx_east_oq      (data send east — every non-eastmost PE)
+//   3: tx_reduce_oq    (barrier reduce send west — eastmost + interior)
+//   4: bcast_send_oq   (barrier broadcast east — PE0 only)
+// IQ index map:
+//   2: reduce_recv_iq  (PE0 + interior)
+//   3: bcast_recv_iq   (eastmost + interior)
+//   4..7: rx_iq_0..3   (data slots; one per upstream east-going PE)
 
-const tx_east_oq: output_queue = @get_output_queue(2);
-const tx_west_oq: output_queue = @get_output_queue(3);
-const rx_iq_0:    input_queue  = @get_input_queue(4);
-const rx_iq_1:    input_queue  = @get_input_queue(5);
-const rx_iq_2:    input_queue  = @get_input_queue(6);
-const rx_iq_3:    input_queue  = @get_input_queue(7);
+const tx_east_oq:     output_queue = @get_output_queue(2);
+const tx_reduce_oq:   output_queue = @get_output_queue(3);
+const bcast_send_oq:  output_queue = @get_output_queue(4);
+const reduce_recv_iq: input_queue  = @get_input_queue(2);
+const bcast_recv_iq:  input_queue  = @get_input_queue(3);
+const rx_iq_0:        input_queue  = @get_input_queue(4);
+const rx_iq_1:        input_queue  = @get_input_queue(5);
+const rx_iq_2:        input_queue  = @get_input_queue(6);
+const rx_iq_3:        input_queue  = @get_input_queue(7);
 
 // ========== Task IDs ==========
 
@@ -85,10 +96,12 @@ const detect_resolve_task_id: local_task_id = @get_local_task_id(17);
 const exit_task_id:           local_task_id = @get_local_task_id(18);
 const send_wavelet_task_id:   local_task_id = @get_local_task_id(19);
 
-const rx_task_0_id: data_task_id = @get_data_task_id(rx_iq_0);
-const rx_task_1_id: data_task_id = @get_data_task_id(rx_iq_1);
-const rx_task_2_id: data_task_id = @get_data_task_id(rx_iq_2);
-const rx_task_3_id: data_task_id = @get_data_task_id(rx_iq_3);
+const rx_task_0_id:     data_task_id = @get_data_task_id(rx_iq_0);
+const rx_task_1_id:     data_task_id = @get_data_task_id(rx_iq_1);
+const rx_task_2_id:     data_task_id = @get_data_task_id(rx_iq_2);
+const rx_task_3_id:     data_task_id = @get_data_task_id(rx_iq_3);
+const reduce_recv_id:   data_task_id = @get_data_task_id(reduce_recv_iq);
+const bcast_recv_id:    data_task_id = @get_data_task_id(bcast_recv_iq);
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tsc     = @import_module("<time>");
@@ -118,9 +131,6 @@ inline fn stop_timing() void {
 }
 
 // ===== Perf counters =====
-// [0] rounds; [1] wavelet-send activations; [2] recv invocations;
-// [4] boundary-table scans; [5] global_to_local calls;
-// [6] speculate inner iterations.
 var perf_counters = @zeros([8]i32);
 var perf_counters_ptr: [*]i32 = &perf_counters;
 
@@ -139,11 +149,8 @@ var num_boundary:          [1]i32;
 var tentative: [max_local_verts]i32;
 var forbidden: [max_palette_size]i32;
 
-var runtime_config:     [2]i32;          // [0]=pe_mask, [1]=palette_size
+var runtime_config:     [2]i32;
 var remote_recv_color:  [max_boundary]i32;
-// Staging slot for data wavelets that arrive tagged with the next
-// round's parity (i.e. sender already advanced past my current round).
-// Promoted into remote_recv_color[] inside reset_round_state().
 var remote_recv_color_next: [max_boundary]i32;
 
 var color_list: [max_local_verts * max_list_size]i32;
@@ -151,11 +158,8 @@ var list_len:   [max_local_verts]i32;
 
 // ===== Send buffers =====
 var east_send_buf: [max_boundary]u32;
-var west_send_buf: [max_boundary]u32;
 var east_count: u16 = 0;
-var west_count: u16 = 0;
-
-var send_phase: u16 = 0;     // 0=east data, 1=west data, 2=east done, 3=west done, 4=wait
+var send_phase: u16 = 0;     // 0 = drain east data, 1 = send data-done, 2 = idle
 var send_idx:   u16 = 0;
 var send_tmp = @zeros([1]u32);
 var local_send_done: bool = false;
@@ -163,17 +167,46 @@ var phase_complete: bool = false;
 
 // ===== Recv state =====
 var data_recv_count: i32 = 0;   // telemetry only
-var done_recv_count: i32 = 0;   // dones tagged with current-round parity
-var done_recv_next:  i32 = 0;   // dones tagged with next-round parity
-var expected_done:   i32 = 0;   // = num_cols - 1
+// Per-round count of data-done sentinels received from upstream east-going
+// source colors. Each upstream PE emits exactly one data-done per round
+// AFTER it finishes draining its east data buffer (FIFO-ordered with
+// data, so once data_done arrives all of that PE's data has too).
+// expected_data_done = pe_id (number of upstream PEs).
+var expected_data_done: i32 = 0;
+var data_done_recv_count: i32 = 0;   // current-parity tally
+var data_done_recv_next:  i32 = 0;   // next-parity tally (early arrivals)
+var data_done_present:    bool = false;
 
-// ===== Barrier OR-reduce carrier (piggy-backed on done sentinels) =====
-// sync_buf[0] = OR-reduced has_uncolored flag for the current round.
-// sync_buf[1] = OR of has_uncolored flags from done sentinels carrying
-//               the *next* round's parity that arrived early. Drained
-//               into sync_buf[0] (with local seed) in reset_round_state.
+// ===== Barrier state =====
+// Race model: the dedicated reduce-chain only stays correct if every PE
+// has set sync_buf[0] to its NEW round's local_flag BEFORE it ORs in
+// the chain. Without explicit gating, the eastmost PE may finish
+// detect_resolve and send a reduce wavelet that lands on an interior
+// PE while that interior PE is still mid-detect_resolve (or hasn't
+// even started, depending on task-scheduling order vs. data-task
+// firing). To avoid that, we run a tiny state machine:
+//
+//   * reduce_recv buffers the incoming partial OR into pending_reduce.
+//   * detect_resolve sets sync_buf[0] = local_flag and flips
+//     local_done_for_round = true.
+//   * try_step_barrier() fires from BOTH events; it advances only when
+//     local_done_for_round (and, for non-eastmost, pending_reduce_present).
+//   * Eastmost: as soon as local_done_for_round, inject sync_buf[0].
+//   * Interior: when both, OR and forward.
+//   * PE0:     when both, OR and originate bcast.
+//   * Bcast_recv just delivers the global OR and marks barrier_done.
+//
+// Round 0 bootstraps by setting local_done_for_round = true inside
+// start_coloring (sync_buf[0] = 0 is the trivial local flag at boot).
 var sync_buf = @zeros([2]u32);
 var current_round: i32 = 0;
+var barrier_done: bool = false;
+var local_done_for_round: bool = false;
+var pending_reduce_value: u32 = 0;
+var pending_reduce_present: bool = false;
+var reduce_sent_for_round: bool = false;
+var reduce_tmp = @zeros([1]u32);
+var bcast_tmp  = @zeros([1]u32);
 
 // ===== Host symbol pointers =====
 var csr_offsets_ptr:            [*]i32 = &csr_offsets;
@@ -189,11 +222,14 @@ var color_list_ptr:             [*]i32 = &color_list;
 var list_len_ptr:               [*]i32 = &list_len;
 var runtime_config_ptr:         [*]i32 = &runtime_config;
 
+// expected_recv: kept as a host-visible scratch slot so the host runner
+// can keep uploading telemetry symbols unchanged. The kernel never reads
+// it under the dedicated-barrier design.
 var expected_recv: [2]i32;
 var expected_recv_ptr: [*]i32 = &expected_recv;
 
 // =====================================================================
-// Helpers (same semantics as SW-relay pe_program.csl)
+// Helpers (same semantics as the bidirectional LWW kernel)
 // =====================================================================
 
 fn global_to_local(gid: i32) i32 {
@@ -298,13 +334,10 @@ fn process_incoming_wavelet(sender_gid: i32, sender_color: i32) void {
 }
 
 // ===== Wavelet encoding =====
-// Data: [31]=0, [30]=round_parity, [29:8]=sender_gid (22-bit),
-//       [7:0]=color (8-bit).
-// Done: [31]=1, [1]=round_parity, [0]=has_uncolored flag.
-//
-// round_parity = (sender's current_round) & 1. The receiver compares
-// against its own (current_round & 1) and stages any next-round arrivals
-// so they take effect after reset_round_state runs.
+// Data:      [31]=0, [30]=round_parity, [29:8]=sender_gid, [7:0]=color.
+// Data-done: [31]=1, [30]=round_parity.
+// (Barrier reduce / bcast wavelets carry a single u32 OR-flag; no
+//  parity — they're strictly serialized round-to-round by the chain.)
 
 fn pack_data(gid: i32, col: i32, parity: u32) u32 {
   const g = @as(u32, @as(u16, @as(i16, gid))) & 0x3FFFFF;
@@ -313,19 +346,17 @@ fn pack_data(gid: i32, col: i32, parity: u32) u32 {
   return p | (g << 8) | c;
 }
 
-fn pack_done(flag: u32, parity: u32) u32 {
-  return 0x80000000 | ((parity & 0x1) << 1) | (flag & 0x1);
+fn pack_data_done(parity: u32) u32 {
+  return 0x80000000 | ((parity & 0x1) << 30);
 }
 
-fn is_done(w: u32) bool  { return (w >> 31) != 0; }
+fn is_data_done(w: u32) bool { return (w >> 31) != 0; }
 fn unpack_gid(w: u32) i32 { return @as(i32, (w >> 8) & 0x3FFFFF); }
 fn unpack_color(w: u32) i32 { return @as(i32, w & 0xFF); }
-fn get_done_flag(w: u32) u32 { return w & 0x1; }
-fn unpack_data_parity(w: u32) u32 { return (w >> 30) & 0x1; }
-fn unpack_done_parity(w: u32) u32 { return (w >> 1) & 0x1; }
+fn unpack_parity(w: u32) u32 { return (w >> 30) & 0x1; }
 
 // =====================================================================
-// Speculate (identical to SW-relay kernel)
+// Speculate (identical to bidirectional LWW kernel)
 // =====================================================================
 
 task speculate() void {
@@ -404,23 +435,14 @@ task speculate() void {
 }
 
 // =====================================================================
-// Send boundary — pack one wavelet per boundary edge into east/west bufs.
-// Receivers scan boundary[] and filter by sender_gid; duplicate wavelets
-// to the same gid are harmless (idempotent remote_recv_color update).
+// Send boundary — east-only.
 // =====================================================================
-
-// NOTE: rx data tasks are never @block'd at runtime. They are bound at
-// compile time and free to fire as soon as wavelets arrive. Early-arriving
-// wavelets land with local_send_done=false, so check_completion is a no-op
-// until this PE finishes its own send; sync_buf[0] OR-reduction stays
-// correct whether the wavelet lands before or after this PE's dones.
 
 task send_boundary() void {
   const nbnd = num_boundary[0];
   const pal_threshold = runtime_config[1];
   const par = @as(u32, current_round) & 0x1;
   east_count = 0;
-  west_count = 0;
 
   var b: i16 = 0;
   while (b < max_boundary) : (b += 1) {
@@ -428,20 +450,20 @@ task send_boundary() void {
     const li = @as(u16, @as(i16, boundary_local_idx[b]));
     const c = colors[li];
     if (c >= pal_threshold or c < 0) continue;
-    const wval = pack_data(global_vertex_ids[li], c, par);
     const dir = boundary_direction[b];
-    if (dir == 0) {
-      east_send_buf[east_count] = wval;
-      east_count += 1;
-    } else if (dir == 1) {
-      if (east_only) continue;
-      west_send_buf[west_count] = wval;
-      west_count += 1;
-    }
+    if (dir != 0) continue;
+    east_send_buf[east_count] = pack_data(global_vertex_ids[li], c, par);
+    east_count += 1;
   }
 
   send_phase = 0;
   send_idx = 0;
+  // Kick the barrier from task context. This is where the eastmost
+  // PE injects round N's reduce wavelet (and where any non-eastmost
+  // PE that already has a buffered upstream OR forwards it). All
+  // fabric sends thus originate inside a task, never from
+  // start_coloring or detect_resolve directly.
+  try_step_barrier();
   @activate(send_wavelet_task_id);
 }
 
@@ -456,25 +478,76 @@ fn send_east(w: u32) void {
   @mov32(out, src);
 }
 
-fn send_west(w: u32) void {
-  send_tmp[0] = w;
+fn send_reduce(val: u32) void {
+  reduce_tmp[0] = val;
   var out = @get_dsd(fabout_dsd, .{
     .extent = 1,
-    .fabric_color = my_west_color,
-    .output_queue = tx_west_oq,
+    .fabric_color = sync_reduce_send_color,
+    .output_queue = tx_reduce_oq,
   });
-  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> send_tmp[i] });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> reduce_tmp[i] });
   @mov32(out, src);
 }
 
-// Cooperative one-wavelet-per-activation send chain. Sits between recv
-// tasks so rx handlers can drain between each inject.
+fn send_bcast(val: u32) void {
+  bcast_tmp[0] = val;
+  var out = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = sync_bcast_color,
+    .output_queue = bcast_send_oq,
+  });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> bcast_tmp[i] });
+  @mov32(out, src);
+}
+
+// Race-free barrier step. Called from detect_resolve (after sync_buf[0]
+// is set), reduce_recv (after pending OR is buffered), and from
+// on_recv (after the data-done sentinel count is satisfied).
+// Idempotent: reduce_sent_for_round latches once we've done our part.
+//
+// Gate conditions:
+//   * local_done_for_round: this PE's detect_resolve has set sync_buf[0]
+//   * data_done_present: all upstream PEs' round-N data has arrived
+//                        (FIFO-ordered behind the data-done sentinel)
+//   * pending_reduce_present (non-eastmost only): upstream OR arrived
+fn try_step_barrier() void {
+  if (num_cols == 1) return;
+  if (reduce_sent_for_round) return;
+  if (!local_done_for_round) return;
+  if (!data_done_present) return;
+  if (is_east_edge) {
+    send_reduce(sync_buf[0]);
+    reduce_sent_for_round = true;
+    return;
+  }
+  if (!pending_reduce_present) return;
+  sync_buf[0] = sync_buf[0] | pending_reduce_value;
+  // Consume: clear so next round's reduce_recv sets it fresh. Without
+  // this clear, the next round's try_step_barrier sees stale "present"
+  // and forwards before the round-N+1 upstream reduce actually arrives,
+  // producing a globally-wrong OR (most visibly: a 0 OR even when some
+  // PE still has uncolored vertices, causing premature termination).
+  pending_reduce_present = false;
+  pending_reduce_value = 0;
+  if (is_west_edge) {
+    send_bcast(sync_buf[0]);
+    reduce_sent_for_round = true;
+    barrier_done = true;
+    check_completion();
+  } else {
+    send_reduce(sync_buf[0]);
+    reduce_sent_for_round = true;
+  }
+}
+
+// =====================================================================
+// Send wavelet — drains east data buffer, then declares local_send_done.
+// =====================================================================
+
 task send_wavelet() void {
   perf_counters[1] += 1;
-
   if (phase_complete) return;
 
-  // Phase 0: east data
   if (send_phase == 0) {
     if (!is_east_edge and send_idx < east_count) {
       send_east(east_send_buf[send_idx]);
@@ -483,44 +556,24 @@ task send_wavelet() void {
       return;
     }
     send_phase = 1;
-    send_idx = 0;
   }
-  // Phase 1: west data
+  // Phase 1: emit one data-done sentinel on my east color (FIFO-ordered
+  // behind any data wavelets we just drained). Skip on the eastmost PE
+  // — it has no eastward neighbors and never sends on its source color.
   if (send_phase == 1) {
-    if (!east_only and !is_west_edge and send_idx < west_count) {
-      send_west(west_send_buf[send_idx]);
-      send_idx += 1;
-      @activate(send_wavelet_task_id);
-      return;
+    if (!is_east_edge) {
+      const par = @as(u32, current_round) & 0x1;
+      send_east(pack_data_done(par));
     }
     send_phase = 2;
-    send_idx = 0;
-  }
-  // Phase 2: east done sentinel (carries local has_uncolored flag).
-  // Tag with this PE's current round parity so receivers can route
-  // early-arriving sentinels to the next-round bucket.
-  if (send_phase == 2) {
-    const par = @as(u32, current_round) & 0x1;
-    if (!is_east_edge) send_east(pack_done(sync_buf[0], par));
-    send_phase = 3;
-  }
-  // Phase 3: west done sentinel. After this, all outbound traffic is
-  // posted. Termination is now driven exclusively by rx tasks calling
-  // check_completion() on arriving done sentinels — no spin loop here
-  // (a spin loop can starve data tasks on WSE-3).
-  if (send_phase == 3) {
-    const par = @as(u32, current_round) & 0x1;
-    if (!is_west_edge) send_west(pack_done(sync_buf[0], par));
-    send_phase = 4;
     local_send_done = true;
     check_completion();
   }
 }
 
 fn check_completion() void {
-  if (!phase_complete and local_send_done and done_recv_count >= expected_done) {
+  if (!phase_complete and local_send_done and barrier_done) {
     phase_complete = true;
-    // sync_buf[0] now holds the OR-reduced has_uncolored flag.
     if (current_round > 0 and sync_buf[0] == 0) {
       @activate(exit_task_id);
     } else {
@@ -530,28 +583,25 @@ fn check_completion() void {
 }
 
 // =====================================================================
-// Recv tasks (up to 4 upstream slots — broadcast + local filter).
-// Identical body in each slot: unpack, dispatch on is_done.
+// Recv tasks — data slots (east-going wavelets from west PEs).
 // =====================================================================
 
 fn on_recv(wval: u32) void {
   perf_counters[2] += 1;
   const cur_par = @as(u32, current_round) & 0x1;
-  if (is_done(wval)) {
-    const dpar = unpack_done_parity(wval);
-    const flag = get_done_flag(wval);
+  const dpar = unpack_parity(wval);
+  if (is_data_done(wval)) {
     if (dpar == cur_par) {
-      sync_buf[0] = sync_buf[0] | flag;
-      done_recv_count += 1;
-      check_completion();
+      data_done_recv_count += 1;
+      if (!data_done_present and data_done_recv_count >= expected_data_done) {
+        data_done_present = true;
+        try_step_barrier();
+      }
     } else {
-      // Sender already advanced. Park flag + count for next round.
-      sync_buf[1] = sync_buf[1] | flag;
-      done_recv_next += 1;
+      data_done_recv_next += 1;
     }
     return;
   }
-  const dpar = unpack_data_parity(wval);
   const gid  = unpack_gid(wval);
   const col  = unpack_color(wval);
   if (dpar == cur_par) {
@@ -576,7 +626,28 @@ task rx_task_2(w: u32) void { on_recv(w); }
 task rx_task_3(w: u32) void { on_recv(w); }
 
 // =====================================================================
-// Detect / resolve / loop (identical to SW-relay kernel)
+// Barrier rx tasks.
+// =====================================================================
+
+// reduce_recv: arrives at PE0 (sink) and interior PEs (relay). The
+// eastmost PE is the originator and never receives on this color.
+// Buffer the incoming partial OR and let try_step_barrier decide
+// whether to forward (gated by local_done_for_round).
+task reduce_recv_task(w: u32) void {
+  pending_reduce_value = w;
+  pending_reduce_present = true;
+  try_step_barrier();
+}
+
+// bcast_recv: arrives at every non-PE0 PE. Final OR is now in `w`.
+task bcast_recv_task(w: u32) void {
+  sync_buf[0] = w;
+  barrier_done = true;
+  check_completion();
+}
+
+// =====================================================================
+// Detect / resolve / loop
 // =====================================================================
 
 task detect_resolve() void {
@@ -612,14 +683,18 @@ task detect_resolve() void {
       }
     }
   }
-  // Seed next round's OR-reduce: union of any next-round done flags that
-  // arrived early (sync_buf[1]) with this PE's local has_uncolored seed.
   const local_flag: u32 = if (has_uncolored) @as(u32, 1) else @as(u32, 0);
-  sync_buf[0] = sync_buf[1] | local_flag;
-  sync_buf[1] = 0;
 
   current_round += 1;
   reset_round_state();
+  // Seed THIS round's barrier with this PE's local has_uncolored flag,
+  // mark our half of the barrier-readiness gate true, then try to step.
+  // detect_resolve is a task, so it's safe to send fabric wavelets here
+  // (unlike start_coloring which is host-invoked). Also re-kicked from
+  // send_boundary in case nothing happened here.
+  sync_buf[0] = local_flag;
+  local_done_for_round = true;
+  try_step_barrier();
   @activate(speculate_task_id);
 }
 
@@ -627,15 +702,7 @@ fn reset_round_state() void {
   local_send_done = false;
   phase_complete = false;
   data_recv_count = 0;
-  // Carry over any done sentinels that arrived tagged with the new
-  // round's parity before this reset ran. Without this, those senders
-  // never send another done and check_completion would stall waiting
-  // for ghost dones.
-  done_recv_count = done_recv_next;
-  done_recv_next = 0;
-  expected_done = @as(i32, num_cols) - 1;
   east_count = 0;
-  west_count = 0;
   send_phase = 0;
   send_idx = 0;
   // Promote any data wavelets that arrived tagged with the new round's
@@ -649,9 +716,24 @@ fn reset_round_state() void {
       remote_recv_color_next[b] = -1;
     }
   }
-  // NOTE: sync_buf[0] is NOT reset here — it was set at the end of
-  // detect_resolve to (sync_buf[1] | local_seed) and becomes the
-  // starting OR for the new round.
+  // Promote any early-arriving data-done sentinels for the new round.
+  data_done_recv_count = data_done_recv_next;
+  data_done_recv_next = 0;
+  data_done_present = (data_done_recv_count >= expected_data_done);
+
+  // Barrier reset (preserve pending_reduce_* across the boundary; see
+  // long comment in detect_resolve / try_step_barrier for rationale).
+  if (num_cols == 1) {
+    barrier_done = true;
+    local_done_for_round = true;
+    pending_reduce_present = false;
+    pending_reduce_value = 0;
+    reduce_sent_for_round = true;
+  } else {
+    barrier_done = false;
+    local_done_for_round = false;
+    reduce_sent_for_round = false;
+  }
 }
 
 // =====================================================================
@@ -668,8 +750,16 @@ fn start_coloring() void {
   current_round = 0;
   sync_buf[0] = 0;
   sync_buf[1] = 0;
-  done_recv_next = 0;
+  expected_data_done = @as(i32, pe_id);
+  data_done_recv_count = 0;
+  data_done_recv_next = 0;
+  data_done_present = (expected_data_done == 0);
   reset_round_state();
+  // Bootstrap: round 0's local_flag is trivially 0. Mark local-done
+  // so send_boundary's try_step_barrier kick can fire round 0's reduce
+  // (subject to data_done_present, which is already true on PE0 and
+  // will become true on others as upstream data-done sentinels arrive).
+  local_done_for_round = true;
   @activate(speculate_task_id);
 }
 
@@ -694,17 +784,39 @@ comptime {
   if (slot_count > 2) @bind_data_task(rx_task_2, rx_task_2_id);
   if (slot_count > 3) @bind_data_task(rx_task_3, rx_task_3_id);
 
-  if (@is_arch("wse3")) {
-    // Skip initializing the tx queue when this PE is on the matching edge —
-    // the corresponding own source color has no fabric route there, so
-    // binding a queue to it would leave an orphaned color/queue pair.
-    if (!is_east_edge) @initialize_queue(tx_east_oq, .{ .color = my_east_color });
-    if (!is_west_edge) @initialize_queue(tx_west_oq, .{ .color = my_west_color });
+  // Barrier tasks: PE0 receives reduce, originates bcast (no bcast rx).
+  // Eastmost originates reduce (no reduce rx), receives bcast.
+  // Interior receives both reduce and bcast.
+  if (num_cols > 1) {
+    if (is_west_edge or !is_east_edge) {
+      @bind_data_task(reduce_recv_task, reduce_recv_id);
+    }
+    if (!is_west_edge) {
+      @bind_data_task(bcast_recv_task, bcast_recv_id);
+    }
+  }
 
+  if (@is_arch("wse3")) {
+    if (!is_east_edge) @initialize_queue(tx_east_oq, .{ .color = my_east_color });
     if (slot_count > 0) @initialize_queue(rx_iq_0, .{ .color = slot0_color });
     if (slot_count > 1) @initialize_queue(rx_iq_1, .{ .color = slot1_color });
     if (slot_count > 2) @initialize_queue(rx_iq_2, .{ .color = slot2_color });
     if (slot_count > 3) @initialize_queue(rx_iq_3, .{ .color = slot3_color });
+
+    if (num_cols > 1) {
+      // Reduce send queue: eastmost (originator) and interior (relay).
+      if (!is_west_edge) @initialize_queue(tx_reduce_oq,
+        .{ .color = sync_reduce_send_color });
+      // Reduce recv queue: PE0 (sink) and interior (relay).
+      if (is_west_edge or !is_east_edge) @initialize_queue(reduce_recv_iq,
+        .{ .color = sync_reduce_recv_color });
+      // Bcast send queue: PE0 only.
+      if (is_west_edge) @initialize_queue(bcast_send_oq,
+        .{ .color = sync_bcast_color });
+      // Bcast recv queue: every non-PE0 PE.
+      if (!is_west_edge) @initialize_queue(bcast_recv_iq,
+        .{ .color = sync_bcast_color });
+    }
   }
 
   @export_symbol(csr_offsets_ptr,           "csr_offsets");

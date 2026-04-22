@@ -44,23 +44,35 @@ way.
 ## Current position (2026-04-21)
 
 1D transport validated end-to-end through chained bridges. 1D Picasso
-integration (Step 2c.2a) now passes all 13 in-scope local tests after
-the round-parity fix to the LWW kernel
-([LWW_PICASSO_RESULTS.md](LWW_PICASSO_RESULTS.md)). Remaining 1D work
-is the bridge-aware multi-segment layout (2c.2b) and the westbound
-mirror (2c.2c). 2D is unblocked from the transport side; the gating
-item is now bridge-color renaming + segment parameterization, not the
-protocol adaptation.
+integration (Step 2c.2a) passes all 13 in-scope local tests after the
+round-parity fix and now under both hash partition (bidirectional
+kernel) and Path C monotone block partition
+([LWW_PICASSO_RESULTS.md](LWW_PICASSO_RESULTS.md)).
+
+**Path C decision (committed `f432e88`):** the host runner now switches
+to a contiguous-GID block partition whenever
+`--routing pipelined-lww`. This enforces
+`gid_a < gid_b => pe(gid_a) <= pe(gid_b)`. Combined with the existing
+"lower-GID wins" conflict rule, the eastern PE always loses any
+cross-PE conflict, so westbound traffic is provably redundant.
+Westbound (Step 2c.2c) is therefore **deleted, not deferred**:
+bidirectional traffic is no longer required for correctness. Step 2c.2b
+becomes "east-only bridges + parameterize S".
 
 | Sub-step | Status | Evidence |
 |---|---|---|
 | 2a: per-source-color 1×6 | ✅ | [spikes/experiments/pipelined_lww_1d_spike/RESULTS.md](spikes/experiments/pipelined_lww_1d_spike/RESULTS.md) |
 | 2b: segmented reuse, 1×10, 1 bridge | ✅ | [spikes/experiments/pipelined_lww_1d_seg_spike/RESULTS.md](spikes/experiments/pipelined_lww_1d_seg_spike/RESULTS.md) |
 | 2c.1: chained bridges, 1×15, 2 bridges | ✅ | [spikes/experiments/pipelined_lww_1d_seg2_spike/RESULTS.md](spikes/experiments/pipelined_lww_1d_seg2_spike/RESULTS.md) |
-| 2c.2a: single-segment Picasso wiring (num_cols ≤ 5, eastbound only) | ✅ | [LWW_PICASSO_RESULTS.md](LWW_PICASSO_RESULTS.md), [runs/local/20260421-lww-4pe-tests1-13-fix1/stdout.log](runs/local/20260421-lww-4pe-tests1-13-fix1/stdout.log) |
-| 2c.2b: east bridges + parameterize S for num_cols > 5 | 🔜 **next** | — |
-| 2c.2c: west-going pipeline (bidirectional transport) | deferred | — |
-| 4: 2D extension | gated on 2c.2c passing | — |
+| 2c.2a: single-segment Picasso wiring (num_cols ≤ 5, bidirectional) | ✅ | [LWW_PICASSO_RESULTS.md](LWW_PICASSO_RESULTS.md), [runs/local/20260421-lww-4pe-tests1-13-fix1/stdout.log](runs/local/20260421-lww-4pe-tests1-13-fix1/stdout.log) |
+| Path C: monotone block partition under `--routing pipelined-lww` | ✅ | [runs/local/20260421-lww-4pe-tests1-13-block/stdout.log](runs/local/20260421-lww-4pe-tests1-13-block/stdout.log) |
+| East-data-only probe (`--lww-east-only`, west *data* gated off) | ✅ (uncommitted) | [runs/local/20260421-lww-4pe-tests1-13-east-data-only/stdout.log](runs/local/20260421-lww-4pe-tests1-13-east-data-only/stdout.log) |
+| 2c.2b.i: east-only kernel + dedicated reduce-chain barrier (single segment, S=4) | ✅ | [runs/local/20260421-lww-east-4pe-tests-without12-v6/stdout.log](runs/local/20260421-lww-east-4pe-tests-without12-v6/stdout.log) (12/12 PASS, test12 excluded — host OOM, not kernel) |
+| 2c.2b.ii: east bridges + parameterize S for num_cols > 5 | ✅ | W=4 [runs/local/20260421-east-seg-w4-reuse-check/stdout.log](runs/local/20260421-east-seg-w4-reuse-check/stdout.log), W=8 [runs/local/20260421-east-seg-w8-bridge1/stdout.log](runs/local/20260421-east-seg-w8-bridge1/stdout.log), W=16 [runs/local/20260421-east-seg-w16-bridges3/stdout.log](runs/local/20260421-east-seg-w16-bridges3/stdout.log) (12/12 PASS each; bridge colors c_be/c_bo alternate → W unbounded by colors) |
+| 4a iter 1: 2D east+south-only at 2×2, NO back-channel (narrowest falsifier) | ✅ falsified as predicted | [runs/local/20260421-lww-2d-iter1-sweep/stdout.log](runs/local/20260421-lww-2d-iter1-sweep/stdout.log) (3/12 PASS, 9 FAIL on anti-diagonal cross-PE pairs) |
+| 4a iter 2: 2D 2×2 with east→south forward + W back-channel + in-band row_bcast | ✅ DONE | [runs/local/20260421-lww-2d-iter2-fixdir/stdout.log](runs/local/20260421-lww-2d-iter2-fixdir/stdout.log) (12/12 PASS) |
+| 4b/4c: 2D scaling 4×4 / 8×8 / 16×16 / 32×32 with per-axis bridges | queued | — |
+| 5: degree-aware monotone renumbering within per-PE GID chunks | queued | — |
 
 **Measured transport cost (WSE-3 simulator):**
 - ~32 cyc/voice at leaf PEs, consistent across all three spikes. Task
@@ -178,49 +190,105 @@ carries Picasso's boundary-exchange protocol correctly for small rows
 - Cycle count and correctness vs SW-relay in a new
   `LWW_PICASSO_RESULTS.md` alongside the spike RESULTS files.
 
-##### Step 2c.2b — east bridges, parameterize S for num_cols > 5 (deferred)
+##### Step 2c.2b — east-only kernel, east bridges, parameterize S for num_cols > 5 🔜
 
 **Scope:** lift the `num_cols ≤ 5` cap by generating multi-segment
-east-going layouts with bridges, scaling to 1×16 / 1×32 widths.
+east-only layouts with bridges, scaling to 1×16 / 1×32 widths. Drop
+westbound *data* state and traffic from the kernel; rely on the Path C
+invariant for correctness.
+
+**Algorithmic claim already validated by `--lww-east-only` probe**
+(2026-04-21, uncommitted, run dir
+`runs/local/20260421-lww-4pe-tests1-13-east-data-only/`):
+- 13/13 PASS at 4 PE 1D under block partition with westbound *data*
+  wavelets suppressed at the kernel level. Color counts unchanged vs
+  bidirectional block; cycles −12% to −37% (dense cases biggest:
+  test12 −37%, test11 −31%, test7 −31%, test6 −28%).
+- Important caveat: the westbound *done* sentinel must remain. It
+  carries each PE's per-round `has_uncolored` flag for the OR-reduce
+  barrier. Pure east-only (no westbound traffic at all) hangs BSP
+  with `cs_python` exit 139 / "received length (0 bytes) is not
+  expected (8 bytes)" on the first d2h after `launch()` returns.
+- The proper Step 2c.2b layout therefore drops westbound *data*
+  colors entirely and keeps a single westbound done channel for the
+  barrier (or replaces the OR-reduce with a different barrier).
 
 **Work:**
-- Parameterize `csl/layout_lww.csl` (or generate it programmatically)
-  from `W` and `S`. Formula: `num_bridges = ceil(W / S) - 1`,
-  `bridge_pe[i] = (i+1)*S - 1`.
-- Validate with a partial-last-segment width (e.g., 1×13 with seg-2 of
-  3 PEs) — untested in 2c.1.
-- Rename bridge colors to 11+ range to keep 8-10 free for the sync
-  barrier.
+- New layout `csl/layout_lww_east.csl`: only `c_0_E..c_{S-1}_E` data
+  colors. **No `c_*_W` data colors.** Reuses existing barrier color
+  IDs 8/9/10 (`sync_reduce_c0`, `sync_reduce_c1`, `sync_bcast`) for the
+  dedicated reduce-chain BSP barrier (see next bullet). Bridge colors
+  at IDs ≥ 11 when segmentation lands.
+- **Bundled: dedicated reduce-chain BSP barrier.** The existing
+  per-source done sentinel rides the per-PE west *data* color, so it
+  cannot survive deletion of those colors. Replace with the
+  alternating reduce chain already wired (but unused) in
+  `pe_program_lww.csl` / `layout_lww.csl`:
+  - PE i with i%2==0: rx_E on `sync_reduce_c0`, OR local
+    `has_uncolored` flag, tx_W on `sync_reduce_c1`.
+  - PE i with i%2==1: rx_E on `sync_reduce_c1`, OR, tx_W on
+    `sync_reduce_c0`.
+  - PE 0 (west edge) holds final OR, broadcasts east on `sync_bcast`
+    (rx=WEST, tx={EAST, RAMP}).
+  - Per-round cost: O(num_cols) wavelets total, O(1) per PE — instead
+    of O(num_cols²) today.
+- New kernel `csl/pe_program_lww_east.csl` (clean fork of
+  `pe_program_lww.csl`): drop `remote_recv_color_west*`,
+  `west_send_buf`, `west_count`, `is_west_edge` west-data uses, the
+  `dir==1` branch in `send_boundary`, phases 1 and 3 of
+  `send_wavelet`. Replace `expected_done` / `done_recv_count` machinery
+  with the reduce-chain barrier handlers (one rx task on the chain
+  color, one rx task on the bcast color). Receiver still runs the full
+  GID-rule comparator on incoming wavelets.
+- Parameterize layout from `W` and `S`. Single-segment first (S=W,
+  no bridges). Formula for segments:
+  `num_bridges = ceil(W / S) - 1`, `bridge_pe[i] = (i+1)*S - 1`.
+  Bridges land in the next sub-step.
+- Validate at S=W=4 (matches today's 13-test suite), then S=W=5.
 - Host-side: extend the `--routing pipelined-lww` code path in
-  `picasso/run_csl_tests.py` to generate per-W bridge layouts.
+  `picasso/run_csl_tests.py` with `--lww-layout east` (or a new
+  routing mode value) selecting the new layout/kernel pair while
+  keeping Path C block partition selection. Drop the per-PE
+  `expected_done_recv` plumbing for the east-only path (the reduce
+  chain doesn't need it).
+- Re-check queue budget for an interior PE in a single-segment
+  east-only kernel:
+  - Data: `1 tx_E + (S-1) rx_E` = `S` queues.
+  - Reduce chain: `1 rx_E (incoming reduce color) + 1 tx_W (outgoing
+    reduce color)` = 2 queues.
+  - Bcast: `1 rx_W` (HW forwards east at wire speed, no tx queue
+    needed for non-originating PEs) = 1 queue.
+  - Total: `S + 3`.
+  - Mitigation already in the codebase: the 2D dedicated barrier in
+    `csl/layout.csl` parks barrier colors on Q0/Q1 (nominally
+    memcpy-reserved but free during the coloring phase). That leaves
+    Q2-Q5 = 4 queues for data, so **single-segment east-only is
+    feasible up to S = 4** without further queue-sharing tricks.
+  - **Plan: bring up S = 4 first.** S = 5 in a single segment needs
+    a queue-sharing investigation (multi-color → single input queue
+    binding) deferred to a follow-up. Going wider than 5 uses
+    bridges (next sub-step), so S = 4 in a single segment is not a
+    long-term ceiling.
 
-**Gate:** requires 2c.2a passing on `num_cols ≤ 5`. Until then, the
-error messages in [picasso/run_csl_tests.py:1256,1261](picasso/run_csl_tests.py#L1256)
-explicitly point here as the next step.
+**Gate:** requires 2c.2a passing (✅), Path C block partition (✅), and
+east-data-only probe correctness (✅, see above). The error messages in
+`picasso/run_csl_tests.py` that currently cap `num_cols <= 5` should be
+updated to point here as the next step.
 
-##### Step 2c.2c — west-going pipeline, bidirectional transport (deferred)
+##### Step 2c.2c — westbound pipeline ❌ removed
 
-**Scope:** add a westbound mirror of the eastbound pipeline so LWW can
-carry boundary exchanges in both directions, matching SW-relay's
-bidirectional capability.
+Deleted by Path C. Under the monotone block partition, the
+"lower-GID wins" conflict rule guarantees the eastern PE always loses
+cross-PE conflicts; westbound traffic carries no information the
+receiver needs. Bidirectional transport is no longer required for
+correctness, and removing it frees the per-PE queue budget needed for
+the 2D extension.
 
-**Why a separate phase:** east-only covers roughly half of Picasso's
-boundary traffic (neighbors east of sender). Partitioning quality can
-skew the ratio but never eliminate westbound traffic. A complete
-replacement for SW-relay needs both axes.
-
-**Work:**
-- Duplicate the east-going color plan for westbound: `c_0W..c_{S-1}W`
-  source colors + `c_bridgeW_i` bridge colors, mirrored route configs
-  (`rx=EAST, tx={WEST, RAMP}` for westbound forward).
-- Queue budget re-check: east and west pipelines each consume ≤6
-  queues per PE. Running both concurrently may exceed the 6-queue
-  ceiling at non-edge PEs. If so: time-multiplex east and west phases
-  within a round (first drain east, then west) instead of concurrent.
-- Validate with a test that has mixed E/W boundary traffic.
-
-**Gate:** requires 2c.2b passing. This is the final 1D deliverable
-before 2D extension.
+If a future change abandons Path C (e.g., switches to a non-monotone
+partitioner for load-balance reasons) westbound traffic must be
+reintroduced. The bidirectional kernel
+(`csl/pe_program_lww.csl` + `csl/layout_lww.csl`) is preserved on
+master as the fallback reference.
 
 ### Step 3 — folded into Step 2
 
@@ -228,22 +296,52 @@ Per-source-color vs segmented-reuse bakeoff resolved by the 2a/2b/2c.1
 results. Segmented reuse is the production design. Placeholder kept for
 continuity with earlier planning docs.
 
-### Step 4 — 2D extension
+### Step 4 — 2D extension (east + south only, monotone row-major partition)
 
-Gated on Step 2c.2c passing correctness + wavelets/sec vs SW-relay on
-Pauli tests. Combine the proven 1D LWW segmented-bridge mechanism
-(bidirectional) with the two-color 2D broadcast tree from
-`spikes/experiments/rotating_root_2d_spike/`. Target 32×32 per `context.ai`.
+**Algorithmic basis:** Path C generalizes to 2D with row-major GID
+assignment over the PE grid:
+`gid_a < gid_b ⇒ pe_row(a) < pe_row(b) OR
+ (pe_row(a) == pe_row(b) AND pe_col(a) ≤ pe_col(b))`. Combined with
+"lower-GID wins", the western PE wins on the E/W axis and the northern
+PE wins on the N/S axis. **East+south-only is provably correct.**
 
-**Pre-work that can happen in parallel with 2c.2:**
-- Read [spikes/experiments/rotating_root_2d_spike/src/kernel.csl](spikes/experiments/rotating_root_2d_spike/src/kernel.csl)
-  for the 2D fan-out pattern (C_S spine + C_E row).
-- Sketch how segmented-bridge composes with row-level fan-out: each row
-  is a 1D bidirectional segmented-bridge chain; col-0 PE of each row
-  becomes the "row bridge" that injects into the 2D spine.
-- Queue-budget sanity-check for 2D: 1D bidirectional uses close to 6
-  queues; 2D row-bridge adds col-axis rx/tx queues. Verify feasibility
-  under the 6-queue ceiling before committing to this design.
+**Queue-budget reality check (WSE-3, 6-queue cap):** an interior 2D PE
+with east+south-only data + dedicated 2D barrier needs roughly
+`1 tx_E + (S_e−1) rx_E + 1 tx_S + (S_n−1) rx_N + barrier_queues`.
+With the 2D dedicated barrier already in `csl/layout.csl` (3 colors,
+~2 queues amortized via Q0/Q1 reuse), feasible only at
+`S_e + S_n ≤ 4`. So initial 2D bring-up runs at S_e = S_n = 2;
+beyond that requires per-axis segmentation (Step 4 sub-steps).
+
+**Bidirectional 2D is infeasible** without segmentation/color reuse on
+both axes; do not attempt it.
+
+**Sub-steps:**
+- **4a:** 2D east+south-only at 2×2 with S_e = S_n = 2. Validate the
+  whole stack (block partition row-major, dropped W and N colors,
+  reuse 2D dedicated barrier). This is the narrowest test that can
+  falsify the strategy.
+- **4b:** scale to 4×4 / 8×8 with per-axis segmentation, reusing the
+  bridge mechanism from Step 2c.2b sub-steps.
+- **4c:** stretch to 16×16 / 32×32 (per `context.ai`).
+
+**Pre-work that can happen in parallel:**
+- Read [csl/layout.csl](csl/layout.csl) sections wiring the 2D
+  dedicated barrier (`use_dedicated_2d_barrier` path, ~2026-04-18).
+- Sketch row-major monotone block partition in
+  `picasso/run_csl_tests.py partition_graph(..., mode='block-2d')`.
+
+### Step 5 — Degree-aware monotone renumbering
+
+**Motivation:** Path C with naive contiguous block partition correlates
+degree with GID; hubs cluster on PE0 (test12 cycles regressed +51% vs
+hash partition because of this). The Path C invariant only requires
+`gid_a < gid_b ⇒ pe(gid_a) ≤ pe(gid_b)` — we can permute *within* a
+PE's GID range freely.
+
+**Plan:** after 2D works (Step 4), renumber within per-PE chunks to
+balance degree. Validate against the test12-style dense graphs that
+exposed the regression. Has no kernel impact — host-only change.
 
 ## Deferred (do not touch until Step 4+)
 
