@@ -548,31 +548,58 @@ def picasso_reference(num_verts, edges, palette_size, alpha=1.0, list_size=None,
 # Graph partitioning (same logic as run.py)
 # ---------------------------------------------------------------------------
 
-def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1):
-    """Partition graph across a 2D PE grid using hash-based GID mapping.
+def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
+                    mode='hash'):
+    """Partition graph across a 2D PE grid.
 
-    Fix 1: total_pes must be a power of 2. gid_to_pe = gid & (total_pes - 1).
-    This distributes high-degree hub vertices uniformly across PEs.
+    Modes:
+      'hash'  : gid_to_pe = gid & (total_pes - 1). Distributes high-degree
+                hub vertices uniformly. Requires total_pes power of 2.
+      'block' : contiguous block partition; PE i owns a contiguous GID
+                range. Guarantees gid_a < gid_b => pe(a) <= pe(b), so
+                "lower-GID wins" is equivalent to "lower-PE wins". This
+                is the invariant the pipelined-LWW transport exploits to
+                drop westbound traffic (Path C).
 
     Direction encoding: 0=east, 1=west, 2=south, 3=north.
-
-    Fix 4: No relay traffic computation needed — hardware pass-through routing.
-    Fix 5: expected_data_recv replaces expected_total_recv.
     """
     total_pes = num_cols * num_rows
-    assert total_pes & (total_pes - 1) == 0, \
-        f"total_pes ({total_pes}) must be a power of 2 for hash partitioning"
-    pe_mask = total_pes - 1
 
-    # Hash-based: assign each vertex to PE = gid & pe_mask
-    pe_vertex_lists = [[] for _ in range(total_pes)]
-    for gid in range(num_verts):
-        pe_vertex_lists[gid & pe_mask].append(gid)
+    if mode == 'hash':
+        assert total_pes & (total_pes - 1) == 0, \
+            f"total_pes ({total_pes}) must be a power of 2 for hash partitioning"
+        pe_mask = total_pes - 1
+        pe_vertex_lists = [[] for _ in range(total_pes)]
+        for gid in range(num_verts):
+            pe_vertex_lists[gid & pe_mask].append(gid)
+
+        def gid_to_pe(gid):
+            return gid & pe_mask
+
+    elif mode == 'block':
+        # Balanced contiguous chunks: first `rem` PEs get base+1, rest get base.
+        base = num_verts // total_pes
+        rem = num_verts % total_pes
+
+        def _pe_start(p):
+            return p * base + min(p, rem)
+
+        gid_to_pe_arr = [0] * num_verts
+        pe_vertex_lists = [[] for _ in range(total_pes)]
+        for p in range(total_pes):
+            s = _pe_start(p)
+            e = _pe_start(p + 1) if p + 1 < total_pes else num_verts
+            for g in range(s, e):
+                gid_to_pe_arr[g] = p
+                pe_vertex_lists[p].append(g)
+
+        def gid_to_pe(gid):
+            return gid_to_pe_arr[gid]
+
+    else:
+        raise ValueError(f"unknown partition mode: {mode}")
 
     pe_data = []
-
-    def gid_to_pe(gid):
-        return gid & pe_mask
 
     for pe_idx in range(total_pes):
         pe_row = pe_idx // num_cols
@@ -1483,9 +1510,14 @@ def main():
     skipped_tests = []
     fitting_tests = []
 
+    # Path C: pipelined-LWW relies on lower-GID == lower-PE so the
+    # "lower-GID wins" conflict rule maps onto east-only forwarding.
+    partition_mode = 'block' if args.routing == 'pipelined-lww' else 'hash'
+
     for td in test_data_list:
         pe_data = partition_graph(td['num_verts'], td['offsets'],
-                                 td['adj'], num_cols, num_rows)
+                                 td['adj'], num_cols, num_rows,
+                                 mode=partition_mode)
         td_max_lv = max(d['local_n'] for d in pe_data)
         td_max_le = max(len(d['local_adj']) for d in pe_data)
         td_max_bnd = max(len(d['boundary_local_idx']) for d in pe_data)
@@ -1707,7 +1739,8 @@ def main():
             print(f"--- {name} ---")
 
             # Partition and run with host-driven recursion
-            pe_data = partition_graph(num_verts, offsets, adj, num_cols, num_rows)
+            pe_data = partition_graph(num_verts, offsets, adj, num_cols, num_rows,
+                                      mode=partition_mode)
 
             # Appliance mode: convert numpy types to plain Python for JSON
             if args.mode == 'appliance':
