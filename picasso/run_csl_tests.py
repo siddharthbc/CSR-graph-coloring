@@ -691,6 +691,38 @@ def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
     return pe_data
 
 
+def compute_multicast_bitmaps(pe_data):
+    """Populate per-local-vertex producer-side gating bitmaps used by
+    the `2d_multicast` kernel variant.
+
+    For each PE, sets two new keys on its dict:
+      should_send_east [v] = 1 iff local vertex v has >=1 boundary
+                              entry with dir == 0 (east).
+      should_send_south[v] = 1 iff local vertex v has >=1 boundary
+                              entry with dir == 2 (south).
+
+    Length matches local_n (host pads to max_local_verts on upload).
+    Modifies pe_data in place; safe to call after partition_graph.
+    """
+    for d in pe_data:
+        n = d['local_n']
+        sse = [0] * n
+        sss = [0] * n
+        bnd_local = d['boundary_local_idx']
+        bnd_dir = d['boundary_direction']
+        for b in range(len(bnd_local)):
+            v = int(bnd_local[b])
+            if v < 0 or v >= n:
+                continue
+            dr = int(bnd_dir[b])
+            if dr == 0:
+                sse[v] = 1
+            elif dr == 2:
+                sss[v] = 1
+        d['should_send_east'] = sse
+        d['should_send_south'] = sss
+
+
 def generate_color_lists(pe_data, num_verts, palette_size, list_size, seed=123,
                          offset=0, vertex_subset=None, kernel_stride=None):
     """Generate random per-vertex color lists for Picasso palette coloring.
@@ -1071,7 +1103,13 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
     # separate (layout_lww.csl, pe_program_lww.csl) pair so the SW-relay /
     # HW-filter kernel can stay untouched during the 2c.2a bring-up.
     if routing_mode == 2:
-        if lww_layout == '2d':
+        if lww_layout == '2d_seg2':
+            layout_name = 'layout_lww_2d_seg2.csl'
+        elif lww_layout == '2d_seg':
+            layout_name = 'layout_lww_2d_seg.csl'
+        elif lww_layout == '2d_multicast':
+            layout_name = 'layout_lww_2d_multicast.csl'
+        elif lww_layout == '2d':
             layout_name = 'layout_lww_2d.csl'
         elif lww_layout == 'east_seg':
             layout_name = 'layout_lww_east_seg.csl'
@@ -1104,11 +1142,23 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
             # Segmented east-only kernel: same base params plus segment
             # size S (1..4 currently; queue budget caps slot_count at 4).
             params = base_params + ',S:4'
+        elif lww_layout == '2d_seg':
+            # CP2a: 2D-namespaced segmented kernel (1xN only at this
+            # checkpoint). Same params as east_seg.
+            params = base_params + ',S:4'
+        elif lww_layout == '2d_seg2':
+            # CP2d fork: same plumbing as 2d_seg but S=2 so interior
+            # bridge PEs fit in the 6-IQ WSE-3 cap at 4x4 / 8x8 / 16x16.
+            params = base_params + ',S:2'
         elif lww_layout == 'east':
             params = base_params
         elif lww_layout == '2d':
             # 2D east+south-only kernel (Step 4a iter 1). num_rows is
             # already in base_params; no extra params required.
+            params = base_params
+        elif lww_layout == '2d_multicast':
+            # 2D MULTICAST variant: same params as '2d', extra device
+            # symbols uploaded by the host. 2x2 only at this checkpoint.
             params = base_params
         else:
             params = base_params + f',east_only_flag:{1 if lww_east_only else 0}'
@@ -1146,10 +1196,13 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
 
 def run_on_cerebras(compiled_dir, pe_data, num_cols, num_rows, num_verts,
                     max_local_verts, max_local_edges, max_boundary,
-                    max_list_size=0, palette_size=30):
+                    max_list_size=0, palette_size=30, lww_layout='bidir'):
     """Run a single test on the Cerebras simulator via cs_python.
     
     palette_size: runtime palette size for this test.
+    lww_layout: forwarded to cerebras_host.py so it knows whether to
+        upload kernel-variant-specific device symbols (e.g. multicast
+        bitmaps for `2d_multicast`).
     
     cs_python runs inside a singularity container that only binds the cwd
     and /tmp. So we copy the host script into compiled_dir and write
@@ -1188,6 +1241,7 @@ def run_on_cerebras(compiled_dir, pe_data, num_cols, num_rows, num_verts,
             '--max-boundary', str(max_boundary),
             '--max-list-size', str(max_list_size),
             '--palette-size', str(palette_size),
+            '--lww-layout', str(lww_layout),
         ]
         result = subprocess.run(cmd, capture_output=False, text=True,
                                 stdout=subprocess.PIPE, stderr=None,
@@ -1377,7 +1431,7 @@ def main():
                              'rides the done sentinel under the bidirectional '
                              'kernel). Only meaningful with --lww-layout bidir.')
     parser.add_argument('--lww-layout', type=str, default='bidir',
-                        choices=['bidir', 'east', 'east_seg', '2d'],
+                        choices=['bidir', 'east', 'east_seg', '2d', '2d_seg', '2d_seg2', '2d_multicast'],
                         help='Pipelined-LWW kernel variant: bidir (default, '
                              'csl/layout_lww.csl + csl/pe_program_lww.csl) '
                              'or east (Step 2c.2b.i, csl/layout_lww_east.csl '
@@ -1444,17 +1498,60 @@ def main():
     # Pipelined-LWW guards: 1D only EXCEPT for --lww-layout 2d (Step 4a),
     # num_cols <= 5 (WSE-3 queue budget) for 1D variants.
     if args.routing == 'pipelined-lww':
-        if num_rows > 1 and args.lww_layout != '2d':
+        if num_rows > 1 and args.lww_layout not in ('2d', '2d_seg', '2d_seg2', '2d_multicast'):
             sys.exit("ERROR: --routing pipelined-lww requires 1D layout "
                      f"(num_rows=1) for --lww-layout {args.lww_layout}; "
                      f"got num_rows={num_rows}. Use --lww-layout 2d for 2D.")
+        if args.lww_layout == '2d_seg':
+            # CP2c.i (DONE 2026-04-22): 12/12 PASS at 2x2 dual-axis.
+            # CP2c.ii: scaling to 2x4 / 4x2 / 4x4. Single-axis (one of
+            # num_rows/num_cols == 1) works at any size via CP2b path.
+            # Dual-axis (both>1) capped at 4x4 until per-segment bridge
+            # plumbing across the col axis is validated (CP2d).
+            if num_rows > 1 and num_cols > 1 and (num_rows > 4 or num_cols > 4):
+                sys.exit("ERROR: --lww-layout 2d_seg dual-axis (CP2c.ii) "
+                         "currently capped at 4x4. "
+                         f"Got {num_rows}x{num_cols}. "
+                         "Single-axis cases (1xN or Nx1) work at any size.")
+        if args.lww_layout == '2d_seg2':
+            # CP2d.d.2 (2026-04-24) merged back-channel onto sync_reduce
+            # alternating chain via opcode dispatch. Frees Q6 IQ at
+            # interior-row interior-col PEs so col_reduce_recv has no
+            # conflict. Cap raised to 16x16 for exploratory validation.
+            if num_rows > 1 and num_cols > 1 and (num_rows > 16 or num_cols > 16):
+                sys.exit("ERROR: --lww-layout 2d_seg2 dual-axis is "
+                         "currently capped at 16x16 (CP2d.d.2 probe). "
+                         f"Got {num_rows}x{num_cols}.")
         if args.lww_layout == '2d':
-            # Step 4a iter 1: only 2x2 supported until barrier generalizes.
+            # Checkpoint 1 (post Step 4a iter 2): barrier generalised to
+            # multi-PE alternating reduce chains (east_seg pattern applied
+            # per row + per col 0). 2x2 regression PASSES 13/13.
+            #
+            # The barrier infrastructure now supports arbitrary chain
+            # lengths, but the iter-2 data plane still assumes "only the
+            # col-0 PE originates east data" and "only the row-0 PE
+            # originates south data" (interior PEs cannot kernel-inject
+            # because the fabric routes use rx=WEST / rx=NORTH for the
+            # forwarding chain). 1xN / Nx1 / general HxW therefore stall
+            # in the simulator at the first send_east / send_south on an
+            # interior PE. Lifting the cap is checkpoint 2's job.
             if num_rows != 2 or num_cols != 2:
-                sys.exit("ERROR: --lww-layout 2d is currently capped at "
-                         f"2x2 during Step 4a iter 1 bring-up. "
+                sys.exit("ERROR: --lww-layout 2d (checkpoint 1) is still "
+                         "capped at 2x2. The new alternating barrier "
+                         "compiles + works, but the iter-2 c_E_data / "
+                         "c_S_data fabric chains do not yet allow "
+                         "interior-PE injection. Use 1D layouts (east, "
+                         "east_seg) for >4 PE single-row cases. "
                          f"Got num_rows={num_rows}, num_cols={num_cols}.")
-        elif num_cols > 5 and args.lww_layout != 'east_seg':
+        if args.lww_layout == '2d_multicast':
+            # Multicast variant inherits the 2x2 shape constraint from
+            # the underlying 2D iter-2 kernel (only adds producer-side
+            # gating; fabric routes / interior-injection limits unchanged).
+            if num_rows != 2 or num_cols != 2:
+                sys.exit("ERROR: --lww-layout 2d_multicast is capped at "
+                         "2x2 (inherits 2D iter-2 fabric layout). "
+                         f"Got num_rows={num_rows}, num_cols={num_cols}.")
+        elif num_cols > 5 and args.lww_layout not in ('east_seg', '2d_seg', '2d_seg2'):
             sys.exit("ERROR: --routing pipelined-lww caps num_cols <= 5 "
                      "(WSE-3 queue budget: 2 tx + (num_cols-1) rx <= 6). "
                      f"Got num_cols={num_cols}. Multi-segment bridging comes "
@@ -1469,6 +1566,12 @@ def main():
         if args.lww_layout == '2d' and args.lww_east_only:
             sys.exit("ERROR: --lww-east-only is a probe on the bidirectional "
                      "kernel and cannot be combined with --lww-layout 2d.")
+        if args.lww_layout == '2d_seg' and args.lww_east_only:
+            sys.exit("ERROR: --lww-east-only is a probe on the bidirectional "
+                     "kernel and cannot be combined with --lww-layout 2d_seg.")
+        if args.lww_layout == '2d_seg2' and args.lww_east_only:
+            sys.exit("ERROR: --lww-east-only is a probe on the bidirectional "
+                     "kernel and cannot be combined with --lww-layout 2d_seg2.")
         # Step 2c.2b.i bring-up cap: validate east-only layout at <=4 PE
         # first (queue budget S+3 <= 6 with barrier on Q0/Q1).
         if args.lww_layout == 'east' and num_cols > 4:
@@ -1483,7 +1586,7 @@ def main():
         # c_0..c_{S-1} are reused per segment as before. The only true
         # caps are S <= 4 (queue budget) and the host runner's memory
         # for very large graphs.
-    elif args.lww_layout in ('east', 'east_seg', '2d'):
+    elif args.lww_layout in ('east', 'east_seg', '2d', '2d_seg', '2d_multicast'):
         sys.exit(f"ERROR: --lww-layout {args.lww_layout} requires --routing pipelined-lww.")
 
     # HW-filter is blocked on WSE-3: interior PEs cannot both receive from
@@ -1615,6 +1718,8 @@ def main():
         pe_data = partition_graph(td['num_verts'], td['offsets'],
                                  td['adj'], num_cols, num_rows,
                                  mode=partition_mode)
+        if args.lww_layout == '2d_multicast':
+            compute_multicast_bitmaps(pe_data)
         td_max_lv = max(d['local_n'] for d in pe_data)
         td_max_le = max(len(d['local_adj']) for d in pe_data)
         td_max_bnd = max(len(d['boundary_local_idx']) for d in pe_data)
@@ -1840,6 +1945,8 @@ def main():
             # Partition and run with host-driven recursion
             pe_data = partition_graph(num_verts, offsets, adj, num_cols, num_rows,
                                       mode=partition_mode)
+            if args.lww_layout == '2d_multicast':
+                compute_multicast_bitmaps(pe_data)
 
             # Appliance mode: convert numpy types to plain Python for JSON
             if args.mode == 'appliance':
@@ -1960,10 +2067,24 @@ def main():
                         num_rows, num_verts, max_lv,
                         max_le, max_bnd,
                         max_list_size=max(max_list_size, cur_T),
-                        palette_size=cur_pal)
+                        palette_size=cur_pal,
+                        lww_layout=args.lww_layout)
                 if result_data is None:
                     print(f"  FAIL  Cerebras run returned no result at level {level}")
                     break
+
+                # CP2d.c diagnostics: dump 2d_seg2 per-PE diag counters if present.
+                _ppp = result_data.get('per_pe_perf') if isinstance(result_data, dict) else None
+                if _ppp:
+                    _diag_keys = [k for k in next(iter(_ppp.values())).keys() if k.startswith('diag_')]
+                    if _diag_keys:
+                        _diag_lines = []
+                        for _pe_key, _pe_vals in _ppp.items():
+                            _parts = ' '.join(f"{k.replace('diag_','')}={_pe_vals[k]}" for k in _diag_keys)
+                            _diag_lines.append(f"    {_pe_key} {_parts}")
+                        print("  diag_counters:")
+                        for _line in _diag_lines:
+                            print(_line)
 
                 colors_this_level = result_data['colors']
 

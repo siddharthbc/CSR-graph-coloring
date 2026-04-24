@@ -35,7 +35,8 @@ CS_FREQUENCY = 850_000_000
 
 def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
                  max_local_verts, max_local_edges, max_boundary,
-                 max_list_size=0, palette_size=3, cmaddr=None):
+                 max_list_size=0, palette_size=3, cmaddr=None,
+                 lww_layout='bidir'):
     """Load graph onto device, run coloring, read back results.
 
     Args:
@@ -43,6 +44,9 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
         palette_size: Runtime palette size for this test (must be <= compile-time max).
         cmaddr: IP:port of CS system. None = simulator mode.
                 On the appliance, SdkLauncher passes this via %CMADDR%.
+        lww_layout: kernel variant. '2d_multicast' triggers per-PE
+                upload of should_send_east / should_send_south bitmaps
+                (one i32 per local vertex, 0/1).
     """
     total_pes = num_cols * num_rows
 
@@ -72,6 +76,19 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
     sym_list_len = runner.get_id('list_len')
     sym_timer = runner.get_id('coloring_timer')
     sym_perf = runner.get_id('perf_counters')
+    # Optional: 2d_seg2 diagnostics array. Other kernels don't export it.
+    sym_diag = None
+    try:
+        sym_diag = runner.get_id('diag_counters')
+    except Exception:
+        sym_diag = None
+
+    # Multicast variant: per-local-vertex producer-side gates.
+    sym_should_send_east = None
+    sym_should_send_south = None
+    if lww_layout == '2d_multicast':
+        sym_should_send_east = runner.get_id('should_send_east')
+        sym_should_send_south = runner.get_id('should_send_south')
 
     runner.load()
     runner.run()
@@ -169,6 +186,29 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
                           data_type=MemcpyDataType.MEMCPY_32BIT,
                           nonblock=False)
 
+        # Multicast variant: producer-side gating bitmaps.
+        if sym_should_send_east is not None:
+            sse = np.zeros(max_local_verts, dtype=np.int32)
+            sss = np.zeros(max_local_verts, dtype=np.int32)
+            for i, v in enumerate(d.get('should_send_east', [])):
+                if i >= max_local_verts:
+                    break
+                sse[i] = v
+            for i, v in enumerate(d.get('should_send_south', [])):
+                if i >= max_local_verts:
+                    break
+                sss[i] = v
+            runner.memcpy_h2d(sym_should_send_east, sse, pe_col, pe_row, 1, 1,
+                              max_local_verts, streaming=False,
+                              order=MemcpyOrder.ROW_MAJOR,
+                              data_type=MemcpyDataType.MEMCPY_32BIT,
+                              nonblock=False)
+            runner.memcpy_h2d(sym_should_send_south, sss, pe_col, pe_row, 1, 1,
+                              max_local_verts, streaming=False,
+                              order=MemcpyOrder.ROW_MAJOR,
+                              data_type=MemcpyDataType.MEMCPY_32BIT,
+                              nonblock=False)
+
         # Expected recv counts: [data_recv, done_recv] merged into 2-element array
         etr = d.get('expected_data_recv', 0)
         edr = d.get('expected_done_recv', 0)
@@ -262,6 +302,26 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
                 perf_labels[i]: int(counters[i]) for i in range(NUM_PERF)
             }
 
+    # CP2d.c diagnostics (only present in 2d_seg2 kernel).
+    if sym_diag is not None:
+        NUM_DIAG = 8
+        diag_data = np.zeros(num_rows * num_cols * NUM_DIAG, dtype=np.int32)
+        runner.memcpy_d2h(diag_data, sym_diag, 0, 0, num_cols, num_rows,
+                          NUM_DIAG, streaming=False,
+                          data_type=MemcpyDataType.MEMCPY_32BIT,
+                          order=MemcpyOrder.ROW_MAJOR, nonblock=False)
+        diag_reshaped = diag_data.reshape((num_rows, num_cols, NUM_DIAG))
+        diag_labels = ["row_data_recv", "south_data_recv",
+                       "row_done_recv", "south_done_recv",
+                       "unmatched_gid", "row_done_next_residual",
+                       "south_done_next_residual", "rounds_done"]
+        for pe_row in range(num_rows):
+            for pe_col in range(num_cols):
+                d = diag_reshaped[pe_row, pe_col, :]
+                per_pe_perf[f"PE({pe_col},{pe_row})"].update({
+                    f"diag_{diag_labels[i]}": int(d[i]) for i in range(NUM_DIAG)
+                })
+
     runner.stop()
     return all_colors.tolist(), max_cycles, elapsed_ms, per_pe_cycles, per_pe_perf
 
@@ -282,6 +342,10 @@ def main():
                         help='Runtime palette size for this test')
     parser.add_argument('--cmaddr', type=str, default=None,
                         help='IP:port for CS system (None = simulator)')
+    parser.add_argument('--lww-layout', type=str, default='bidir',
+                        help='Pipelined-LWW kernel variant. Only consumed '
+                             'by host upload logic when value triggers extra '
+                             'symbols (currently 2d_multicast).')
     args = parser.parse_args()
 
     with open(args.graph_data, 'r') as f:
@@ -292,7 +356,8 @@ def main():
         args.num_verts, args.max_local_verts, args.max_local_edges,
         args.max_boundary, max_list_size=args.max_list_size,
         palette_size=args.palette_size,
-        cmaddr=args.cmaddr)
+        cmaddr=args.cmaddr,
+        lww_layout=args.lww_layout)
 
     # Output as JSON on stdout (the test runner parses this)
     print(json.dumps({

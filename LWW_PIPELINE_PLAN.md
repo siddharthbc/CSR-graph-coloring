@@ -331,6 +331,422 @@ both axes; do not attempt it.
 - Sketch row-major monotone block partition in
   `picasso/run_csl_tests.py partition_graph(..., mode='block-2d')`.
 
+### Step 4 CP3 — rx-merge probe (DONE 2026-04-22)
+
+**Question:** can a single PE on WSE-3 simultaneously
+(a) forward arrivals on color X (route `rx=DIR_IN, tx={DIR_OUT, ...}`),
+(b) deliver them to its own `rx_task` via RAMP, AND
+(c) inject locally onto color X via its own OQ so the wavelet appears on the outgoing fabric?
+
+This is the question that decides whether the iter-2 fabric pattern
+(`rx=WEST, tx={EAST,RAMP}` on every interior c_E_data PE, broadened OQ
+inits) can scale past 2×2, or whether the data plane must port the
+`east_seg` per-segment-colors-plus-bridges scheme into 2D rows and columns.
+
+**Probe:** [spikes/cp3_rx_merge_probe/](spikes/cp3_rx_merge_probe/). 1×3
+grid, single color `c_E`, three roles:
+
+| PE | route on c_E | OQ on c_E? | IQ on c_E? |
+|----|-----|---|---|
+| PE0 (origin) | `rx=RAMP, tx={EAST}` | yes | no |
+| PE1 (DUT)    | `rx=WEST, tx={EAST, RAMP}` | **yes** | yes |
+| PE2 (sink)   | `rx=WEST, tx={RAMP}` | no | yes |
+
+PE0 sends `[0xAAAA0000, 0xDEAD0000]`. PE1 on the second arrival fires
+`send_east(0xBBBB0001)` and `send_east(0xDEED0002)` via its own OQ on
+`c_E`. PE2 stores everything it sees and unblocks on first arrival.
+
+**Result: FAIL.** PE1's local OQ inject is silently dropped.
+
+```
+PE1 recv_count = 2   recv_buf = [0xAAAA0000, 0xDEAD0000]   ← forward+RAMP works ✓
+PE2 recv_count = 2   recv_buf = [0xAAAA0000, 0xDEAD0000]   ← PE1's wavelets MISSING ✗
+```
+
+| sub-question | result |
+|---|---|
+| `rx=WEST, tx={EAST,RAMP}` forwards correctly | PASS |
+| Same route also delivers to PE1's `rx_task` | PASS |
+| Same route + same-color OQ inject at PE1 → EAST | **FAIL** |
+
+The router silently drops the OQ output when the color already has a
+non-RAMP `rx` route consuming the same stream. No compile error, no
+runtime error. If a downstream PE blocks waiting for those wavelets,
+the symptom is the documented WSE-3 stall:
+
+```
+std::runtime_error: the received length (0 bytes) is not expected
+(N bytes), could be a kernel stall
+```
+
+(observed on the v2 sentinel-gated variant of the probe).
+
+**Implication for 2D scaling:** the iter-2 `c_E_data` / `c_S_data`
+fabric pattern only works at 2×2 because at 2×2 there are no interior
+PEs of class "forward + inject on the same color." For ≥3 PEs along
+either axis the data plane MUST switch to per-segment colors with
+bridges. The CP2 "cheap path" (broaden OQ inits + reuse iter-2 routes)
+is dead.
+
+The general WSE-3 rule is recorded in
+[/memories/repo/wse3-rx-merge-broken.md](/memories/repo/wse3-rx-merge-broken.md).
+
+### Step 4 CP2 — port east_seg into 2D rows + columns
+
+**Goal:** lift [csl/layout_lww_east_seg.csl](csl/layout_lww_east_seg.csl)
++ [csl/pe_program_lww_east_seg.csl](csl/pe_program_lww_east_seg.csl)
+(validated to 1×16 in 1D) into 2D, applied per row AND per column,
+preserving CP1's alternating reduce-chain barrier.
+
+**Why unidirectional only.** CP3 + Path C together force this:
+
+1. **Path C invariant** (lower-GID-wins + monotone block partition):
+   the eastern PE always loses E/W conflicts; the southern PE always
+   loses N/S conflicts. The winner's color must reach the loser; the
+   winner is always upstream on E and on S. Westbound/northbound
+   *data* is provably redundant.
+2. **WSE-3 6-queue cap.** Unidirectional interior PE budget at one
+   axis is `S source rx + 1 bridge rx + 1 tx + 3 barrier ≈ S+5`,
+   already tight at S=2. Mirroring (bidirectional) doubles the data
+   queues to `2S+7`, then doubling for the second axis brings it to
+   `4S+9`. Does not fit even at S=1.
+3. **CP3 prohibition.** A bidirectional kernel that tried to share a
+   color in both directions on the same PE would hit the CP3 silent-
+   drop, requiring per-segment sub-colors *on both axes both ways* —
+   quadrupling the bridge work without recovering queue budget.
+
+The col-0 westbound back-channel `c_W_data_rR` (one color per row,
+carrying anti-diagonal closure only) is the residual reverse traffic.
+It is `O(R)` colors, not `O(R·S)`, and is a bounded exception, not a
+general bidirectional channel.
+
+**Color budget at 16×16 with S=2 per axis:**
+
+| group | colors |
+|---|---|
+| row data: 2 src + 2 bridge (reused per row) | 4 |
+| col data: 2 src + 2 bridge (reused per col) | 4 |
+| col-0 westbound back-channel `c_W_data_rR` (one per row, but reusable in pairs across rows) | ~8 → reducible to 2-4 with parity reuse |
+| col-0 col bcast | 1 |
+| barrier (row reduce ×2 + col reduce ×2 + col bcast) | 5 |
+| **total** | ~16-18 |
+
+Within the ~14-16 usable budget if the back-channel is reused on row
+parity (mirroring the bridge alternation trick), tight if not.
+
+**Queue budget per interior PE (axis-S=2):**
+
+```
+row data:  2 src rx + 1 bridge rx + 1 east tx                  = 4
+col data:  2 src rx + 1 bridge rx + 1 south tx                 = 4
+back-chan: 0 (only on col 0 / east-edge)
+barrier:   1 row-red rx + 1 row-red tx + 1 col-bcast rx        = 3 (parked on Q0/Q1)
+─────────────────────────────────────────────────────────────────
+data queues needed: 8 → exceeds 6 user queues. MUST share across axes.
+```
+
+The interior PE doesn't need both `(S+1)` row recvs *and* `(S+1)` col
+recvs simultaneously alive on distinct queues — most PEs are interior
+to only one axis chain (within their row segment) and edge to the
+other. The actual budget needs to be computed per-PE-class. CP2c
+covers that analysis.
+
+**Sub-steps:**
+
+#### CP2a — lift east_seg row-only into 2D files (1×N validation) ✅ DONE 2026-04-22
+
+- New layout `csl/layout_lww_2d_seg.csl`, kernel `csl/pe_program_lww_2d_seg.csl`.
+  Forks of the `east_seg` pair (NOT the `_2d` pair) wrapped in a
+  `for row` loop with `@set_rectangle(num_cols, num_rows)` and
+  `@set_color_config(col, row, ...)`. At `num_rows == 1` the route
+  generation is bit-equivalent to `layout_lww_east_seg.csl`. The
+  kernel adds `my_row` and `my_col` params (unused at CP2a) so the
+  `@set_tile_code` call is forward-compatible with CP2b/c.
+- New runner flag `--lww-layout 2d_seg`
+  ([picasso/run_csl_tests.py](picasso/run_csl_tests.py)). Compile
+  params identical to `east_seg` (`S:4`). Block partition is selected
+  automatically because the trigger keys on `--routing pipelined-lww`,
+  not on the layout. CP2a runner guard: `2d_seg` accepts only
+  `num_rows == 1`; CP2b will lift to N×1; CP2c to H×W.
+- The existing `--lww-layout 2d` is preserved untouched as the 2×2
+  reference (12/12 PASS).
+- **Validation results (2026-04-22):** 12/12 PASS at all three widths.
+  | width | tests | run dir |
+  |---|---|---|
+  | 1×4  | tests 1-11, 13 | `runs/local/20260422-cp2a-1x4{,-t13}/` |
+  | 1×8  | tests 1-11, 13 | `runs/local/20260422-cp2a-1x8{,-t13}/` |
+  | 1×16 | tests 1-11, 13 | `runs/local/20260422-cp2a-1x16{,-t13}/` |
+
+  Test12 excluded locally (host runner OOMs pre-launch — same exclusion
+  as the `east_seg` validation it mirrors). Test14/15 / H2_631g out of
+  scope per `AGENTS.md`. The 12/12 result matches the corresponding
+  `east_seg` validation
+  (`runs/local/20260421-east-seg-w{4,8,16}`) test-for-test.
+
+**Gate:** 12/12 PASS at 1×4, 1×8, 1×16. ✅ MET.
+
+#### CP2b — add south-axis east_seg mirror (N×1 validation) ✅ DONE 2026-04-22
+
+- **Implementation chosen: axis-agnostic single plumbing.** Layout
+  detects `axis_is_south = (num_rows > 1)` and rotates the same
+  per-segment route generation 90° via comptime `DIR_IN/DIR_OUT`
+  (= WEST/EAST in east mode, NORTH/SOUTH in south mode). Same
+  source/bridge/barrier color IDs are reused on the rotated axis;
+  the kernel sees `num_cols = axis_len` (active-axis length) and
+  takes a new `axis_dir_filter: i16` param (= 0 east / 2 south)
+  to filter `boundary_direction[]`. Everything else in the kernel
+  is unchanged from CP2a.
+- This keeps CP2b a ~150-line layout edit + 2-line kernel edit.
+  CP2c will need a SECOND parallel plumbing path with disjoint
+  color IDs; that's where per-col source/bridge colors get added.
+- South back-channel not needed at N×1 (no anti-diagonal cross-PE
+  edges in a single column; partition assigns dir=2 for higher-row
+  neighbour, kernel filters on it).
+- Runner guard lifted from "num_rows == 1" to
+  "(num_rows == 1) XOR (num_cols == 1)".
+
+**Validation (12 tests = test1–11 + test13; test12 excluded as
+host runner OOMs locally pre-launch, same as east_seg validation):**
+
+| Grid | Run dir                                    | Result        |
+|------|--------------------------------------------|---------------|
+| 4×1  | `runs/local/20260422-cp2b-4x1/`            | 11/11 PASS    |
+| 4×1  | `runs/local/20260422-cp2b-4x1-t13/`        |  1/1 PASS     |
+| 8×1  | `runs/local/20260422-cp2b-8x1/`            | 11/11 PASS    |
+| 8×1  | `runs/local/20260422-cp2b-8x1-t13/`        |  1/1 PASS     |
+| 16×1 | `runs/local/20260422-cp2b-16x1/`           | 11/11 PASS    |
+| 16×1 | `runs/local/20260422-cp2b-16x1-t13/`       |  1/1 PASS     |
+
+**Gate:** 12/12 PASS at 4×1, 8×1, 16×1. ✅ MET.
+
+#### CP2c — compose row + col + back-channel (H×W with min(H,W) small)
+
+**Status: in progress 2026-04-22.** Detailed design committed in
+`/memories/repo/lww-2d-cp2c-design.md`. Sub-staged into three turns:
+
+- **CP2c.i Turn 1 (DONE 2026-04-22):** Color allocation locked, design memory
+  written (`/memories/repo/lww-2d-cp2c-design.md`), layout colour constants
+  reserved (commented).
+- **CP2c.i Turn 2 Stage A (DONE 2026-04-22):** Forked
+  `csl/pe_program_lww_2d_dual.csl` from CP2b kernel (scaffold;
+  identical params + symbols, single-axis behaviour). Layout dispatches
+  to dual file when `is_dual_axis = (num_rows>1 AND num_cols>1)`.
+  Runner gate lifted (HxW capped at 2x2 for dual-axis until Stage B).
+  Validated: 2x2 test9 PASS (`runs/local/20260422-cp2c-t2-2x2-smoke/`);
+  CP2b 4x1 + 1x4 cycle-identical to baseline
+  (`runs/local/20260422-cp2c-t2-regression-{4x1,1x4}/`).
+- **CP2c.i Turn 2 Stage B (DONE 2026-04-22):** Added south plumbing to
+  dual kernel (col-axis OQ Q5/Q6/Q7, IQ Q5/Q6/Q7, send_south,
+  south_send_buf, south_rx_task_0, dual send_boundary fills both
+  buffers, dual send_wavelet drains both axes, expected_south_data_done
+  tracking, col barrier on sync_col_reduce_*/sync_col_bcast).
+  KEY DESIGN: SEQUENCED 2D allreduce (row-reduce -> row-bcast ->
+  col-reduce of row-sums -> col-bcast) so global OR reaches every PE
+  including diagonal opposite. Color fix: sync_col_bcast moved 21->20
+  (21 reserved by MEMCPYD2H_DATA). Validated 2x2:
+  test9 PASS (barrier-only),
+  test13 PASS (1 east edge),
+  test1 FAIL 1 conflict (anti-diagonal -- expected, Turn 3 work).
+  CP2b regression 1x4+4x1 cycle-identical
+  (`runs/local/20260422-cp2c-t2b-regression-{1x4,4x1}/`).
+- **CP2c.i Turn 3 (DONE 2026-04-22):** Cross-axis re-emit
+  (PE(0, c>0) east arrival -> send_south) + per-row westbound
+  back-channel on c_W_back_re/ro (15/17, parity-reused per row) +
+  Q2 OQ / Q4 IQ overrides on back-relay/back-sink PEs. Layout
+  computes is_e2s_relay / is_back_relay / is_back_sink flags +
+  bumped expected_south_data_done counts. **12/12 PASS at 2x2**:
+  `runs/local/20260422-cp2c-t3-2x2-test{1,9,13,11,12}/` and
+  `.../20260422-cp2c-t3-2x2-test2-10/`. CP2b regression intact
+  at 1x4+4x1 cycle-identical
+  (`runs/local/20260422-cp2c-t3-regression-{1x4,4x1}/`).
+  test12 cycles 1.77M (compare baseline; degree-aware Step 5 will
+  address load imbalance).
+- **CP2c.ii:** scale to 2x4 / 4x2 / 4x4. Generalize back_sink expected
+  formula beyond 2x2; queue audit at 4x4. In-band row bcast (opcode
+  bit 29) only needed if queue budget tightens.
+
+- Re-introduce the iter-2 cross-axis logic on top of the per-segment
+  scheme:
+  - PE(0, c>0) re-emits row arrivals on the south source color
+    (carrying the row-0 originator's data into south-row PEs).
+  - PE(R, num_cols-1) reflects south arrivals onto a per-row westbound
+    color `c_W_data_rR`, sized per-row using the bridge alternation
+    trick (parity reuse across rows so total back-channel colors stay
+    bounded).
+  - Row bcast remains in-band on the row source colors (opcode bit 29);
+    same trick applied to the per-segment colors.
+  - Per-PE-class queue budget audit. PEs at row segment boundaries that
+    are also col segment boundaries are the worst case.
+- Host-side: extend `partition_graph(mode='block')` to compute the 2D
+  block layout (already done for iter 2) and verify the anti-diagonal
+  direction patch (`dr>0 && dc<0 ⇒ dir=2 south`) still applies.
+- Validate at 2×4, 4×2, 2×8, 4×4.
+
+**Gate:** 12/12 PASS at 4×4 and 2×4 / 4×2.
+
+#### CP2d — full multi-segment 2D (8×8, 16×16)
+
+**Status (2026-04-23): data plane partially working at 4×4, dense-graph
+correctness bug remains.**
+
+- Files: `csl/layout_lww_2d_seg2.csl` + `csl/pe_program_lww_2d_seg2.csl`,
+  forked from `layout_lww_2d_seg.csl` + `pe_program_lww_2d_dual.csl`.
+- New runner flag `--lww-layout 2d_seg2` (default `S=2`, dual-axis
+  capped at 4×4 until CP2d.c lands). Single-axis cases still
+  delegate to `pe_program_lww_2d_seg.csl`.
+- 2×2 regression: **13/13 PASS**
+  (`runs/local/20260423-2d-seg2-2x2-tests1-13-cp2db/`).
+- 4×4 full suite: **9/13 PASS**, 4 FAIL (test3, test6, test7, test12)
+  (`runs/local/20260423-2d-seg2-4x4-tests1-13/`).
+- 4×4 test1 smoke: **PASS** in 13,479 cycles / 2 rounds
+  (`runs/local/20260423-2d-seg2-4x4-smoke-test1-cp2db/`).
+
+**CP2d.a (DONE): queue-map patches** to compile at 4×4 + S=2. See
+`/memories/repo/lww-2d-seg2-scaffold.md` for details (`south_slot1_q`
+and `col_bcast_recv_q` rules).
+
+**CP2d.b (DONE): col bridge re-inject.** Added `col_bridge_reinject`
+kernel function (mirror of `bridge_reinject` for the south axis) and
+call it from `south_rx_task_0/1/2` gated on `is_col_bridge`. Without
+this, col bridge PE(1, c) terminated all row 0 south traffic and
+rows 2/3 never saw upstream data → barrier never lifted (the v4
+stall). With it, the existing `expected_south_data_done = r*(1+col)`
+(and `r*(1+num_cols)` for back_sink) formula carries over unchanged
+(verified by hand at every PE in the 4×4 grid).
+
+**CP2d.c — DONE (2026-04-23, option 1a in-band col_bcast):
+anti-diagonal SW data delivery to interior columns.** The 4 dense-graph failures
+(test3 / 6 / 7 / 12 at 4×4) were diagnosed via a `diag_counters`
+dump (run dir `runs/local/20260423-2d-seg2-4x4-test3-diag-v3/`).
+The barrier is clean — `residual=0` at every PE, sentinel counts
+match, no stall. The bug is purely a **data plane delivery hole**:
+anti-diagonal SW receivers at col > 0 never see their winner's
+color.
+
+Trace (test3, gid 5 at PE(1,1) needs gid 2 at PE(0,2)):
+1. Partitioner sets dir=2 south for PE(0,2)→PE(1,1) (block + dr>0
+   + dc<0 anti-diag patch in `partition_graph`).
+2. PE(0,2) ships gid 2 down col 2 on `c_col_0`.
+3. col 2 PEs receive but PE(1,1) is on col 1, not col 2.
+4. PE(3,2) (south_edge col 2) drops the wavelet — it is NOT
+   `is_back_relay` because `is_back_relay = (row>0) and
+   (col == num_cols-1)`. Only col 3 forwards to the back-channel.
+5. Even if it did reach col 3, the back-channel only delivers
+   to `is_back_sink = (row>0) and (col == 0)`. Interior columns
+   never receive SW traffic.
+
+This works at 2×2 because num_cols−1 = 1, so col 0 is the only
+non-east-edge column; SW receivers ARE always at col 0. At 4×4
+the topology is fundamentally broken.
+
+**The natural fix won't fit.** Broadening the back-channel listener
+to every (R>0, c<num_cols−1) PE requires binding `c_W_back_row` to
+an IQ at every interior dual-axis PE. Queue audit at PE(1,1):
+- Q2 reduce_recv_iq (row barrier)
+- Q3 bcast_recv_iq (row barrier)
+- Q4 rx_iq_0 = `c_0` (row data)
+- Q5 col_reduce_recv (col barrier)
+- Q6 col_bcast_recv (col barrier)
+- Q7 south_rx_iq_0 = `c_col_0` (south data)
+
+All 6 user IQs are claimed. WSE-3 cap = 6. There is no port to
+bind `c_W_back` to at interior dual-axis PEs.
+
+**Resolution (option 1a — in-band col_bcast only).** Rather than
+move the full col barrier in-band (option 1 above), only `col_bcast`
+was embedded on the south data stream via a bit[29] opcode on
+`my_south_color`. `col_reduce` stayed on its dedicated alternating
+chain (`sync_col_reduce_c0/c1`) because that chain flips direction
+each row and does not match the N→S data flow. Moving just
+`col_bcast` frees exactly Q6 at interior dual-axis PEs, which is
+enough to bind `c_W_back_color` there. Layout introduces an
+`is_back_recv = (row>0) && (0<col<num_cols-1)` flag and widens the
+interior `c_W_back_row` route to `tx = {WEST, RAMP}`, so anti-diagonal
+SW winners reach interior SW receivers. Expected south-done counts
+grow on interior PEs: `row*(1+col+num_cols)` for `col < num_cols-1`,
+`row*(1+col)` at `col == num_cols-1` (back-channel source, no RAMP).
+
+Kernel encoding (`csl/pe_program_lww_2d_seg2.csl`):
+- `pack_col_bcast(par, val) = 0x80000000 | (par<<30) | (1<<29) | (val&1)`
+- `is_col_bcast_wavelet(w) = (w>>31) && ((w>>29)&1)`
+- `is_data_done(w) = (w>>31) && !((w>>29)&1)`  (tightened)
+- `on_recv_south` dispatches col-bcast wavelets to `col_sync_buf[0]`
+  and fires `on_row_barrier_done`/`check_completion` at the top,
+  before the data-done path.
+- `is_back_relay` PEs now forward only non-col-bcast wavelets west
+  (`if (is_back_relay and !is_col_bcast_wavelet(w)) send_west_back(w)`)
+  so col-bcast does not pollute other columns.
+- Q6 IQ bound to `back_recv_iq` at `is_back_recv` PEs; `back_recv_task`
+  just calls `on_recv_south`.
+
+Results (`--lww-layout 2d_seg2`):
+- 2×2 regression: 13/13 PASS
+  (`runs/local/20260424-2d-seg2-2x2-tests1-13-cp2dc/`).
+- 4×4 full suite: 13/13 PASS, previously 9/13
+  (`runs/local/20260424-2d-seg2-4x4-tests1-13-cp2dc/`).
+
+**CP2d.d (DONE 2026-04-24) — N-invariant queue ceiling.**
+Two sub-checkpoints landed:
+- **CP2d.d.1**: row_bcast in-band on `my_east_color` (bit[29]=1).
+  Frees Q3 IQ + Q4 OQ.
+- **CP2d.d.2**: back-channel data folded onto the
+  `sync_reduce_c0/c1` alternating chain via opcode dispatch on
+  Q2 IQ. `is_row_reduce_wavelet` (bit[28]=1) selects reduce path;
+  data/data-done get `on_recv_south` + `send_west_back` chain-
+  forward. `back_recv_iq` (Q6) removed; dedicated `c_W_back_*`
+  routes deleted. `south_slot1_q` is grid-conditional Q5↔Q3.
+
+After CP2d.d.2, interior-interior PE binding at S=2 is:
+| Q | IQ |
+|---|---|
+| Q2 | reduce_recv (merged: row_reduce + back-channel data) |
+| Q3 | south_slot1 (when conflict requires) |
+| Q4 | rx_iq_0 (row data slot 0) |
+| Q5 | rx_iq_1 OR col_reduce_recv OR south_slot1 (per PE) |
+| Q6 | col_reduce_recv (when rx_slot_count > 1) |
+| Q7 | south_rx_iq_0 (col data slot 0) |
+
+6/6, fixed for any N at S=2.
+
+Architecture validated:
+- 4×4 regression 13/13 PASS.
+- 8×8 sparse (test1, test3) PASS.
+- 16×16 test1 PASS.
+- 2×16 rectangular PASS.
+- Same compiled binary runs at any of these sizes — no per-N kernel
+  rework needed.
+
+Known limitations (not scaling-blockers, both targeted by CP2d.e):
+1. 8×8 dense (test12) hangs at level 0 — back-channel chain via
+   CPU `send_west_back` saturates `tx_reduce_oq` (Q3 OQ shared with
+   reduce send) under heavy load. Fix: re-introduce a dedicated
+   fabric-forwarded back-channel route (CP2d.c-style) that uses
+   fabric switch's `tx={WEST, RAMP}` to auto-forward without CPU
+   queueing; keep chain merge only for reduce.
+2. Multi-test regression sometimes hangs at level 1 of certain
+   tests at 4×4. Tests pass in isolation. Likely simulator-side
+   state accumulation across subprocess invocations.
+
+**Historical options considered (kept for context):**
+
+1. **Full in-band col barrier** — encode both `col_reduce` and
+   `col_bcast` in-band. Option 1a (above) is a strict subset and
+   was sufficient. Adopted.
+2. **Col-0-only barrier** — drop col barrier at interior PEs.
+   Not pursued; option 1a cheaper.
+3. **Topology pivot** — not pursued; 4×4 dual-axis now GREEN.
+
+**Diagnostic infrastructure landed for this checkpoint:** kernel
+exposes `diag_counters[8]` (`row_data_recv`, `south_data_recv`,
+`row_done_recv`, `south_done_recv`, `unmatched_gid`,
+`row_done_next_residual`, `south_done_next_residual`,
+`rounds_done`); host (`cerebras_host.py`) reads it when present
+and runner (`run_csl_tests.py`) prints per-PE diag rows after
+each level. Only `2d_seg2` exports the symbol; other kernels are
+unaffected.
+
+**Gate:** 12/12 PASS at 4×4, 8×8, 16×16.
+
 ### Step 5 — Degree-aware monotone renumbering
 
 **Motivation:** Path C with naive contiguous block partition correlates

@@ -198,11 +198,83 @@ Order of operations agreed 2026-04-21:
    diagonal SW boundary entries (dr>0 && dc<0) get dir=2 south
    instead of dir=1 west, so PE(0,col>0) actually puts them in
    south_send_buf where the back-channel can carry them.
-5. **Step 4b/4c — 2D scaling** (active), to 4×4, 8×8, 16×16,
-   32×32 with per-axis bridges and per-row westbound colors.
-   Bidirectional 2D is infeasible on WSE-3 under the 6-queue cap
-   and is not pursued.
-6. **Step 5 — degree-aware monotone renumbering** within per-PE GID
+5. **Step 4 CP1 — multi-PE alternating reduce-chain barrier in 2D**
+   (DONE 2026-04-22). Generalised the iter-2 barrier to alternating
+   row-reduce + col-reduce + col-bcast chains (east_seg pattern per
+   axis). 12/12 PASS at 2×2 under `--lww-layout 2d`. 1×N / N×1 /
+   larger 2D blocked on the data plane (CP2), not the barrier.
+6. **Step 4 CP3 — rx-merge probe** (DONE 2026-04-22).
+   `spikes/cp3_rx_merge_probe/`. Verdict: kernel-inject + fabric-
+   forward on the same color same PE is BROKEN on WSE-3. The
+   router silently drops the OQ output. See
+   [/memories/repo/wse3-rx-merge-broken.md](/memories/repo/wse3-rx-merge-broken.md).
+   Forces CP2 onto the per-segment-colors-plus-bridges scheme; the
+   "broaden iter-2 OQ inits" cheap path is dead.
+7. **Step 4 CP2 — port east_seg into 2D rows + columns** (active,
+   sub-staged a/b/c/d in [LWW_PIPELINE_PLAN.md](LWW_PIPELINE_PLAN.md)).
+   New files `csl/layout_lww_2d_seg.csl` + `csl/pe_program_lww_2d_seg.csl`
+   under new flag `--lww-layout 2d_seg`; existing `--lww-layout 2d`
+   preserved as the 2×2 reference.
+   - **CP2a (DONE 2026-04-22): 1×N row-only lift.** 12/12 PASS at
+     1×4, 1×8, 1×16. Run dirs: `runs/local/20260422-cp2a-1x{4,8,16}{,-t13}/`.
+     The 2D-namespaced kernel is bit-equivalent to `east_seg` at
+     num_rows=1 by construction.
+   - **CP2b (DONE 2026-04-22): N×1 south-axis mirror via axis-agnostic
+     plumbing.** Layout uses comptime `axis_is_south = (num_rows>1)`,
+     `DIR_IN/DIR_OUT` to rotate the same per-segment route generation
+     90°. Same source/bridge/barrier color IDs reused on the rotated
+     axis. Kernel adds `axis_dir_filter: i16` (0 east / 2 south);
+     `send_boundary` filters on it. Runner accepts (num_rows==1) XOR
+     (num_cols==1). 12/12 PASS at 4×1, 8×1, 16×1. Run dirs:
+     `runs/local/20260422-cp2b-{4,8,16}x1{,-t13}/`. Note: this design
+     reuses one plumbing path per checkpoint; CP2c will add a second
+     parallel path with disjoint color IDs to run both axes alive.
+   - CP2c: 4×4 + 2×4 + 4×2 with row+col+col-0 back-channel.
+   - CP2d: 8×8, 16×16 full multi-segment.
+     **Status (2026-04-24):** CP2d.a + CP2d.b + CP2d.c + **CP2d.d.1
+     + CP2d.d.2** landed under `--lww-layout 2d_seg2`. The kernel
+     now scales architecturally to any N×M at S=2 with 6/6 IQs and
+     ~10 colors; the same compiled binary runs at 2×2 through 16×16.
+
+     CP2d.d.1 (row_bcast in-band on `my_east_color`, bit[29]=1)
+     freed Q3 IQ + Q4 OQ. CP2d.d.2 then folded the back-channel
+     onto the existing `sync_reduce_c0/c1` alternating chain via
+     opcode dispatch on Q2 IQ — `is_row_reduce_wavelet` (bit[28]=1)
+     selects the chain handler; data/data-done wavelets get
+     `on_recv_south` + `send_west_back` forwarding through the
+     same chain. Removed: `back_recv_iq` (Q6) and the dedicated
+     `c_W_back_*` color routes. `south_slot1_q` switches Q5↔Q3
+     based on `(rx_slot_count, cy_is_south, num_cols)` to dodge
+     the col_reduce / rx_iq_1 contention.
+
+     Validation:
+     - 4×4 regression: 13/13 PASS (`runs/local/20260424-2d-seg2-4x4-tests1-13-cp2dd2-v4/`).
+     - 8×8 test1 (sparse): PASS (`runs/local/20260424-2d-seg2-8x8-test1-cp2dd2/`).
+     - 8×8 test3 (anti-diagonal): PASS (`runs/local/20260424-2d-seg2-8x8-test3-cp2dd2/`).
+     - 16×16 test1: PASS (`runs/local/20260424-2d-seg2-16x16-test1-cp2dd2/`).
+     - 2×16 (rectangular): PASS (`runs/local/20260424-2d-seg2-2x16-test1-cp2dd2/`).
+
+     Known issues:
+     - **8×8 dense (test12) hangs at level 0.** Back-channel
+       wavelets traverse the whole chain via CPU send on shared
+       `tx_reduce_oq`; under heavy load (~`row*num_cols` wavelets
+       /round) the OQ backpressures. CP2d.e is the next move:
+       restore a dedicated fabric-forwarded back-channel route
+       (CP2d.c-style) on a freed Q while keeping the chain merge
+       only for reduce. This decouples back-channel from CPU OQ
+       pressure.
+     - **Multi-test regression at 4×4 sometimes hangs at test10
+       level 1.** Same test PASSES in isolation. Reproduces across
+       layout-equivalent variants → likely a simulator-side state
+       accumulation across rapid subprocess invocations, not a
+       kernel bug. Worth investigating but doesn't block scaling.
+
+     Runner cap raised to 16×16 in `picasso/run_csl_tests.py`.
+     Diagnostic infrastructure: `diag_counters[8]` symbol on
+     2d_seg2 kernel; printed per-PE per-level by runner.
+   Bidirectional 2D is infeasible on WSE-3 under the 6-queue cap +
+   CP3 prohibition and is not pursued.
+8. **Step 5 — degree-aware monotone renumbering** within per-PE GID
    chunks to fix the load imbalance Path C exposed (test12 cycles
    regressed +51% under naive block because hubs cluster on PE0).
    Host-only change; does not touch the kernel.

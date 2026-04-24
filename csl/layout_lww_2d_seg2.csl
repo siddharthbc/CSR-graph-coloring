@@ -1,0 +1,781 @@
+// Picasso Graph Coloring — Pipelined LWW transport, 2D segmented (Step 4 CP2d, S=2).
+//
+// FORK of layout_lww_2d_seg.csl, intended to scale dual-axis grids beyond 4x4.
+// Same plumbing topology as 2d_seg, but the runner passes S=2 (not S=4) so the
+// per-PE queue budget at interior bridges fits in 6 IQs at 4x4 / 8x8 / 16x16.
+// At S=2 each axis splits into ceil(N/2) segments with one bridge per segment
+// boundary; bridge colours alternate (c_be / c_bo per axis) for span-disjoint
+// reuse, so colour count stays bounded as N grows.
+//
+// Single-axis (1xN, Nx1) cases delegate to the existing 2d_seg kernel; only
+// the dual-axis branch dispatches to the new pe_program_lww_2d_seg2.csl.
+//
+// CP2a (1xN): exact lift of layout_lww_east_seg.csl into 2D namespace.
+// CP2b (1xN OR Nx1): axis-agnostic — when num_rows > 1 (and num_cols == 1)
+//   the same per-segment plumbing rotates 90° and runs on the south axis.
+//   Routes use DIR_IN/DIR_OUT (= WEST/EAST in east mode, NORTH/SOUTH in
+//   south mode). The kernel sees the active-axis length as `num_cols`,
+//   the active-axis origin/terminus as is_west_edge/is_east_edge, and a
+//   new `axis_dir_filter` (= 0 east / 2 south) for boundary partitioning.
+//   Runner enforces (num_rows == 1) XOR (num_cols == 1) at this checkpoint.
+// CP2c will compose row+col+back-channel; CP2d targets 8x8 / 16x16.
+//
+// Color map (S = 4 fixed for now):
+//   0..3  source colors c_0..c_3       (reused per segment)
+//   4,5   bridge colors c_be, c_bo     (alternated between consecutive
+//                                        bridges; reused once terminated
+//                                        at the next bridge — same way
+//                                        source colors are reused per
+//                                        segment, so num_cols is unbounded)
+//   8/9/10 dedicated barrier colors    (unchanged from east-only kernel)
+//
+// Queue budget per PE (interior seg-N, N>0, local_x = S-1 = 3):
+//   OQ2 tx_east + OQ3 tx_reduce             = 2 OQs
+//   IQ2 reduce_recv + IQ3 bcast_recv
+//     + IQ4..7 data slots (4 = bridge + 3 in-seg) = 6 IQs
+//   Fits the 6-user-queue WSE-3 cap exactly.
+
+param num_cols: i16;
+param num_rows: i16;                   // CP2a: must be 1 (runner-enforced)
+param max_local_verts: i16;
+param max_local_edges: i16;
+param max_boundary: i16;
+param max_palette_size: i16;
+param max_list_size: i16;
+param S: i16;                          // segment size (1..4)
+
+// Source colors c_0..c_3 (reused per segment).
+const c_0: color = @get_color(0);
+const c_1: color = @get_color(1);
+const c_2: color = @get_color(2);
+const c_3: color = @get_color(3);
+
+// Bridge colors: only 2 needed thanks to span-disjoint reuse. bridge_k
+// uses c_be when k is even, c_bo when k is odd. c_b{even} is alive only
+// from bridge_0 .. bridge_1 (then terminated), so bridge_2 can reuse it
+// safely; same for c_bo between bridge_1 .. bridge_2 vs bridge_3.
+const c_be: color = @get_color(4);
+const c_bo: color = @get_color(5);
+
+// Dedicated reduce-chain barrier colors.
+const sync_reduce_c0: color = @get_color(8);
+const sync_reduce_c1: color = @get_color(9);
+// CP2d.d.1: sync_bcast is still used by the single-axis branch
+// (pe_program_lww_2d_seg.csl). In the dual-axis branch row_bcast
+// rides in-band on my_east_color (bit[29] opcode).
+const sync_bcast:     color = @get_color(10);
+
+// ── CP2c colour reservations (active when is_dual_axis at runtime) ──
+// Col-axis source colors (parallel to row source 0-3). Used only when
+// num_rows>1 AND num_cols>1; see `is_dual_axis` below.
+const c_col_0: color = @get_color(11);
+const c_col_1: color = @get_color(12);
+const c_col_2: color = @get_color(13);
+const c_col_3: color = @get_color(14);
+// Col-axis bridge colors (parallel to row bridge 4-5). Unused at 2x2.
+const c_col_be: color = @get_color(6);
+const c_col_bo: color = @get_color(7);
+// Per-row westbound back-channel pair (parity reuse across rows).
+// Turn 3 (anti-diagonal cross-PE handling) at 2x2 uses _ro for row 1.
+const c_W_back_re: color = @get_color(15);
+const c_W_back_ro: color = @get_color(17);
+// Col-axis dedicated reduce-chain barrier colors.
+const sync_col_reduce_c0: color = @get_color(18);
+const sync_col_reduce_c1: color = @get_color(19);
+// CP2d.c (option 1a): sync_col_bcast is gone. Col-bcast rides in-band on
+// my_south_color via a bit[29] opcode (see pack_col_bcast in the kernel).
+// Color 20 is now free; keep reserved for a future dedicated use.
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width  = num_cols,
+  .height = num_rows,
+});
+
+fn source_color_of(j: i16) color {
+  if (j == 0) return c_0;
+  if (j == 1) return c_1;
+  if (j == 2) return c_2;
+  return c_3;
+}
+
+fn bridge_color_of(seg: i16) color {
+  // bridge_seg uses c_be if seg is even, c_bo if seg is odd. The previous
+  // bridge (seg-1) used the OPPOSITE color, which was terminated at
+  // bridge_seg, so reuse is safe across any number of segments.
+  if (seg % 2 == 0) return c_be;
+  return c_bo;
+}
+
+// CP2c dual-axis col helpers (parallel to source/bridge above).
+fn col_source_color_of(j: i16) color {
+  if (j == 0) return c_col_0;
+  if (j == 1) return c_col_1;
+  if (j == 2) return c_col_2;
+  return c_col_3;
+}
+
+fn col_bridge_color_of(seg: i16) color {
+  if (seg % 2 == 0) return c_col_be;
+  return c_col_bo;
+}
+
+layout {
+  @set_rectangle(num_cols, num_rows);
+
+  // CP2b axis selection: south axis is active iff num_rows > 1 (and we
+  // require num_cols == 1 at the runner for single-axis cases).
+  // CP2c (DUAL): when both num_rows>1 AND num_cols>1, dispatch to the
+  // dual-axis kernel `pe_program_lww_2d_dual.csl`. At Stage A this
+  // kernel is a SCAFFOLD ONLY (still single-axis behaviour); south
+  // plumbing arrives in Stage B / Turn 3. The single-axis routes
+  // generated below pick south (because num_rows>1 ⇒ axis_is_south).
+  const is_dual_axis: bool = (num_rows > 1) and (num_cols > 1);
+  const axis_is_south: bool = (num_rows > 1);
+  const axis_len: i16 = if (axis_is_south) num_rows else num_cols;
+  const axis_dir_filter: i16 = if (axis_is_south) 2 else 0;
+
+  // Number of segments (B = ceil(axis_len / S)).
+  const num_segs: i16 = (axis_len + S - 1) / S;
+
+  for (@range(i16, num_rows)) |row| {
+  for (@range(i16, num_cols)) |col| {
+  if (!is_dual_axis) {
+    const axis_pos: i16 = if (axis_is_south) row else col;
+    const is_axis_origin:   bool = (axis_pos == 0);
+    const is_axis_terminus: bool = (axis_pos == axis_len - 1);
+    // Kernel still uses these labels (origin = west/north, terminus = east/south).
+    const is_west_edge: bool = is_axis_origin;
+    const is_east_edge: bool = is_axis_terminus;
+    const mp = memcpy.get_params(col);
+
+    const seg_idx: i16 = axis_pos / S;
+    const local_x: i16 = axis_pos - seg_idx * S;
+    const is_bridge: bool = (seg_idx < num_segs - 1) and (local_x == S - 1);
+
+    // Own east-going color: bridge → its bridge color; else source[local_x].
+    const my_east_color: color =
+      if (is_bridge) bridge_color_of(seg_idx) else source_color_of(local_x);
+
+    // Slot mapping. Slot 0 is the cross-segment bridge (if seg_idx > 0),
+    // slots 1..local_upstream are in-seg source colors c_0..c_{local_upstream-1}.
+    // For bridge: in-seg upstream count = S-1 (rx c_0..c_{S-2}).
+    // For non-bridge: in-seg upstream count = local_x.
+    const local_upstream: i16 = if (is_bridge) (S - 1) else local_x;
+    const has_cross_bridge: bool = (seg_idx > 0);
+    const cross_bridge_color: color =
+      if (has_cross_bridge) bridge_color_of(seg_idx - 1) else c_0;
+    const slot_count: i16 = local_upstream + (if (has_cross_bridge) @as(i16, 1) else @as(i16, 0));
+
+    // Slot color assignments. The kernel's rx_task_X are bound to
+    // slot k iff k < slot_count. We pack the bridge slot first (slot 0)
+    // when present, then in-seg sources in ascending color order.
+    const slot0_color: color =
+      if (has_cross_bridge) cross_bridge_color
+      else if (local_upstream > 0) source_color_of(0)
+      else c_0;
+    const slot1_color: color =
+      if (has_cross_bridge and local_upstream > 0) source_color_of(0)
+      else if (!has_cross_bridge and local_upstream > 1) source_color_of(1)
+      else c_0;
+    const slot2_color: color =
+      if (has_cross_bridge and local_upstream > 1) source_color_of(1)
+      else if (!has_cross_bridge and local_upstream > 2) source_color_of(2)
+      else c_0;
+    const slot3_color: color =
+      if (has_cross_bridge and local_upstream > 2) source_color_of(2)
+      else if (!has_cross_bridge and local_upstream > 3) source_color_of(3)
+      else c_0;
+
+    // Expected count of data-done sentinels per round.
+    // = S*seg_idx (cross-bridge merged stream from earlier segments)
+    // + local_upstream (in-segment upstream sources)
+    const expected_data_done: i16 = S * seg_idx + local_upstream;
+
+    // CP2c dispatch: dual-axis grids use `pe_program_lww_2d_dual.csl`
+    // (currently scaffold; identical params + symbols to the
+    // single-axis kernel). Single-axis grids keep
+    // `pe_program_lww_2d_seg.csl`.
+    const tile_params = .{
+      .memcpy_params    = mp,
+      .pe_id            = row * num_cols + col,
+      .my_row           = row,
+      .my_col           = col,
+      // Kernel sees `num_cols` as the ACTIVE-axis length so all its
+      // existing `num_cols`-keyed logic (barrier short-circuit, expected
+      // counts, terminus checks) works unchanged when axis_is_south.
+      .num_cols         = axis_len,
+      .num_rows         = num_rows,
+      .axis_dir_filter  = axis_dir_filter,
+      .max_local_verts  = max_local_verts,
+      .max_local_edges  = max_local_edges,
+      .max_boundary     = max_boundary,
+      .max_palette_size = max_palette_size,
+      .max_list_size    = max_list_size,
+      .is_west_edge     = is_west_edge,
+      .is_east_edge     = is_east_edge,
+      .is_bridge        = is_bridge,
+      .my_east_color    = my_east_color,
+      .slot0_color      = slot0_color,
+      .slot1_color      = slot1_color,
+      .slot2_color      = slot2_color,
+      .slot3_color      = slot3_color,
+      .slot_count       = slot_count,
+      .expected_data_done_param = expected_data_done,
+      .sync_reduce_recv_color =
+        if (axis_pos % 2 == 0) sync_reduce_c0 else sync_reduce_c1,
+      .sync_reduce_send_color =
+        if (axis_pos % 2 == 0) sync_reduce_c1 else sync_reduce_c0,
+      .sync_bcast_color = sync_bcast,
+    };
+    if (is_dual_axis) {
+      @set_tile_code(col, row, "pe_program_lww_2d_seg2.csl", tile_params);
+    } else {
+      @set_tile_code(col, row, "pe_program_lww_2d_seg.csl", tile_params);
+    }
+
+    // ── Source color routes (c_0..c_{S-1} reused per segment) ──
+    // Axis-aware: in east mode DIR_IN=WEST, DIR_OUT=EAST; in south mode
+    // DIR_IN=NORTH, DIR_OUT=SOUTH. Segmentation indexes axis_pos (=col
+    // east, =row south); axis_len = num_cols (east) or num_rows (south).
+    var j: i16 = 0;
+    while (j < S) : (j += 1) {
+      const cj: color = source_color_of(j);
+      if (local_x == j and !is_bridge) {
+        // Injector (non-bridge owns its source color).
+        if (is_axis_terminus or local_x == S - 1) {
+          // Last PE of last segment AND happens to be local source. No
+          // downstream neighbor → no route (kernel won't transmit).
+        } else if (axis_is_south) {
+          @set_color_config(col, row, cj, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ SOUTH } },
+          });
+        } else {
+          @set_color_config(col, row, cj, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+          });
+        }
+      } else if (local_x > j) {
+        // Downstream in same segment.
+        if (is_bridge) {
+          if (axis_is_south) {
+            @set_color_config(col, row, cj, .{
+              .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } },
+            });
+          } else {
+            @set_color_config(col, row, cj, .{
+              .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+            });
+          }
+        } else if (is_axis_terminus) {
+          if (axis_is_south) {
+            @set_color_config(col, row, cj, .{
+              .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } },
+            });
+          } else {
+            @set_color_config(col, row, cj, .{
+              .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+            });
+          }
+        } else {
+          if (axis_is_south) {
+            @set_color_config(col, row, cj, .{
+              .routes = .{ .rx = .{ NORTH }, .tx = .{ SOUTH, RAMP } },
+            });
+          } else {
+            @set_color_config(col, row, cj, .{
+              .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } },
+            });
+          }
+        }
+      }
+    }
+
+    // ── Bridge color routes (c_b0..c_b{B-2}) ──
+    var k: i16 = 0;
+    while (k < num_segs - 1) : (k += 1) {
+      const ck: color = bridge_color_of(k);
+      const inj_pe: i16 = (k + 1) * S - 1;       // bridge_k position on axis
+      const sink_pe: i16 =
+        if (k + 2 < num_segs) (k + 2) * S - 1
+        else axis_len - 1;
+      if (axis_pos == inj_pe) {
+        if (axis_is_south) {
+          @set_color_config(col, row, ck, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ SOUTH } },
+          });
+        } else {
+          @set_color_config(col, row, ck, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+          });
+        }
+      } else if (axis_pos > inj_pe and axis_pos <= sink_pe) {
+        if (axis_pos == sink_pe) {
+          if (axis_is_south) {
+            @set_color_config(col, row, ck, .{
+              .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } },
+            });
+          } else {
+            @set_color_config(col, row, ck, .{
+              .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+            });
+          }
+        } else {
+          if (axis_is_south) {
+            @set_color_config(col, row, ck, .{
+              .routes = .{ .rx = .{ NORTH }, .tx = .{ SOUTH, RAMP } },
+            });
+          } else {
+            @set_color_config(col, row, ck, .{
+              .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } },
+            });
+          }
+        }
+      }
+    }
+
+    // ── Dedicated reduce-chain + axis-bound broadcast barrier routes ──
+    // Reduce: terminus → origin (E→W or S→N).
+    // Bcast:  origin → terminus (W→E or N→S).
+    const is_px_even: bool = (axis_pos % 2 == 0);
+    if (is_west_edge and is_east_edge) {
+      @set_color_config(col, row, sync_bcast,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{RAMP} } });
+    } else if (is_east_edge) {
+      // axis terminus: send reduce upstream, recv bcast from upstream
+      if (axis_is_south) {
+        @set_color_config(col, row,
+          if (is_px_even) sync_reduce_c1 else sync_reduce_c0,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+        @set_color_config(col, row, sync_bcast,
+          .{ .routes = .{ .rx = .{NORTH}, .tx = .{RAMP} } });
+      } else {
+        @set_color_config(col, row,
+          if (is_px_even) sync_reduce_c1 else sync_reduce_c0,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+        @set_color_config(col, row, sync_bcast,
+          .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+      }
+    } else if (is_west_edge) {
+      // axis origin: recv reduce from downstream, send bcast downstream
+      if (axis_is_south) {
+        @set_color_config(col, row,
+          if (is_px_even) sync_reduce_c0 else sync_reduce_c1,
+          .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+        @set_color_config(col, row, sync_bcast,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{SOUTH} } });
+      } else {
+        @set_color_config(col, row,
+          if (is_px_even) sync_reduce_c0 else sync_reduce_c1,
+          .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+        @set_color_config(col, row, sync_bcast,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+      }
+    } else {
+      // interior on axis
+      if (axis_is_south) {
+        @set_color_config(col, row,
+          if (is_px_even) sync_reduce_c0 else sync_reduce_c1,
+          .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+        @set_color_config(col, row,
+          if (is_px_even) sync_reduce_c1 else sync_reduce_c0,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+        @set_color_config(col, row, sync_bcast,
+          .{ .routes = .{ .rx = .{NORTH}, .tx = .{SOUTH, RAMP} } });
+      } else {
+        @set_color_config(col, row,
+          if (is_px_even) sync_reduce_c0 else sync_reduce_c1,
+          .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+        @set_color_config(col, row,
+          if (is_px_even) sync_reduce_c1 else sync_reduce_c0,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+        @set_color_config(col, row, sync_bcast,
+          .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST, RAMP} } });
+      }
+    }
+  } else {
+    // ============================================================
+    // CP2c dual-axis branch (num_rows>1 AND num_cols>1).
+    // Generates row-axis routes (existing east_seg pattern on row
+    // colors 0-5) AND col-axis routes (mirror on col colors 6, 7,
+    // 11-14) AND row barrier (8/9/10) AND col barrier (18/19/21).
+    // Stage B target: 2x2 only. Larger HxW deferred to CP2c.ii.
+    // ============================================================
+    const mp = memcpy.get_params(col);
+
+    // ── Row-axis per-PE state ──
+    const rx_axis_pos:  i16 = col;
+    const rx_axis_len:  i16 = num_cols;
+    const rx_num_segs:  i16 = (rx_axis_len + S - 1) / S;
+    const rx_seg_idx:   i16 = rx_axis_pos / S;
+    const rx_local_x:   i16 = rx_axis_pos - rx_seg_idx * S;
+    const rx_is_bridge: bool = (rx_seg_idx < rx_num_segs - 1) and (rx_local_x == S - 1);
+    const rx_is_west:   bool = (rx_axis_pos == 0);
+    const rx_is_east:   bool = (rx_axis_pos == rx_axis_len - 1);
+    const rx_my_color:  color =
+      if (rx_is_bridge) bridge_color_of(rx_seg_idx) else source_color_of(rx_local_x);
+    const rx_local_upstream: i16 = if (rx_is_bridge) (S - 1) else rx_local_x;
+    const rx_has_cross_bridge: bool = (rx_seg_idx > 0);
+    const rx_slot_count: i16 = rx_local_upstream + (if (rx_has_cross_bridge) @as(i16, 1) else @as(i16, 0));
+    const rx_cross_bridge_color: color =
+      if (rx_has_cross_bridge) bridge_color_of(rx_seg_idx - 1) else c_0;
+    const rx_slot0: color =
+      if (rx_has_cross_bridge) rx_cross_bridge_color
+      else if (rx_local_upstream > 0) source_color_of(0)
+      else c_0;
+    const rx_slot1: color =
+      if (rx_has_cross_bridge and rx_local_upstream > 0) source_color_of(0)
+      else if (!rx_has_cross_bridge and rx_local_upstream > 1) source_color_of(1)
+      else c_0;
+    const rx_slot2: color =
+      if (rx_has_cross_bridge and rx_local_upstream > 1) source_color_of(1)
+      else if (!rx_has_cross_bridge and rx_local_upstream > 2) source_color_of(2)
+      else c_0;
+    const rx_slot3: color =
+      if (rx_has_cross_bridge and rx_local_upstream > 2) source_color_of(2)
+      else if (!rx_has_cross_bridge and rx_local_upstream > 3) source_color_of(3)
+      else c_0;
+    const rx_expected_data_done: i16 = S * rx_seg_idx + rx_local_upstream;
+
+    // ── Col-axis per-PE state (mirror) ──
+    const cy_axis_pos:  i16 = row;
+    const cy_axis_len:  i16 = num_rows;
+    const cy_num_segs:  i16 = (cy_axis_len + S - 1) / S;
+    const cy_seg_idx:   i16 = cy_axis_pos / S;
+    const cy_local_x:   i16 = cy_axis_pos - cy_seg_idx * S;
+    const cy_is_bridge: bool = (cy_seg_idx < cy_num_segs - 1) and (cy_local_x == S - 1);
+    const cy_is_north:  bool = (cy_axis_pos == 0);
+    const cy_is_south:  bool = (cy_axis_pos == cy_axis_len - 1);
+    const cy_my_color:  color =
+      if (cy_is_bridge) col_bridge_color_of(cy_seg_idx) else col_source_color_of(cy_local_x);
+    const cy_local_upstream: i16 = if (cy_is_bridge) (S - 1) else cy_local_x;
+    const cy_has_cross_bridge: bool = (cy_seg_idx > 0);
+    const cy_slot_count: i16 = cy_local_upstream + (if (cy_has_cross_bridge) @as(i16, 1) else @as(i16, 0));
+    const cy_cross_bridge_color: color =
+      if (cy_has_cross_bridge) col_bridge_color_of(cy_seg_idx - 1) else c_col_0;
+    const cy_slot0: color =
+      if (cy_has_cross_bridge) cy_cross_bridge_color
+      else if (cy_local_upstream > 0) col_source_color_of(0)
+      else c_col_0;
+    const cy_slot1: color =
+      if (cy_has_cross_bridge and cy_local_upstream > 0) col_source_color_of(0)
+      else if (!cy_has_cross_bridge and cy_local_upstream > 1) col_source_color_of(1)
+      else c_col_0;
+    const cy_slot2: color =
+      if (cy_has_cross_bridge and cy_local_upstream > 1) col_source_color_of(1)
+      else if (!cy_has_cross_bridge and cy_local_upstream > 2) col_source_color_of(2)
+      else c_col_0;
+    const cy_slot3: color =
+      if (cy_has_cross_bridge and cy_local_upstream > 2) col_source_color_of(2)
+      else if (!cy_has_cross_bridge and cy_local_upstream > 3) col_source_color_of(3)
+      else c_col_0;
+    const cy_expected_data_done: i16 = S * cy_seg_idx + cy_local_upstream;
+
+    // ── CP2c.ii: generalized anti-diagonal cross-PE relays ──
+    // is_e2s_relay: PE(R, c>0) re-emits east arrivals south (NOT just
+    //   row 0 anymore). Kernel gates the actual send on !is_south_edge.
+    // is_back_relay: PE(R>0, last col) forwards south arrivals west on
+    //   per-row back-channel.
+    // is_back_sink: PE(R>0, 0) receives back-channel.
+    const is_e2s_relay:  bool = (col > 0);
+    const is_back_relay: bool = (row > 0) and (col == num_cols - 1);
+    const is_back_sink:  bool = (row > 0) and (col == 0);
+    // CP2d.c (option 1a): interior cols (0 < col < num_cols - 1) in
+    // rows > 0 now tap the per-row back-channel via RAMP so anti-diagonal
+    // SW winners reach interior SW receivers. Q6 IQ binds c_W_back_color
+    // at these PEs (freed because col_bcast is now in-band on my_south_color).
+    const is_back_recv:  bool = (row > 0) and (col > 0) and (col < num_cols - 1);
+    const c_W_back_row: color =
+      if (row % 2 == 0) c_W_back_re else c_W_back_ro;
+
+    // Generalized expected south sentinels per PE.
+    //   row 0: 0 (no upstream).
+    //   col == num_cols - 1 (back-channel source, no recv): R * (1 + col).
+    //   col < num_cols - 1, row > 0: R * (1 + col + num_cols)
+    //     = existing own-south R * (1 + col)                   (for col > 0)
+    //     + back-channel arrivals R * num_cols                 (forwards
+    //       every PE(R, last)'s south arrival west; its south arrivals
+    //       count R * (1 + (num_cols - 1)) = R * num_cols).
+    //   col == 0 reduces to R * (1 + num_cols) (same as prior sink case).
+    const cy_expected_data_done_t3: i16 =
+      if (row == 0) @as(i16, 0)
+      else if (col == num_cols - 1) row * (1 + col)
+      else row * (1 + col + num_cols);
+    const rx_expected_data_done_t3: i16 = rx_expected_data_done;
+
+    // Per-PE south rx queue index assignment for slots 1 and 2.
+    // Goal: fit the south_slot1 IQ binding without colliding with
+    // reduce_recv (Q2), col_reduce_recv (Q5 or Q6), or rx_iq_1 (Q5).
+    // - col == 0 / west-edge: Q3 (free; bcast_recv removed in CP2d.d.1).
+    // - col == num_cols-1 / east-edge: Q2 (free; reduce_recv binding
+    //   skipped at east-edge per `is_west_edge or !is_east_edge`).
+    // - interior, rx_slot_count <= 1, south_edge: Q5 (col_reduce_recv
+    //   skipped at south_edge so Q5 is free). 4x4 row 3 case.
+    // - interior, rx_slot_count <= 1, non-south-edge: Q3 (col_reduce
+    //   on Q5; Q3 free). 8x8 rows 3/5 interior even-col case.
+    // - interior, rx_slot_count > 1: Q3 (Q5 occupied by rx_iq_1; Q3
+    //   free). 8x8 rows 3/5/7 interior odd-col bridge case.
+    // south_slot1_q chosen to avoid conflict with the queue actually
+    // bound at this PE's other roles. Only matters when south_slot1
+    // is REALLY bound (south_slot_count > 1) — at other PEs the
+    // const exists but @initialize_queue is gated off, however the
+    // const value still influences task-id / IQ allocation. We
+    // therefore choose conservatively even for unused cases.
+    //   col=0 / west-edge: Q3 (free; bcast removed in CP2d.d.1).
+    //   col=last / east-edge: Q2 (free; reduce_recv skipped at east).
+    //   interior, south_slot_count > 1, NOT cy_is_south: Q3
+    //     (col_reduce_recv occupies Q5; needs Q3). 8x8+ rows 3/5/7
+    //     interior cols.
+    //   else (interior, south_slot_count <= 1 OR cy_is_south): Q5
+    //     (col_reduce_recv unbound at south_edge OR south_slot1
+    //     unused so binding is inert).
+    // south_slot1_q tuned per grid size to avoid Q conflicts:
+    //  - 4x4 (num_cols<=4): exactly the v4-stable mapping
+    //    (rx_slot_count<=1 -> Q5, else Q3). Verified 13/13 PASS.
+    //  - 8x8+ (num_cols>4): col_reduce_recv at non-south_edge interior
+    //    rx_slot_count<=1 PEs occupies Q5, so south_slot1 must use Q3
+    //    there; rx_slot_count>1 keeps Q3.
+    //   Q5 only chosen when both safe: south_edge AND rx_slot_count<=1.
+    const south_slot1_q: u16 =
+      if (col == 0) @as(u16, 3)
+      else if (col == num_cols - 1) @as(u16, 2)
+      else if (num_cols <= 4 and rx_slot_count <= 1) @as(u16, 5)
+      else if (rx_slot_count <= 1 and cy_is_south) @as(u16, 5)
+      else @as(u16, 3);
+    const south_slot2_q: u16 = @as(u16, 5);
+
+    // CP2c.ii Stage 2: per-PE col-axis recv queue indices.
+    // 2d_seg2 / 4x4 S=2 update: at east_edge (col=num_cols-1)
+    // rx_slot_count is 2 (rx_local_x=1, has cross_bridge), so
+    // col_reduce_recv lands on Q6 (the > 1 branch). CP2d.c (option 1a)
+    // removes the dedicated col_bcast IQ entirely: col_bcast now rides
+    // in-band on my_south_color (tx_south_oq) so no separate IQ is
+    // needed. Q6 IQ is free and is repurposed for back_recv_iq at
+    // interior back-channel receivers (is_back_recv == true).
+    const col_reduce_recv_q: u16 =
+      if (rx_slot_count > 2) @as(u16, 2)
+      else if (rx_slot_count > 1) @as(u16, 6)
+      else @as(u16, 5);
+
+    // ── Tile code: dual kernel (seg2 fork) ──
+    @set_tile_code(col, row, "pe_program_lww_2d_seg2.csl", .{
+      .memcpy_params    = mp,
+      .pe_id            = row * num_cols + col,
+      .my_row           = row,
+      .my_col           = col,
+      .num_cols         = num_cols,
+      .num_rows         = num_rows,
+      .axis_dir_filter  = 0,             // unused at dual; kernel filters dir==0 east AND dir==2 south
+      .max_local_verts  = max_local_verts,
+      .max_local_edges  = max_local_edges,
+      .max_boundary     = max_boundary,
+      .max_palette_size = max_palette_size,
+      .max_list_size    = max_list_size,
+      .is_west_edge     = rx_is_west,
+      .is_east_edge     = rx_is_east,
+      .is_bridge        = rx_is_bridge,
+      .my_east_color    = rx_my_color,
+      .slot0_color      = rx_slot0,
+      .slot1_color      = rx_slot1,
+      .slot2_color      = rx_slot2,
+      .slot3_color      = rx_slot3,
+      .slot_count       = rx_slot_count,
+      .expected_data_done_param = rx_expected_data_done_t3,
+      .sync_reduce_recv_color =
+        if (rx_axis_pos % 2 == 0) sync_reduce_c0 else sync_reduce_c1,
+      .sync_reduce_send_color =
+        if (rx_axis_pos % 2 == 0) sync_reduce_c1 else sync_reduce_c0,
+      // CP2d.d.1: sync_bcast_color removed. Row bcast is in-band on
+      // my_east_color (bit[29] opcode).
+      // Dual-axis additions:
+      .is_dual_axis     = true,
+      .is_north_edge    = cy_is_north,
+      .is_south_edge    = cy_is_south,
+      .is_col_bridge    = cy_is_bridge,
+      .my_south_color   = cy_my_color,
+      .south_slot0_color = cy_slot0,
+      .south_slot1_color = cy_slot1,
+      .south_slot2_color = cy_slot2,
+      .south_slot3_color = cy_slot3,
+      .south_slot_count = cy_slot_count,
+      .expected_south_data_done_param = cy_expected_data_done_t3,
+      .sync_col_reduce_recv_color =
+        if (cy_axis_pos % 2 == 0) sync_col_reduce_c0 else sync_col_reduce_c1,
+      .sync_col_reduce_send_color =
+        if (cy_axis_pos % 2 == 0) sync_col_reduce_c1 else sync_col_reduce_c0,
+      // CP2d.c (option 1a): sync_col_bcast_color removed. col_bcast
+      // rides in-band on my_south_color via tx_south_oq (bit[29] opcode).
+      // Turn 3 / CP2d.c anti-diagonal relays.
+      .is_e2s_relay  = is_e2s_relay,
+      .is_back_relay = is_back_relay,
+      .is_back_sink  = is_back_sink,
+      .is_back_recv  = is_back_recv,
+      .c_W_back_color = c_W_back_row,
+      .south_slot1_q = south_slot1_q,
+      .south_slot2_q = south_slot2_q,
+      .col_reduce_recv_q = col_reduce_recv_q,
+    });
+
+    // ── Row-axis source color routes (WEST/EAST on c_0..c_3) ──
+    var rj: i16 = 0;
+    while (rj < S) : (rj += 1) {
+      const cj: color = source_color_of(rj);
+      if (rx_local_x == rj and !rx_is_bridge) {
+        if (rx_is_east or rx_local_x == S - 1) {
+          // no downstream
+        } else {
+          @set_color_config(col, row, cj,
+            .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } } });
+        }
+      } else if (rx_local_x > rj) {
+        if (rx_is_bridge or rx_is_east) {
+          @set_color_config(col, row, cj,
+            .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } } });
+        } else {
+          @set_color_config(col, row, cj,
+            .{ .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } } });
+        }
+      }
+    }
+
+    // ── Row-axis bridge color routes ──
+    var rk: i16 = 0;
+    while (rk < rx_num_segs - 1) : (rk += 1) {
+      const ck: color = bridge_color_of(rk);
+      const inj_pe:  i16 = (rk + 1) * S - 1;
+      const sink_pe: i16 = if (rk + 2 < rx_num_segs) (rk + 2) * S - 1 else rx_axis_len - 1;
+      if (rx_axis_pos == inj_pe) {
+        @set_color_config(col, row, ck,
+          .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } } });
+      } else if (rx_axis_pos > inj_pe and rx_axis_pos <= sink_pe) {
+        if (rx_axis_pos == sink_pe) {
+          @set_color_config(col, row, ck,
+            .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } } });
+        } else {
+          @set_color_config(col, row, ck,
+            .{ .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } } });
+        }
+      }
+    }
+
+    // ── Col-axis source color routes (NORTH/SOUTH on c_col_0..c_col_3) ──
+    var cj_: i16 = 0;
+    while (cj_ < S) : (cj_ += 1) {
+      const cc: color = col_source_color_of(cj_);
+      if (cy_local_x == cj_ and !cy_is_bridge) {
+        if (cy_is_south or cy_local_x == S - 1) {
+          // no downstream
+        } else {
+          @set_color_config(col, row, cc,
+            .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ SOUTH } } });
+        }
+      } else if (cy_local_x > cj_) {
+        if (cy_is_bridge or cy_is_south) {
+          @set_color_config(col, row, cc,
+            .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+        } else {
+          @set_color_config(col, row, cc,
+            .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ SOUTH, RAMP } } });
+        }
+      }
+    }
+
+    // ── Col-axis bridge color routes ──
+    var ck_: i16 = 0;
+    while (ck_ < cy_num_segs - 1) : (ck_ += 1) {
+      const cb: color = col_bridge_color_of(ck_);
+      const cinj:  i16 = (ck_ + 1) * S - 1;
+      const csink: i16 = if (ck_ + 2 < cy_num_segs) (ck_ + 2) * S - 1 else cy_axis_len - 1;
+      if (cy_axis_pos == cinj) {
+        @set_color_config(col, row, cb,
+          .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ SOUTH } } });
+      } else if (cy_axis_pos > cinj and cy_axis_pos <= csink) {
+        if (cy_axis_pos == csink) {
+          @set_color_config(col, row, cb,
+            .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+        } else {
+          @set_color_config(col, row, cb,
+            .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ SOUTH, RAMP } } });
+        }
+      }
+    }
+
+    // ── Row barrier routes (WEST/EAST on sync_reduce_* only) ──
+    // CP2d.d.1: sync_bcast is gone. Row bcast rides in-band on
+    // my_east_color (bit[29] opcode), so it inherits the row data
+    // routes established above. Only the reduce chain still needs
+    // dedicated routes here.
+    const rx_px_even: bool = (rx_axis_pos % 2 == 0);
+    if (rx_is_west and rx_is_east) {
+      // single-col row: no reduce chain needed
+    } else if (rx_is_east) {
+      @set_color_config(col, row,
+        if (rx_px_even) sync_reduce_c1 else sync_reduce_c0,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+    } else if (rx_is_west) {
+      @set_color_config(col, row,
+        if (rx_px_even) sync_reduce_c0 else sync_reduce_c1,
+        .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+    } else {
+      @set_color_config(col, row,
+        if (rx_px_even) sync_reduce_c0 else sync_reduce_c1,
+        .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+      @set_color_config(col, row,
+        if (rx_px_even) sync_reduce_c1 else sync_reduce_c0,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+    }
+
+    // ── Col barrier routes (NORTH/SOUTH on sync_col_reduce_* only) ──
+    // CP2d.c (option 1a): sync_col_bcast no longer exists as a fabric
+    // color. The col-bcast sync bit is embedded in the south data
+    // stream (my_south_color) via the bit[29] opcode, so it inherits
+    // the south data routes set up above. Only the reduce chain still
+    // needs dedicated routes here.
+    const cy_px_even: bool = (cy_axis_pos % 2 == 0);
+    if (cy_is_north and cy_is_south) {
+      // single row: no col reduce needed
+    } else if (cy_is_south) {
+      @set_color_config(col, row,
+        if (cy_px_even) sync_col_reduce_c1 else sync_col_reduce_c0,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+    } else if (cy_is_north) {
+      @set_color_config(col, row,
+        if (cy_px_even) sync_col_reduce_c0 else sync_col_reduce_c1,
+        .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+    } else {
+      @set_color_config(col, row,
+        if (cy_px_even) sync_col_reduce_c0 else sync_col_reduce_c1,
+        .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+      @set_color_config(col, row,
+        if (cy_px_even) sync_col_reduce_c1 else sync_col_reduce_c0,
+        .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+    }
+    // ── CP2d.d.2 (final): drop dedicated c_W_back_row routes.
+    // Back-channel data now rides the alternating sync_reduce_c0/c1
+    // chain (same east->west path, shared IQ via opcode dispatch on
+    // reduce_recv_iq). This removes the Q6 back_recv_iq that
+    // conflicted with col_reduce_recv at interior-bridge PEs. See
+    // kernel reduce_recv_task for dispatcher. c_W_back_re/ro are no
+    // longer bound to any PE.
+  }  // end if (is_dual_axis) else
+  }  // end for col
+  }  // end for row
+
+  // Host ↔ device exports (same set as east-only kernel).
+  @export_name("csr_offsets",            [*]i32, true);
+  @export_name("csr_adj",                [*]i32, true);
+  @export_name("colors",                 [*]i32, true);
+  @export_name("local_num_verts",        [*]i32, true);
+  @export_name("global_vertex_ids",      [*]i32, true);
+  @export_name("boundary_local_idx",     [*]i32, true);
+  @export_name("boundary_neighbor_gid",  [*]i32, true);
+  @export_name("boundary_direction",     [*]i32, true);
+  @export_name("runtime_config",         [*]i32, true);
+  @export_name("num_boundary",           [*]i32, true);
+  @export_name("expected_recv",          [*]i32, true);
+  @export_name("coloring_timer",         [*]f32, true);
+  @export_name("perf_counters",          [*]i32, true);
+  @export_name("diag_counters",          [*]i32, true);
+  @export_name("color_list",             [*]i32, true);
+  @export_name("list_len",               [*]i32, true);
+  @export_name("start_coloring", fn()void);
+}

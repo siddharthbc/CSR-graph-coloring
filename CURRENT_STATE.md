@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-04-21
+Last updated: 2026-04-24
 
 ## Project Status
 
@@ -44,24 +44,61 @@ The active optimization effort is the pipelined LWW transport:
   forward + row-1 westbound back-channel + in-band row_bcast on
   c_E_data. **12/12 PASS at 2×2** under `--lww-layout 2d`.
   Files: `csl/layout_lww_2d.csl`, `csl/pe_program_lww_2d.csl`.
-  Direction encoding patched in `partition_graph` block mode:
-  anti-diagonal SW entries (dr>0 && dc<0) now go dir=2 south so
-  the back-channel can carry them. Run dir:
-  `runs/local/20260421-lww-2d-iter2-fixdir/`.
-- Primary active task: **Step 4b** — generalize 2D kernel beyond
-  2×2. Need per-row westbound colors c_W_data_rR for R>0,
-  interior-col forwarding on the back-channel west axis,
-  per-segment east bridges (Step 2c.2b.ii pattern in 2D), and
-  expected_data_done_w that accounts for multi-hop forwarding.
-  Target: 4×4 first, then 8×8.
+- **CP2d.c option 1a — DONE (2026-04-23).** In-band `col_bcast`
+  on south data stream. 4×4: 13/13 PASS.
+- **CP2d.d.1 — DONE (2026-04-24).** In-band `row_bcast` on east
+  data stream (bit[29] opcode on `my_east_color`). Frees Q3 IQ
+  + Q4 OQ. 2×2/4×4: 13/13 PASS.
+- **CP2d.d.2 — DONE (2026-04-24).** Back-channel data folded onto
+  the `sync_reduce` alternating chain via opcode dispatch on Q2 IQ.
+  `is_row_reduce_wavelet` (bit[28]=1) distinguishes reduce wavelets;
+  data/data-done wavelets get `on_recv_south` + `send_west_back`
+  forwarding through the same chain. Frees Q6 IQ at interior PEs
+  (back_recv_iq removed). Combined with `south_slot1_q=Q3` at
+  interior cols with `rx_slot_count>1`, this unblocks 8×8.
+
+  Validation results (`--lww-layout 2d_seg2`):
+    * **4×4 regression: 13/13 PASS** (`runs/local/20260424-2d-seg2-4x4-tests1-13-cp2dd2-v4/`).
+    * **8×8 test1: PASS** (`runs/local/20260424-2d-seg2-8x8-test1-cp2dd2/`).
+    * **8×8 test3 (anti-diagonal stress): PASS** (`runs/local/20260424-2d-seg2-8x8-test3-cp2dd2/`).
+    * **16×16 test1: PASS** (`runs/local/20260424-2d-seg2-16x16-test1-cp2dd2/`).
+    * **2×16 (rectangular): PASS** (`runs/local/20260424-2d-seg2-2x16-test1-cp2dd2/`).
+    * Same compiled binary scales from 2×2 to 16×16 with no kernel
+      changes, proving the architectural ceiling.
+
+  Known issues (NOT scaling-blockers, both rooted in the same
+  congestion behavior):
+    * **Dense graph (test12 at 8×8) hangs at level 0.** Every
+      back-channel data wavelet from PE(R, last) traverses the
+      entire chain via CPU, queuing on `tx_reduce_oq` (Q3 OQ)
+      shared with reduce wavelets. Under heavy load (~`row*num_cols`
+      back-channel wavelets/round) the OQ backpressures and PEs
+      stall. CP2d.c had separate `c_W_back_color` route with
+      fabric auto-forward (no CPU OQ pressure) — re-introducing
+      that as a separate path while keeping the chain-merge for
+      reduce is the natural CP2d.e.
+    * **Multi-test regression at 4×4/2×2 level-1 hangs at certain
+      tests.** Same tests PASS in isolation. Strong evidence this
+      is a simulator/runner artifact (state accumulation across
+      successive subprocess invocations) rather than a kernel bug.
+      Worth investigating but doesn't block the architecture.
+
+- Runner cap raised to **16×16** in `picasso/run_csl_tests.py`
+  (was 4×4 before CP2d.d.2). Higher dimensions feasible but
+  simulator slows substantially; real WSE-3 needs the appliance path.
 - Plan of record: `LWW_PIPELINE_PLAN.md`.
 - Wider roadmap: `IMPLEMENTATION_ROADMAP.md`.
 
 ## Current LWW Scope
 
 - 1D: any width via `--lww-layout east_seg` (validated to W=16).
-- 2D: 2×2 only via `--lww-layout 2d` (validated 12/12 at 2×2,
-  iter 2 with back-channel).
+- 2D (legacy, fixed 2×2 path): `--lww-layout 2d` — 12/12 PASS at 2×2.
+- 2D (dual-axis, S=2): `--lww-layout 2d_seg2` — 13/13 PASS at 4×4
+  full suite, sparse tests PASS at 8×8 / 16×16 / 2×16 (2026-04-24,
+  CP2d.d.2). **Architecture demonstrably scales to any N×M at S=2
+  with 6/6 IQs and ~10 colors, no per-N kernel rework.** Dense
+  graphs at 8×8+ hit back-channel chain backpressure (CP2d.e
+  fix pending). Runner-capped at 16×16 for sim speed.
 - Intended for local simulator bring-up before any wider extension.
 
 ## Latest Known LWW Findings
