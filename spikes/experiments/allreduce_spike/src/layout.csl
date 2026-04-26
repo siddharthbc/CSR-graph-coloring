@@ -1,0 +1,55 @@
+// Minimal allreduce-only layout for spike benchmarking.
+// Goal: measure cycles/call for <allreduce>.allreduce(1, &x, MAX) on a width×height grid.
+
+param C0_ID: i16;  // the one routable color reserved for allreduce
+
+param width: i16;
+param height: i16;
+
+const C0: color = @get_color(C0_ID);
+
+// 4 entrypoints required by the allreduce library
+const EN_REDUCE_1: local_task_id = @get_local_task_id(17);
+const EN_REDUCE_2: local_task_id = @get_local_task_id(18);
+const EN_REDUCE_3: local_task_id = @get_local_task_id(19);
+const EN_REDUCE_4: local_task_id = @get_local_task_id(20);
+
+const reduce = @import_module("allreduce/layout.csl", .{
+    .colors = [1]color{C0},
+    .entrypoints = [4]local_task_id{EN_REDUCE_1, EN_REDUCE_2, EN_REDUCE_3, EN_REDUCE_4},
+    .width = width,
+    .height = height,
+});
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width = width,
+    .height = height,
+});
+
+layout {
+    @set_rectangle(width, height);
+
+    var py: i16 = 0;
+    while (py < height) : (py += 1) {
+        var px: i16 = 0;
+        while (px < width) : (px += 1) {
+            const memcpyParams = memcpy.get_params(px);
+            const reduceParams = reduce.get_params(px, py);
+            const params: comptime_struct = .{
+                .memcpyParams = memcpyParams,
+                .reduceParams = reduceParams,
+            };
+            @set_tile_code(px, py, "kernel.csl", params);
+        }
+    }
+
+    @export_name("flag",        [*]f32, true);
+    @export_name("time_buf",    [*]u16, true);
+    @export_name("time_ref",    [*]u16, true);
+
+    @export_name("f_enable_timer",         fn()void);
+    @export_name("f_memcpy_timestamps",    fn()void);
+    @export_name("f_reference_timestamps", fn()void);
+    @export_name("f_allreduce_once",       fn()void);
+    @export_name("f_allreduce_loop",       fn(i16)void);
+}

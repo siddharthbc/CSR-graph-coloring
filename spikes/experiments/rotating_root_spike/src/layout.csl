@@ -1,0 +1,60 @@
+// Rotating-root broadcast spike — simplified to measure wire-speed
+// single-source broadcast latency (no actual rotation).
+//
+// Why simplified: compile-time switch positions can only override ONE of
+// (.rx, .tx) with a SINGLE direction per position (verified empirically —
+// lists and two-field overrides produce compile errors). That constraint
+// makes compile-time rotating-root impossible when phases need
+// direction-flipping or multi-direction forwarding.
+//
+// What this still measures: PE0 injects one data wavelet on BCAST; the
+// fabric broadcasts east at wire speed (rx=WEST, tx={EAST,RAMP} on every
+// non-source PE, courtesy of a multi-direction tx in .routes which IS
+// allowed). PE_{last} records the arrival cycle. Compared against the
+// current SW relay cost (~20 cyc/hop × hops), this gives the per-phase
+// ceiling any rotating-root scheme could achieve.
+
+param BCAST_ID: i16;
+param WIDTH:    i16;
+
+const BCAST: color = @get_color(BCAST_ID);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width  = WIDTH,
+    .height = 1,
+});
+
+layout {
+    @set_rectangle(WIDTH, 1);
+
+    const last: i16 = WIDTH - 1;
+
+    var px: i16 = 0;
+    while (px < WIDTH) : (px += 1) {
+        const mp = memcpy.get_params(px);
+
+        @set_tile_code(px, 0, "kernel.csl", .{
+            .memcpy_params = mp,
+            .pe_id         = px,
+            .num_pes       = WIDTH,
+            .bcast_color   = BCAST,
+        });
+
+        // Base route: east-source broadcast. No switch positions.
+        //   PE0     : .rx = RAMP,      .tx = EAST
+        //   mid PE  : .rx = WEST,      .tx = { EAST, RAMP }
+        //   last PE : .rx = WEST,      .tx = RAMP
+        const r = if (px == 0)
+            .{ .rx = .{ RAMP }, .tx = .{ EAST } }
+        else if (px == last)
+            .{ .rx = .{ WEST }, .tx = .{ RAMP } }
+        else
+            .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } };
+
+        @set_color_config(px, 0, BCAST, .{ .routes = r });
+    }
+
+    @export_name("time_buf", [*]u16, true);
+    @export_name("status",   [*]u32, true);
+    @export_name("start",    fn()void);
+}

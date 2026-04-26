@@ -1,0 +1,351 @@
+// Pipeline static-root 2D — per-PE kernel with ON-DEVICE list-greedy coloring.
+//
+// Roles by position:
+//   PE(0,0): COLORER + SOURCE.
+//     1. Runs single-level Picasso-style list-greedy coloring in CSL:
+//        each vertex gets a random list of `list_size` colors drawn from
+//        the first `palette_size` integers; greedy first-fit in GID order.
+//        Vertices whose list is exhausted fall back to a host-style greedy
+//        pass (smallest unused color among colored neighbors).
+//     2. Streams finalized (gid, color) tuples onto C_E and C_S.
+//        Final wavelet is SENTINEL (bit 31 = 1).
+//   PE(0, y>0): ROW-WEST. Receives on C_S, records, re-injects on C_E.
+//   PE(x>0, *): INTERIOR. Receives on C_E; router auto-forwards east.
+//
+// NOTE: single-level only for now. Multi-level recursion stays on the
+// host-side path (or is a future kernel extension).
+//
+// Wavelet encoding (u32):
+//   bit 31     = sentinel flag
+//   bits 30:16 = gid (15 bits)
+//   bits 15: 0 = color (16 bits)
+
+param memcpy_params: comptime_struct;
+param pe_x:      i16;
+param pe_y:      i16;
+param width:     i16;
+param height:    i16;
+param c_e:       color;
+param c_s:       color;
+param MAX_V:     i32;
+param MAX_E:     i32;
+param MAX_LIST:  i16;  // max per-vertex list length
+param SEED:      i32;  // PRNG seed (xorshift32, runtime-mutable)
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+
+const tx_e_oq: output_queue = @get_output_queue(2);
+const rx_e_iq: input_queue  = @get_input_queue(2);
+const tx_s_oq: output_queue = @get_output_queue(3);
+const rx_s_iq: input_queue  = @get_input_queue(3);
+
+const recv_e_tid: data_task_id =
+    if (@is_arch("wse3")) @get_data_task_id(rx_e_iq)
+    else                  @get_data_task_id(c_e);
+const recv_s_tid: data_task_id =
+    if (@is_arch("wse3")) @get_data_task_id(rx_s_iq)
+    else                  @get_data_task_id(c_s);
+
+const done_task_id:      local_task_id = @get_local_task_id(15);
+const emit_next_task_id: local_task_id = @get_local_task_id(14);
+
+// ---- host-visible state --------------------------------------------------
+
+var num_v = @zeros([1]i32);
+var num_e = @zeros([1]i32);
+var offsets   = @zeros([MAX_V + 1]i32);
+var adj       = @zeros([MAX_E]i32);
+var palette_size = @zeros([1]i32);   // host-provided initial palette size
+var list_size    = @zeros([1]i32);   // host-provided list size
+var final_col = @zeros([MAX_V]i32);  // device-computed colors (for readback)
+var recv_gid  = @zeros([MAX_V]i32);
+var recv_col  = @zeros([MAX_V]i32);
+var recv_cnt  = @zeros([1]i32);
+var status    = @zeros([8]u32);
+var tsc_start = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end   = @zeros([timestamp.tsc_size_words]u16);
+var time_buf  = @zeros([timestamp.tsc_size_words * 2]u16);
+
+var num_v_ptr:        [*]i32 = &num_v;
+var num_e_ptr:        [*]i32 = &num_e;
+var offsets_ptr:      [*]i32 = &offsets;
+var adj_ptr:          [*]i32 = &adj;
+var palette_size_ptr: [*]i32 = &palette_size;
+var list_size_ptr:    [*]i32 = &list_size;
+var final_col_ptr:    [*]i32 = &final_col;
+var recv_gid_ptr:     [*]i32 = &recv_gid;
+var recv_col_ptr:     [*]i32 = &recv_col;
+var recv_cnt_ptr:     [*]i32 = &recv_cnt;
+var status_ptr:       [*]u32 = &status;
+var time_buf_ptr:     [*]u16 = &time_buf;
+
+// ---- coloring working state (meaningful only on PE(0,0)) -----------------
+
+var color_lists = @zeros([MAX_V * 16]i32);  // upper bound: MAX_LIST <= 16
+var list_len    = @zeros([MAX_V]i16);
+var tentative   = @zeros([MAX_V]i32);       // -1 uncolored, -2 invalid, >=0 final
+var rng_state: u32 = 1;
+
+// ---- emit state ----------------------------------------------------------
+
+var emit_idx: i32 = 0;
+var data_buf = @zeros([1]u32);
+
+const tx_e_dsd = @get_dsd(fabout_dsd, .{
+    .extent = 1, .fabric_color = c_e, .output_queue = tx_e_oq,
+});
+const tx_s_dsd = @get_dsd(fabout_dsd, .{
+    .extent = 1, .fabric_color = c_s, .output_queue = tx_s_oq,
+});
+const src_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> data_buf[i] });
+
+// ---- role predicates -----------------------------------------------------
+
+const is_source:   bool = (pe_x == 0) and (pe_y == 0);
+const is_col0:     bool = (pe_x == 0);
+const is_row_src:  bool = (pe_x == 0) and (pe_y > 0);
+const recv_from_e: bool = (pe_x > 0);
+
+// ---- encoding helpers ----------------------------------------------------
+
+const SENTINEL: u32 = 0x80000000;
+
+fn pack_tuple(gid: i32, col: i32) u32 {
+    const g: u32 = @as(u32, @as(i16, gid)) & @as(u32, 0x7FFF);
+    const c: u32 = @as(u32, @as(i16, col)) & @as(u32, 0xFFFF);
+    return (g << @as(u16, 16)) | c;
+}
+
+fn unpack_gid(w: u32) i32 {
+    return @as(i32, @as(i16, @as(u16, (w >> @as(u16, 16)) & @as(u32, 0x7FFF))));
+}
+
+fn unpack_col(w: u32) i32 {
+    return @as(i32, @as(i16, @as(u16, w & @as(u32, 0xFFFF))));
+}
+
+fn is_sentinel(w: u32) bool {
+    return (w & SENTINEL) != @as(u32, 0);
+}
+
+// ---- PRNG (xorshift32) ---------------------------------------------------
+
+fn xorshift32() u32 {
+    var x = rng_state;
+    x ^= x << @as(u16, 13);
+    x ^= x >> @as(u16, 17);
+    x ^= x << @as(u16,  5);
+    rng_state = x;
+    return x;
+}
+
+fn rand_bounded(bound: u32) u32 {
+    return xorshift32() % bound;
+}
+
+// ---- coloring primitives (run on PE(0,0)) --------------------------------
+
+fn color_used_by_neighbor(v: i32, c: i32) bool {
+    const nb_begin = offsets[v];
+    const nb_end   = offsets[v + 1];
+    var i: i32 = nb_begin;
+    while (i < nb_end) : (i += 1) {
+        const u = adj[i];
+        if (tentative[u] == c) return true;
+    }
+    return false;
+}
+
+fn gen_list(v: i32, pal: i32, len: i16) void {
+    const base: i32 = v * @as(i32, MAX_LIST);
+    var i: i16 = 0;
+    while (i < len) : (i += 1) {
+        const r = rand_bounded(@as(u32, pal));
+        color_lists[base + @as(i32, i)] = @as(i32, @as(i16, r));
+    }
+    list_len[v] = len;
+}
+
+fn attempt_color(v: i32) bool {
+    const base: i32 = v * @as(i32, MAX_LIST);
+    const len = list_len[v];
+    var i: i16 = 0;
+    while (i < len) : (i += 1) {
+        const c = color_lists[base + @as(i32, i)];
+        if (!color_used_by_neighbor(v, c)) {
+            tentative[v] = c;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn greedy_assign(v: i32) void {
+    // First-fit: smallest non-negative color not used by any colored neighbor.
+    var c: i32 = 0;
+    while (true) : (c += 1) {
+        if (!color_used_by_neighbor(v, c)) {
+            tentative[v] = c;
+            return;
+        }
+    }
+}
+
+fn run_coloring() void {
+    const n = num_v[0];
+    const pal = palette_size[0];
+    const lsz = @as(i16, list_size[0]);
+
+    // Seed + clear
+    rng_state = @as(u32, @as(i16, SEED));
+    if (rng_state == @as(u32, 0)) {
+        rng_state = @as(u32, 1);
+    }
+    var v: i32 = 0;
+    while (v < n) : (v += 1) {
+        tentative[v] = -1;
+    }
+
+    // Per-vertex random lists, then list-greedy in GID order.
+    v = 0;
+    while (v < n) : (v += 1) {
+        gen_list(v, pal, lsz);
+    }
+    v = 0;
+    while (v < n) : (v += 1) {
+        if (!attempt_color(v)) {
+            tentative[v] = -2;
+        }
+    }
+
+    // Fallback greedy for anything still invalid.
+    v = 0;
+    while (v < n) : (v += 1) {
+        if (tentative[v] == -2) {
+            greedy_assign(v);
+        }
+    }
+
+    // Publish.
+    v = 0;
+    while (v < n) : (v += 1) {
+        final_col[v] = tentative[v];
+    }
+}
+
+// ---- recv + emit helpers -------------------------------------------------
+
+fn record_tuple(w: u32) void {
+    if (is_sentinel(w)) {
+        timestamp.get_timestamp(&tsc_end);
+        time_buf[0] = tsc_start[0];
+        time_buf[1] = tsc_start[1];
+        time_buf[2] = tsc_start[2];
+        time_buf[3] = tsc_end[0];
+        time_buf[4] = tsc_end[1];
+        time_buf[5] = tsc_end[2];
+        status[7] = 0xDEADBEEF;
+        sys_mod.unblock_cmd_stream();
+        return;
+    }
+    const idx = recv_cnt[0];
+    if (idx < MAX_V) {
+        recv_gid[idx] = unpack_gid(w);
+        recv_col[idx] = unpack_col(w);
+        recv_cnt[0] = idx + 1;
+    }
+}
+
+fn inject_one(w: u32) void {
+    data_buf[0] = w;
+    @mov32(tx_s_dsd, src_dsd);
+    @mov32(tx_e_dsd, src_dsd);
+}
+
+task emit_next_task() void {
+    const n = num_v[0];
+    if (emit_idx < n) {
+        const w = pack_tuple(emit_idx, final_col[emit_idx]);
+        emit_idx += 1;
+        inject_one(w);
+        @activate(emit_next_task_id);
+    } else {
+        inject_one(SENTINEL);
+        timestamp.get_timestamp(&tsc_end);
+        time_buf[0] = tsc_start[0];
+        time_buf[1] = tsc_start[1];
+        time_buf[2] = tsc_start[2];
+        time_buf[3] = tsc_end[0];
+        time_buf[4] = tsc_end[1];
+        time_buf[5] = tsc_end[2];
+        status[7] = 0xDEADBEEF;
+        sys_mod.unblock_cmd_stream();
+    }
+}
+
+task recv_e_task(w: u32) void {
+    record_tuple(w);
+}
+
+task recv_s_task(w: u32) void {
+    record_tuple(w);
+    data_buf[0] = w;
+    @mov32(tx_e_dsd, src_dsd);
+}
+
+task done_task() void {
+    status[7] = 0xDEADBEEF;
+    sys_mod.unblock_cmd_stream();
+}
+
+fn start() void {
+    timestamp.enable_tsc();
+    timestamp.get_timestamp(&tsc_start);
+    if (is_source) {
+        run_coloring();
+        emit_idx = 0;
+        status[0] = 1;
+        @activate(emit_next_task_id);
+    }
+}
+
+comptime {
+    if (recv_from_e) {
+        @bind_data_task(recv_e_task, recv_e_tid);
+    }
+    if (is_row_src) {
+        @bind_data_task(recv_s_task, recv_s_tid);
+    }
+    @bind_local_task(done_task,      done_task_id);
+    @bind_local_task(emit_next_task, emit_next_task_id);
+
+    if (@is_arch("wse3")) {
+        if (recv_from_e) {
+            @initialize_queue(rx_e_iq, .{ .color = c_e });
+        }
+        if (is_col0) {
+            @initialize_queue(tx_e_oq, .{ .color = c_e });
+        }
+        if (is_source) {
+            @initialize_queue(tx_s_oq, .{ .color = c_s });
+        }
+        if (is_row_src) {
+            @initialize_queue(rx_s_iq, .{ .color = c_s });
+        }
+    }
+
+    @export_symbol(num_v_ptr,        "num_v");
+    @export_symbol(num_e_ptr,        "num_e");
+    @export_symbol(offsets_ptr,      "offsets");
+    @export_symbol(adj_ptr,          "adj");
+    @export_symbol(palette_size_ptr, "palette_size");
+    @export_symbol(list_size_ptr,    "list_size");
+    @export_symbol(final_col_ptr,    "final_col");
+    @export_symbol(recv_gid_ptr,     "recv_gid");
+    @export_symbol(recv_col_ptr,     "recv_col");
+    @export_symbol(recv_cnt_ptr,     "recv_cnt");
+    @export_symbol(status_ptr,       "status");
+    @export_symbol(time_buf_ptr,     "time_buf");
+    @export_symbol(start);
+}

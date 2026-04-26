@@ -1,0 +1,184 @@
+// 1D pipelined LWW kernel.
+//
+// Each PE k injects one wavelet on its own color C_k = C_BASE + k with
+// payload:
+//
+//   payload = (src_pe << 24) | gid
+//
+// Each PE consumes wavelets on every upstream color C_j (j < k) and
+// keeps max_payload = max over received payloads. Expected result per PE:
+//
+//   PE 0 : recv_cnt = 0, max_payload = 0 (never receives anything)
+//   PE k : recv_cnt = k, max_payload = ((k-1) << 24) | gid(k-1)
+//
+// Hardware hygiene:
+//   - Separate input queue per upstream color (avoids cross-contamination).
+//   - DSD .priority: forward DSDs are not used (hardware routes them); the
+//     injection DSD is marked low-priority so an inject cannot preempt
+//     in-flight forwards.
+//   - WSE-3 queue binding via @initialize_queue.
+
+param memcpy_params: comptime_struct;
+param pe_x:   i16;
+param width:  i16;
+param c_base: i16;
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+
+// ---------------------------------------------------------------------------
+// Per-upstream-color queue arrays (indexed by source PE j = 0..width-1).
+// At compile time we only touch j < pe_x for receive, and j == pe_x for tx.
+// We allocate WIDTH slots but only bind the ones we actually use.
+// ---------------------------------------------------------------------------
+
+const MAX_W: i16 = 16;  // compile-time cap; must be >= WIDTH.
+
+// Output queue for this PE's own-color injection.
+const tx_oq: output_queue = @get_output_queue(2);
+
+// Input queues 3..(3+MAX_W-1) map to upstream colors j=0..MAX_W-1.
+// Using distinct queue ids avoids cross-color aliasing.
+const rx_iq_0:  input_queue = @get_input_queue(3);
+const rx_iq_1:  input_queue = @get_input_queue(4);
+const rx_iq_2:  input_queue = @get_input_queue(5);
+const rx_iq_3:  input_queue = @get_input_queue(6);
+const rx_iq_4:  input_queue = @get_input_queue(7);
+// Queue IDs above 7 are the hardware ceiling probe for WSE-3. Expect
+// compile failures past the supported queue count — we want to discover
+// the exact limit empirically here rather than assume.
+// const rx_iq_5:  input_queue = @get_input_queue(8);
+// const rx_iq_6:  input_queue = @get_input_queue(9);
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+var recv_cnt_arr   = @zeros([1]u32);
+var max_payload_arr= @zeros([1]u32);
+var status         = @zeros([8]u32);
+var tsc_start      = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end        = @zeros([timestamp.tsc_size_words]u16);
+var time_buf       = @zeros([timestamp.tsc_size_words * 2]u16);
+var data_buf       = @zeros([1]u32);
+
+var recv_cnt_ptr:    [*]u32 = &recv_cnt_arr;
+var max_payload_ptr: [*]u32 = &max_payload_arr;
+var status_ptr:      [*]u32 = &status;
+var time_buf_ptr:    [*]u16 = &time_buf;
+
+const done_task_id: local_task_id = @get_local_task_id(15);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn own_color() color {
+    return @get_color(c_base + pe_x);
+}
+
+fn emit_time_buf() void {
+    time_buf[0] = tsc_start[0];
+    time_buf[1] = tsc_start[1];
+    time_buf[2] = tsc_start[2];
+    time_buf[3] = tsc_end[0];
+    time_buf[4] = tsc_end[1];
+    time_buf[5] = tsc_end[2];
+    status[7] = 0xDEADBEEF;
+    sys_mod.unblock_cmd_stream();
+}
+
+fn on_recv(w: u32) void {
+    timestamp.get_timestamp(&tsc_end);
+    recv_cnt_arr[0] += 1;
+    if (w > max_payload_arr[0]) {
+        max_payload_arr[0] = w;
+    }
+    status[1] = recv_cnt_arr[0];
+    status[3] = max_payload_arr[0];
+    // PE k expects exactly k recvs. Fire done once we've seen them all.
+    if (recv_cnt_arr[0] == @as(u32, @as(u16, pe_x))) {
+        @activate(done_task_id);
+    }
+}
+
+// One data task per upstream color. Each uses a dedicated input queue
+// whose data_task_id is bound at comptime (WSE-3 derives from queue).
+
+task recv_task_0(w: u32) void { on_recv(w); }
+task recv_task_1(w: u32) void { on_recv(w); }
+task recv_task_2(w: u32) void { on_recv(w); }
+task recv_task_3(w: u32) void { on_recv(w); }
+task recv_task_4(w: u32) void { on_recv(w); }
+
+task done_task() void {
+    emit_time_buf();
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+fn start() void {
+    timestamp.enable_tsc();
+    timestamp.get_timestamp(&tsc_start);
+    tsc_end[0] = tsc_start[0];
+    tsc_end[1] = tsc_start[1];
+    tsc_end[2] = tsc_start[2];
+
+    // Inject exactly one wavelet on own color with distinct payload.
+    //   payload = (pe_x << 24) | (pe_x & 0xFFFFFF)
+    // High byte = source PE id -> LWW max picks the highest-numbered
+    // upstream contributor for each receiver.
+    data_buf[0] = (@as(u32, @as(u16, pe_x)) << 24) | @as(u32, @as(u16, pe_x));
+
+    const inj_dsd = @get_dsd(fabout_dsd, .{
+        .extent       = 1,
+        .fabric_color = own_color(),
+        .output_queue = tx_oq,
+    });
+    const src_dsd = @get_dsd(mem1d_dsd,
+        .{ .tensor_access = |i|{1} -> data_buf[i] });
+
+    @mov32(inj_dsd, src_dsd);
+    status[0] = 1;
+
+    // PE 0 never receives anything — fire done immediately. All other PEs
+    // fire done from on_recv once recv_cnt == pe_x.
+    if (pe_x == 0) {
+        @activate(done_task_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time binding
+// ---------------------------------------------------------------------------
+comptime {
+    @bind_local_task(done_task, done_task_id);
+
+    // Output queue is always used (every PE injects).
+    @bind_data_task(recv_task_0, @get_data_task_id(rx_iq_0));
+    @bind_data_task(recv_task_1, @get_data_task_id(rx_iq_1));
+    @bind_data_task(recv_task_2, @get_data_task_id(rx_iq_2));
+    @bind_data_task(recv_task_3, @get_data_task_id(rx_iq_3));
+    @bind_data_task(recv_task_4, @get_data_task_id(rx_iq_4));
+
+    if (@is_arch("wse3")) {
+        // Bind tx queue to own color.
+        @initialize_queue(tx_oq, .{ .color = own_color() });
+
+        // Bind rx queues only for upstream colors this PE receives.
+        // Each queue maps to color C_j = c_base + j where j < pe_x.
+        if (pe_x > 0) @initialize_queue(rx_iq_0, .{ .color = @get_color(c_base + 0) });
+        if (pe_x > 1) @initialize_queue(rx_iq_1, .{ .color = @get_color(c_base + 1) });
+        if (pe_x > 2) @initialize_queue(rx_iq_2, .{ .color = @get_color(c_base + 2) });
+        if (pe_x > 3) @initialize_queue(rx_iq_3, .{ .color = @get_color(c_base + 3) });
+        if (pe_x > 4) @initialize_queue(rx_iq_4, .{ .color = @get_color(c_base + 4) });
+    }
+
+    @export_symbol(recv_cnt_ptr,    "recv_cnt");
+    @export_symbol(max_payload_ptr, "max_payload");
+    @export_symbol(status_ptr,      "status");
+    @export_symbol(time_buf_ptr,    "time_buf");
+    @export_symbol(start);
+}

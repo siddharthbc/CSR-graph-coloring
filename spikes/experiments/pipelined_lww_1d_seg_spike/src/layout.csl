@@ -1,0 +1,154 @@
+// 1D pipelined LWW — segmented reuse spike (layout).
+//
+// Goal: validate color-reuse-via-bridge to scale past the 1x6 per-source-
+// color ceiling discovered in ../pipelined_lww_1d_spike/RESULTS.md.
+//
+// Layout (1x10, S=5, single bridge):
+//
+//   PEs 0..3 : segment 0 sources, inject on c_0..c_3 (4 voices).
+//   PE  4    : BRIDGE. Receives seg 0's c_0..c_3, re-emits each on
+//              c_bridge. Also injects its OWN voice on c_bridge at start().
+//              Terminates c_0..c_3 locally (rx=WEST tx=RAMP) so seg 1
+//              can reuse those color IDs.
+//   PEs 5..9 : segment 1 sources, inject on c_0..c_4 (5 voices).
+//              Every seg 1 PE also listens on c_bridge (reads 5 bridged
+//              voices from seg 0).
+//
+// Queue budgets (upper bound per PE):
+//   PE 3 : 3 rx + 1 tx = 4 queues
+//   PE 4 (bridge) : 4 rx + 1 tx = 5 queues
+//   PE 9 (last)   : 5 rx + 1 tx = 6 queues   <- hits WSE-3 ceiling
+//
+// Color IDs:
+//   c_0 .. c_{S-1}  = C_BASE .. C_BASE + S - 1     (reused across segments)
+//   c_bridge        = C_BRIDGE                     (new color for seg 0→1)
+
+param WIDTH:    i16;   // total row width (must be 2 * S for this spike)
+param HEIGHT:   i16;   // = 1
+param S:        i16;   // sources per segment (5)
+param C_BASE:   i16;   // source color base
+param C_BRIDGE: i16;   // bridge color ID
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width  = WIDTH,
+    .height = HEIGHT,
+});
+
+layout {
+    @set_rectangle(WIDTH, HEIGHT);
+
+    const last_x: i16 = WIDTH - 1;
+    const bridge_x: i16 = S - 1;  // bridge is last PE of seg 0
+
+    var px: i16 = 0;
+    while (px < WIDTH) : (px += 1) {
+        const mp = memcpy.get_params(px);
+
+        // Segment-relative identity.
+        const is_seg0: bool  = (px < S);
+        const is_bridge: bool = (px == bridge_x);
+        const seg_idx: i16 = if (is_seg0) 0 else 1;
+        const local_x: i16 = px - seg_idx * S;
+
+        @set_tile_code(px, 0, "kernel.csl", .{
+            .memcpy_params = mp,
+            .pe_x          = px,
+            .local_x       = local_x,
+            .is_bridge     = is_bridge,
+            .is_seg0       = is_seg0,
+            .S             = S,
+            .c_base        = C_BASE,
+            .c_bridge      = C_BRIDGE,
+        });
+
+        // -------------------------------------------------------------------
+        // Source colors c_0 .. c_{S-1}
+        // -------------------------------------------------------------------
+        var j: i16 = 0;
+        while (j < S) : (j += 1) {
+            const cj: color = @get_color(C_BASE + j);
+
+            if (is_seg0) {
+                // Segment 0
+                if (is_bridge) {
+                    // Bridge PE terminates all segment-0 source colors it
+                    // receives from the west (so segment 1 can reuse them).
+                    // It does NOT inject on any c_j — it only injects on
+                    // c_bridge.
+                    if (j <= bridge_x - 1) {
+                        // Upstream source colors 0..bridge_x-1 (= 0..S-2)
+                        @set_color_config(px, 0, cj, .{
+                            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+                        });
+                    }
+                    // j == S-1: that color isn't used in this design
+                    // (segment 0 only has S-1 = 4 sources).
+                } else {
+                    // Non-bridge segment-0 PE at local_x in [0..S-2].
+                    if (j == local_x) {
+                        // Own source
+                        @set_color_config(px, 0, cj, .{
+                            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+                        });
+                    } else if (j < local_x) {
+                        // Upstream: forward east + consume on ramp
+                        @set_color_config(px, 0, cj, .{
+                            .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } },
+                        });
+                    }
+                    // j > local_x: downstream, unconfigured.
+                }
+            } else {
+                // Segment 1 (reusing colors c_0..c_{S-1})
+                if (j == local_x) {
+                    // Own source
+                    @set_color_config(px, 0, cj, .{
+                        .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+                    });
+                } else if (j < local_x) {
+                    // Upstream within seg 1
+                    if (px == last_x) {
+                        @set_color_config(px, 0, cj, .{
+                            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+                        });
+                    } else {
+                        @set_color_config(px, 0, cj, .{
+                            .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } },
+                        });
+                    }
+                }
+                // j > local_x: unconfigured.
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Bridge color c_bridge
+        // -------------------------------------------------------------------
+        const cb: color = @get_color(C_BRIDGE);
+
+        if (is_bridge) {
+            // Bridge PE injects on c_bridge, forwards east.
+            @set_color_config(px, 0, cb, .{
+                .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+            });
+        } else if (px > bridge_x) {
+            // Segment 1: every PE listens on c_bridge.
+            if (px == last_x) {
+                @set_color_config(px, 0, cb, .{
+                    .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+                });
+            } else {
+                @set_color_config(px, 0, cb, .{
+                    .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } },
+                });
+            }
+        }
+        // px < bridge_x: c_bridge unconfigured (no traffic in seg 0).
+    }
+
+    @export_name("recv_cnt",    [*]u32, true);
+    @export_name("max_payload", [*]u32, true);
+    @export_name("status",      [*]u32, true);
+    @export_name("time_buf",    [*]u16, true);
+    @export_name("start",       fn()void);
+}

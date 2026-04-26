@@ -1,0 +1,129 @@
+// CP3 rx-merge probe — per-PE program (v2: deterministic exit).
+//
+// Flow:
+//   PE0 (west edge):  on kick, send [0xAAAA0000, 0xDEAD0000].
+//                     Then unblock immediately.
+//   PE1 (interior):   bind rx_data on c_E (RAMP delivery via the
+//                     rx={WEST}, tx={EAST,RAMP} route). On the SECOND
+//                     arrival (0xDEAD0000), send [0xBBBB0001, 0xDEED0002]
+//                     locally via OQ on c_E. THIS is the rx-merge DUT:
+//                     PE1 must inject onto a color that is also being
+//                     fabric-forwarded WEST→EAST in the same router.
+//                     Then unblock.
+//   PE2 (east edge):  bind rx_data on c_E. Store every wavelet. On
+//                     receipt of 0xDEED0002 → activate exit (unblock).
+//
+// PASS  ⇒ PE2 sees all four wavelets, ending with 0xDEED0002.
+//          recv_count == 4. recv_buf contains both 0xBBBB0001 and
+//          0xDEED0002.
+// FAIL  ⇒ PE1's local sends never appear on EAST. PE2 stalls waiting
+//          for 0xDEED0002. Host d2h crashes with "received length
+//          (0 bytes) is not expected ..." (exit 139). This is the
+//          documented WSE-3 OQ/route-conflict failure mode.
+
+param memcpy_params: comptime_struct;
+param col:           i16;
+param is_west_edge:  bool;
+param is_east_edge:  bool;
+param c_E:           color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const MAX_RECV: i16 = 8;
+
+var recv_count = @zeros([1]i32);
+var recv_buf   = @zeros([MAX_RECV]u32);
+var send_tmp   = @zeros([1]u32);
+
+var recv_count_ptr: [*]i32 = &recv_count;
+var recv_buf_ptr:   [*]u32 = &recv_buf;
+
+const tx_oq:    output_queue = @get_output_queue(2);
+const rx_iq:    input_queue  = @get_input_queue(3);
+const rx_id:    data_task_id = @get_data_task_id(rx_iq);
+const exit_id:  local_task_id = @get_local_task_id(8);
+
+const SENTINEL_PE0: u32 = 0xDEAD0000;
+const SENTINEL_PE1: u32 = 0xDEED0002;
+const DATA_PE0:     u32 = 0xAAAA0000;
+const DATA_PE1:     u32 = 0xBBBB0001;
+
+fn send_east(w: u32) void {
+  send_tmp[0] = w;
+  var out = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = c_E,
+    .output_queue = tx_oq,
+  });
+  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> send_tmp[i] });
+  @mov32(out, src);
+}
+
+task rx_task(w: u32) void {
+  const idx = recv_count[0];
+  if (idx < @as(i32, MAX_RECV)) {
+    recv_buf[@as(u16, @as(i16, idx))] = w;
+  }
+  recv_count[0] = idx + 1;
+
+  // PE1 (interior): on PE0's sentinel, fire our own send burst.
+  // This is the rx-merge DUT.
+  if (!is_west_edge and !is_east_edge) {
+    if (w == SENTINEL_PE0) {
+      send_east(DATA_PE1);
+      send_east(SENTINEL_PE1);
+    }
+  }
+
+  // PE2 (sink): exit on FIRST arrival. We accept the race: by the time
+  // host d2h reads, all in-flight wavelets in this 3-PE simulator have
+  // long since drained. Unblock-on-first lets us discriminate stall
+  // (PE2 sees nothing) from rx-merge-fail (PE2 sees only PE0 wavelets)
+  // from rx-merge-pass (PE2 sees all four wavelets).
+  if (is_east_edge and idx == 0) {
+    @activate(exit_id);
+  }
+}
+
+task exit_task() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+fn kick() void {
+  // PE0: send the data wavelet, then the sentinel.
+  if (is_west_edge and !is_east_edge) {
+    send_east(DATA_PE0);
+    send_east(SENTINEL_PE0);
+    sys_mod.unblock_cmd_stream();
+  }
+  // PE1: nothing immediate — it acts via rx_task. Unblock now so the
+  // host's launch() can return as soon as PE2 also unblocks.
+  if (!is_west_edge and !is_east_edge) {
+    sys_mod.unblock_cmd_stream();
+  }
+  // PE2: do NOT unblock here. Wait for SENTINEL_PE1 via exit_task.
+}
+
+comptime {
+  @bind_local_task(exit_task, exit_id);
+
+  // PE1 + PE2 receive on c_E (both have RAMP in their c_E route).
+  if (!is_west_edge) {
+    @bind_data_task(rx_task, rx_id);
+  }
+
+  if (@is_arch("wse3")) {
+    // PE0 + PE1 init OQ on c_E (both originate; PE1 is the DUT).
+    if (!is_east_edge) {
+      @initialize_queue(tx_oq, .{ .color = c_E });
+    }
+    // PE1 + PE2 init IQ on c_E.
+    if (!is_west_edge) {
+      @initialize_queue(rx_iq, .{ .color = c_E });
+    }
+  }
+
+  @export_symbol(recv_count_ptr, "recv_count");
+  @export_symbol(recv_buf_ptr,   "recv_buf");
+  @export_symbol(kick);
+}

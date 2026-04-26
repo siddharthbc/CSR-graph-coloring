@@ -1,0 +1,11 @@
+[34m[INFO][0m === Calling container-hosted python ===
+[34m[INFO][0m Using SIF: /home/siddharthb/tools/sdk-cbcore-202505230211-4-9382352f.sif
+WARNING: The message system is being used before initialization.
+         Messages will still be printed, but with limited support.
+SDKR050 ERROR '"/home/siddharthb/independent_study/runs/local/20260422-cp3-rx-merge-probe-manual/results/out"' is not a valid directory.
+Traceback (most recent call last):
+  File "./run.py", line 110, in <module>
+    sys.exit(main())
+  File "./run.py", line 38, in main
+    runner = SdkRuntime(str(args.out_dir), cmaddr=None)
+RuntimeError: failed to read artifact directory.

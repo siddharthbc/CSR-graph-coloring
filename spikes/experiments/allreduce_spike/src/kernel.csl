@@ -1,0 +1,93 @@
+// Minimal allreduce spike: chains N allreduces inside the kernel (no host
+// round-trip per call) and records total cycles via on-device TSC.
+
+param memcpyParams: comptime_struct;
+param reduceParams: comptime_struct;
+
+const timestamp = @import_module("<time>");
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpyParams);
+
+// Forward-declared callback — runs every time the library finishes one
+// allreduce. It decrements a counter, re-fires the reduce, or returns to
+// the host once the target iteration count is reached.
+var loop_remaining: i16 = 0;
+var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscEndBuffer   = @zeros([timestamp.tsc_size_words]u16);
+
+// Packed (start,end) exported to host.
+var time_buf = @zeros([timestamp.tsc_size_words * 2]u16);
+// Reference clock snapshot from allreduce module.
+var time_ref = @zeros([timestamp.tsc_size_words]u16);
+
+var flag = @zeros([1]f32);
+
+fn on_reduce_done() void {
+    loop_remaining -= 1;
+    if (loop_remaining > 0) {
+        reduce_mod.allreduce(1, &flag, reduce_mod.TYPE_BINARY_OP.MAX);
+    } else {
+        timestamp.get_timestamp(&tscEndBuffer);
+        sys_mod.unblock_cmd_stream();
+    }
+}
+
+const reduce_mod = @import_module("allreduce/pe.csl", @concat_structs(reduceParams, .{
+    .f_callback    = on_reduce_done,
+    .queues        = [1]u16{2},
+    .dest_dsr_ids  = [1]u16{1},
+    .src0_dsr_ids  = [1]u16{1},
+    .src1_dsr_ids  = [1]u16{1},
+}));
+
+var ptr_flag:     [*]f32 = &flag;
+var ptr_time_buf: [*]u16 = &time_buf;
+var ptr_time_ref: [*]u16 = &time_ref;
+
+fn f_enable_timer() void {
+    timestamp.enable_tsc();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_memcpy_timestamps() void {
+    time_buf[0] = tscStartBuffer[0];
+    time_buf[1] = tscStartBuffer[1];
+    time_buf[2] = tscStartBuffer[2];
+    time_buf[3] = tscEndBuffer[0];
+    time_buf[4] = tscEndBuffer[1];
+    time_buf[5] = tscEndBuffer[2];
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_reference_timestamps() void {
+    time_ref[0] = reduce_mod.tscRefBuffer[0];
+    time_ref[1] = reduce_mod.tscRefBuffer[1];
+    time_ref[2] = reduce_mod.tscRefBuffer[2];
+    sys_mod.unblock_cmd_stream();
+}
+
+// Single-shot allreduce — used for warm-up / reference-clock sync.
+fn f_allreduce_once() void {
+    loop_remaining = 1;
+    reduce_mod.allreduce(1, &flag, reduce_mod.TYPE_BINARY_OP.MAX);
+}
+
+// Chained N allreduces fully inside the kernel: TSC start, fire first
+// reduce, callback re-fires until counter hits zero, then TSC end + host
+// unblock. Measures pure in-device allreduce latency × N.
+fn f_allreduce_loop(n: i16) void {
+    loop_remaining = n;
+    timestamp.get_timestamp(&tscStartBuffer);
+    reduce_mod.allreduce(1, &flag, reduce_mod.TYPE_BINARY_OP.MAX);
+}
+
+comptime {
+    @export_symbol(ptr_flag,     "flag");
+    @export_symbol(ptr_time_buf, "time_buf");
+    @export_symbol(ptr_time_ref, "time_ref");
+
+    @export_symbol(f_enable_timer);
+    @export_symbol(f_memcpy_timestamps);
+    @export_symbol(f_reference_timestamps);
+    @export_symbol(f_allreduce_once);
+    @export_symbol(f_allreduce_loop);
+}

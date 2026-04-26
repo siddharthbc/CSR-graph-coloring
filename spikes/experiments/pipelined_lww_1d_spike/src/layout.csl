@@ -1,0 +1,74 @@
+// 1D pipelined LWW spike — layout.
+//
+// Goal: validate concurrent multi-source injection on WSE-3.
+//
+// Topology: 1xWIDTH row. One source color per PE (C_0..C_{WIDTH-1}).
+//
+//   PE k on C_k : rx=RAMP, tx=EAST          (own source)
+//   PE k on C_j (j < k) : rx=WEST, tx={EAST, RAMP}   (forward + consume)
+//        except last PE (k == WIDTH-1): rx=WEST, tx=RAMP
+//   PE k on C_j (j > k) : unconfigured
+//
+// Last PE on its own color: rx=RAMP, tx=EAST — wavelet exits the east
+// fabric edge (padded) and is dropped. Proves the inject path even when
+// no downstream consumer exists.
+//
+// LWW rule (enforced in kernel): each PE tracks max(payload) across all
+// received wavelets. With source-PE id in the high bits of the payload,
+// the highest-numbered upstream contributor wins for each PE.
+
+param WIDTH:    i16;            // number of PEs in the row
+param HEIGHT:   i16;            // = 1 (single row)
+param C_BASE:   i16;            // first source color id (C_k = C_BASE + k)
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width  = WIDTH,
+    .height = HEIGHT,
+});
+
+layout {
+    @set_rectangle(WIDTH, HEIGHT);
+
+    const last_x: i16 = WIDTH - 1;
+
+    var px: i16 = 0;
+    while (px < WIDTH) : (px += 1) {
+        const mp = memcpy.get_params(px);
+
+        @set_tile_code(px, 0, "kernel.csl", .{
+            .memcpy_params = mp,
+            .pe_x          = px,
+            .width         = WIDTH,
+            .c_base        = C_BASE,
+        });
+
+        // Configure each source color C_j = C_BASE + j for this PE.
+        // Compile-time unroll so every colour has a concrete config.
+        var j: i16 = 0;
+        while (j < WIDTH) : (j += 1) {
+            const cj: color = @get_color(C_BASE + j);
+
+            if (j == px) {
+                // Own source: inject from RAMP, forward east.
+                @set_color_config(px, 0, cj, .{
+                    .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+                });
+            } else if (j < px) {
+                // Upstream source: receive from west, consume + forward.
+                const r =
+                    if (px == last_x)
+                        .{ .rx = .{ WEST }, .tx = .{ RAMP } }
+                    else
+                        .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } };
+                @set_color_config(px, 0, cj, .{ .routes = r });
+            }
+            // j > px: downstream color, unconfigured on this PE.
+        }
+    }
+
+    @export_name("recv_cnt",   [*]u32, true);
+    @export_name("max_payload",[*]u32, true);
+    @export_name("status",     [*]u32, true);
+    @export_name("time_buf",   [*]u16, true);
+    @export_name("start",      fn()void);
+}

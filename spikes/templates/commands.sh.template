@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Template for spike-local compile + run wrappers.
+# Copy this into spikes/<slug>/commands.sh and replace the TODO sections.
+
+set -euo pipefail
+
+SPIKE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SPIKE_DIR}/../../scripts/spike_run_helpers.sh"
+
+# Replace <slug> with a stable descriptive name such as lww-chain-bridge.
+spike_init_run_layout "$SPIKE_DIR" "<slug>"
+cd "$SPIKE_DIR"
+
+# Replace with spike-specific parameters.
+WIDTH=${WIDTH:-4}
+HEIGHT=${HEIGHT:-1}
+
+# Add or remove params as needed for the spike.
+FAB_W=$(( WIDTH + 8 ))
+FAB_H=$(( HEIGHT + 3 ))
+
+rm -rf "$COMPILED_DIR"
+
+{
+    # TODO: replace compile step with the spike's actual cslc invocation.
+    /home/siddharthb/tools/cslc ./src/layout.csl \
+        --arch wse3 \
+        --fabric-dims=${FAB_W},${FAB_H} \
+        --fabric-offsets=4,1 \
+        --params=WIDTH:${WIDTH} \
+        --params=HEIGHT:${HEIGHT} \
+        -o "$COMPILED_DIR" \
+        --memcpy --channels=1 --width-west-buf=0 --width-east-buf=0
+
+    # TODO: replace run.py and flags with the spike's actual entry point.
+    /home/siddharthb/tools/cs_python ./run.py \
+        --width ${WIDTH} \
+        --height ${HEIGHT} \
+        --out-dir "$COMPILED_DIR" \
+        --summary-file "$SUMMARY_FILE"
+} 2>&1 | tee "$STDOUT_LOG"

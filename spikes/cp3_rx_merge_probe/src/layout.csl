@@ -1,0 +1,55 @@
+// CP3 rx-merge probe — layout.
+//
+// 1x3 grid, single user color c_E (id 2). Interior PE (PE1) has both
+// an OQ bound to c_E AND a c_E route with rx=WEST, tx={EAST,RAMP}.
+// If WSE-3 cannot serialise EAST output from two sources on one color,
+// PE2 will never see PE0's wavelet and the host d2h will stall.
+
+param WIDTH:  i16;
+param HEIGHT: i16;
+
+const c_E: color = @get_color(2);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width  = WIDTH,
+  .height = HEIGHT,
+});
+
+layout {
+  @set_rectangle(WIDTH, HEIGHT);
+
+  for (@range(i16, HEIGHT)) |row| {
+    for (@range(i16, WIDTH)) |col| {
+      const is_west_edge: bool = (col == 0);
+      const is_east_edge: bool = (col == WIDTH - 1);
+      const mp = memcpy.get_params(col);
+
+      @set_tile_code(col, row, "pe_program.csl", .{
+        .memcpy_params = mp,
+        .col           = col,
+        .is_west_edge  = is_west_edge,
+        .is_east_edge  = is_east_edge,
+        .c_E           = c_E,
+      });
+
+      // c_E routes per role.
+      if (is_west_edge and !is_east_edge) {
+        // PE0: origin only.
+        @set_color_config(col, row, c_E,
+          .{ .routes = .{ .rx = .{RAMP}, .tx = .{EAST} } });
+      } else if (is_east_edge and !is_west_edge) {
+        // PE2: sink only.
+        @set_color_config(col, row, c_E,
+          .{ .routes = .{ .rx = .{WEST}, .tx = .{RAMP} } });
+      } else if (!is_west_edge and !is_east_edge) {
+        // PE1: interior — DUT. rx=WEST, tx={EAST, RAMP}.
+        @set_color_config(col, row, c_E,
+          .{ .routes = .{ .rx = .{WEST}, .tx = .{EAST, RAMP} } });
+      }
+    }
+  }
+
+  @export_name("recv_count", [*]i32, true);
+  @export_name("recv_buf",   [*]u32, true);
+  @export_name("kick", fn()void);
+}

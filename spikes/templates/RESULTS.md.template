@@ -1,0 +1,39 @@
+# <Spike Title> — Results
+
+Status: exploratory.
+Date: <YYYY-MM-DD>
+
+## Goal
+
+<brief statement of what was measured or validated>
+
+## Run Configuration
+
+- run id: `<run-id>`
+- platform: <simulator | hardware>
+- key params: <list the relevant dimensions, widths, flags, or palette settings>
+
+## Result
+
+- <main outcome>
+- <secondary outcome>
+
+## Evidence
+
+- stdout log: `runs/<scope>/<run_id>/stdout.log`
+- results dir: `runs/<scope>/<run_id>/results/`
+- summary file: `runs/<scope>/<run_id>/results/summary.json`
+
+## Interpretation
+
+- <what the result means>
+- <what remains uncertain>
+
+## Decision
+
+- <promote | keep as reference | archive | integrate into mainline>
+
+## Next
+
+- <next action 1>
+- <next action 2>

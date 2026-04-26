@@ -1,0 +1,253 @@
+// 1D pipelined LWW — chained-bridge kernel (Step 2c).
+//
+// Roles (determined at compile time from layout params):
+//   seg0_src (seg_idx=0, local_x in [0, S-2], not bridge):
+//     Inject own wavelet on c_{local_x}. Recv c_0..c_{local_x-1}.
+//     Done when recv_cnt == local_x.
+//   bridge0 (seg_idx=0, local_x=S-1):
+//     Inject own wavelet on c_bridge0. Recv c_0..c_{S-2}, re-inject each
+//     on c_bridge0. Done when recv_cnt == S-1.
+//   seg1_src (seg_idx=1, local_x in [0, S-2], not bridge):
+//     Inject own wavelet on c_{local_x}. Recv c_bridge0 (S bridged voices)
+//     + c_0..c_{local_x-1}. Done when recv_cnt == S + local_x.
+//   bridge1 (seg_idx=1, local_x=S-1):
+//     Inject own wavelet on c_bridge1. Recv c_bridge0 + c_0..c_{S-2};
+//     re-inject every received wavelet on c_bridge1.
+//     Done when recv_cnt == 2S - 1.
+//   seg2_src (seg_idx=2, local_x in [0, S-1]):
+//     Inject own on c_{local_x}. Recv c_bridge1 (2S voices) +
+//     c_0..c_{local_x-1}. Done when recv_cnt == 2S + local_x.
+//
+// Payload per voice: (pe_x << 24) | pe_x. LWW: max(all received).
+
+param memcpy_params: comptime_struct;
+param pe_x:        i16;
+param seg_idx:     i16;
+param local_x:     i16;
+param is_bridge:   bool;
+param is_last_seg: bool;
+param S:           i16;
+param c_base:      i16;
+param c_bridge0:   i16;
+param c_bridge1:   i16;
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+
+// ---------------------------------------------------------------------------
+// Queue allocation (WSE-3 user queue IDs 0..7)
+//   tx_oq   = id 2  (own inject color — source OR bridge output)
+//   rx_iq_0 = id 3  (c_0)
+//   rx_iq_1 = id 4  (c_1)
+//   rx_iq_2 = id 5  (c_2)
+//   rx_iq_3 = id 6  (c_3)
+//   rx_iq_b = id 7  (upstream bridge color: c_br0 for seg 1, c_br1 for seg 2)
+// PE 9 (bridge1):  4 rx (c_0..c_3) + 1 rx (c_br0) + 1 tx (c_br1) = 6 queues.
+// PE 14 (seg2_4):  4 rx (c_0..c_3) + 1 rx (c_br1) + 1 tx (c_4)   = 6 queues.
+// ---------------------------------------------------------------------------
+
+const tx_oq:   output_queue = @get_output_queue(2);
+const rx_iq_0: input_queue  = @get_input_queue(3);
+const rx_iq_1: input_queue  = @get_input_queue(4);
+const rx_iq_2: input_queue  = @get_input_queue(5);
+const rx_iq_3: input_queue  = @get_input_queue(6);
+const rx_iq_b: input_queue  = @get_input_queue(7);
+
+const done_task_id: local_task_id = @get_local_task_id(15);
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+var recv_cnt_arr    = @zeros([1]u32);
+var max_payload_arr = @zeros([1]u32);
+var status          = @zeros([8]u32);
+var tsc_start       = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end         = @zeros([timestamp.tsc_size_words]u16);
+var time_buf        = @zeros([timestamp.tsc_size_words * 2]u16);
+var data_buf        = @zeros([1]u32);
+
+var recv_cnt_ptr:    [*]u32 = &recv_cnt_arr;
+var max_payload_ptr: [*]u32 = &max_payload_arr;
+var status_ptr:      [*]u32 = &status;
+var time_buf_ptr:    [*]u16 = &time_buf;
+
+// ---------------------------------------------------------------------------
+// Derived quantities
+// ---------------------------------------------------------------------------
+
+fn expected_recvs() u32 {
+    // S*seg_idx bridged voices from upstream segments + local upstream.
+    // Bridge hears S-1 local upstream (the S-1 in-seg sources).
+    // Non-bridge hears local_x.
+    const upstream_in_seg: i16 = if (is_bridge) (S - 1) else local_x;
+    return @as(u32, @as(u16, S * seg_idx + upstream_in_seg));
+}
+
+fn inject_color() color {
+    if (is_bridge and seg_idx == 0) return @get_color(c_bridge0);
+    if (is_bridge and seg_idx == 1) return @get_color(c_bridge1);
+    return @get_color(c_base + local_x);
+}
+
+// Bridge output color for re-inject (bridge-0 uses c_br0, bridge-1 uses c_br1).
+fn bridge_out_color() color {
+    if (seg_idx == 0) return @get_color(c_bridge0);
+    return @get_color(c_bridge1);
+}
+
+// ---------------------------------------------------------------------------
+// Bridge re-inject helper — called from recv tasks on bridge PEs.
+// ---------------------------------------------------------------------------
+
+fn bridge_reinject(w: u32) void {
+    data_buf[0] = w;
+    const dsd = @get_dsd(fabout_dsd, .{
+        .extent       = 1,
+        .fabric_color = bridge_out_color(),
+        .output_queue = tx_oq,
+    });
+    const src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> data_buf[i] });
+    @mov32(dsd, src);
+}
+
+// ---------------------------------------------------------------------------
+// Common on-recv handler
+// ---------------------------------------------------------------------------
+
+fn emit_time_buf() void {
+    time_buf[0] = tsc_start[0];
+    time_buf[1] = tsc_start[1];
+    time_buf[2] = tsc_start[2];
+    time_buf[3] = tsc_end[0];
+    time_buf[4] = tsc_end[1];
+    time_buf[5] = tsc_end[2];
+    status[7] = 0xDEADBEEF;
+    sys_mod.unblock_cmd_stream();
+}
+
+fn on_recv(w: u32) void {
+    timestamp.get_timestamp(&tsc_end);
+    recv_cnt_arr[0] += 1;
+    if (w > max_payload_arr[0]) {
+        max_payload_arr[0] = w;
+    }
+    status[1] = recv_cnt_arr[0];
+    status[3] = max_payload_arr[0];
+    if (recv_cnt_arr[0] == expected_recvs()) {
+        @activate(done_task_id);
+    }
+}
+
+// Receive tasks — one per input queue. Bridge PEs re-inject each received
+// wavelet (from any rx queue) onto their bridge output color.
+
+task recv_c0_task(w: u32) void {
+    on_recv(w);
+    if (is_bridge) bridge_reinject(w);
+}
+task recv_c1_task(w: u32) void {
+    on_recv(w);
+    if (is_bridge) bridge_reinject(w);
+}
+task recv_c2_task(w: u32) void {
+    on_recv(w);
+    if (is_bridge) bridge_reinject(w);
+}
+task recv_c3_task(w: u32) void {
+    on_recv(w);
+    if (is_bridge) bridge_reinject(w);
+}
+task recv_cb_task(w: u32) void {
+    on_recv(w);
+    // bridge1 receives on c_bridge0 and must forward onto c_bridge1.
+    if (is_bridge) bridge_reinject(w);
+}
+
+task done_task() void {
+    emit_time_buf();
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+fn start() void {
+    timestamp.enable_tsc();
+    timestamp.get_timestamp(&tsc_start);
+    tsc_end[0] = tsc_start[0];
+    tsc_end[1] = tsc_start[1];
+    tsc_end[2] = tsc_start[2];
+
+    data_buf[0] = (@as(u32, @as(u16, pe_x)) << 24) | @as(u32, @as(u16, pe_x));
+
+    const inj_dsd = @get_dsd(fabout_dsd, .{
+        .extent       = 1,
+        .fabric_color = inject_color(),
+        .output_queue = tx_oq,
+    });
+    const src_dsd = @get_dsd(mem1d_dsd,
+        .{ .tensor_access = |i|{1} -> data_buf[i] });
+
+    @mov32(inj_dsd, src_dsd);
+    status[0] = 1;
+
+    // PE 0 has no upstream → fire done immediately.
+    if (expected_recvs() == 0) {
+        @activate(done_task_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time role → queue binding
+// ---------------------------------------------------------------------------
+
+// Which source-color rx queues does this PE use?
+//   seg0_src (local_x k, k<S-1): c_0..c_{k-1}.
+//   bridge0                   : c_0..c_{S-2} (all shared sources).
+//   seg1_src (local_x k)       : c_0..c_{k-1} (k<S-1).
+//   bridge1                    : c_0..c_{S-2}.
+//   seg2_src (local_x k)       : c_0..c_{k-1}.
+//
+// Which bridge rx queue?
+//   seg_idx==1 (any PE) : c_bridge0.
+//   seg_idx==2 (any PE) : c_bridge1.
+//   seg_idx==0          : none.
+
+const local_upstream: i16 = if (is_bridge) (S - 1) else local_x;
+
+const uses_rx_c0: bool = (local_upstream > 0);
+const uses_rx_c1: bool = (local_upstream > 1);
+const uses_rx_c2: bool = (local_upstream > 2);
+const uses_rx_c3: bool = (local_upstream > 3);
+const uses_rx_cb: bool = (seg_idx >= 1);
+
+comptime {
+    @bind_local_task(done_task, done_task_id);
+
+    if (uses_rx_c0) @bind_data_task(recv_c0_task, @get_data_task_id(rx_iq_0));
+    if (uses_rx_c1) @bind_data_task(recv_c1_task, @get_data_task_id(rx_iq_1));
+    if (uses_rx_c2) @bind_data_task(recv_c2_task, @get_data_task_id(rx_iq_2));
+    if (uses_rx_c3) @bind_data_task(recv_c3_task, @get_data_task_id(rx_iq_3));
+    if (uses_rx_cb) @bind_data_task(recv_cb_task, @get_data_task_id(rx_iq_b));
+
+    if (@is_arch("wse3")) {
+        @initialize_queue(tx_oq, .{ .color = inject_color() });
+
+        if (uses_rx_c0) @initialize_queue(rx_iq_0, .{ .color = @get_color(c_base + 0) });
+        if (uses_rx_c1) @initialize_queue(rx_iq_1, .{ .color = @get_color(c_base + 1) });
+        if (uses_rx_c2) @initialize_queue(rx_iq_2, .{ .color = @get_color(c_base + 2) });
+        if (uses_rx_c3) @initialize_queue(rx_iq_3, .{ .color = @get_color(c_base + 3) });
+        if (uses_rx_cb) {
+            const cb_rx_color = if (seg_idx == 1) @get_color(c_bridge0)
+                                else              @get_color(c_bridge1);
+            @initialize_queue(rx_iq_b, .{ .color = cb_rx_color });
+        }
+    }
+
+    @export_symbol(recv_cnt_ptr,    "recv_cnt");
+    @export_symbol(max_payload_ptr, "max_payload");
+    @export_symbol(status_ptr,      "status");
+    @export_symbol(time_buf_ptr,    "time_buf");
+    @export_symbol(start);
+}

@@ -1,0 +1,157 @@
+// 2D wire-speed broadcast kernel.
+//
+// PE(0,0) injects one wavelet. The south-spine color (C_S) carries it down
+// column 0; at each PE(0,y) with y>0 the arriving wavelet is consumed AND
+// re-injected on C_E to fan out across row y. PE(x,y) with x>0 receive
+// their wavelet solely from C_E.
+//
+// Per-PE measurement:
+//   tsc_start: captured on entry (before the source injects)
+//   tsc_end:   captured when this PE's data task fires (first arrival)
+//   delta    : wire-speed cycles from global t0 to this PE's receive
+//
+// Only PE(0,0) injects. PE(0,y>0) both receives (C_S) and re-injects (C_E),
+// but we only measure the recv cycle.
+
+param memcpy_params: comptime_struct;
+param pe_x:   i16;
+param pe_y:   i16;
+param width:  i16;
+param height: i16;
+param c_e:    color;
+param c_s:    color;
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+
+// Separate queues per color so they don't cross-contaminate.
+const tx_e_oq: output_queue = @get_output_queue(2);
+const rx_e_iq: input_queue  = @get_input_queue(2);
+const tx_s_oq: output_queue = @get_output_queue(3);
+const rx_s_iq: input_queue  = @get_input_queue(3);
+
+// On WSE-3 data_task_id is derived from the input queue; on WSE-2 from the
+// color. We only arm whichever color this PE actually receives on.
+const recv_e_tid: data_task_id =
+    if (@is_arch("wse3")) @get_data_task_id(rx_e_iq)
+    else                  @get_data_task_id(c_e);
+const recv_s_tid: data_task_id =
+    if (@is_arch("wse3")) @get_data_task_id(rx_s_iq)
+    else                  @get_data_task_id(c_s);
+
+const done_task_id: local_task_id = @get_local_task_id(15);
+
+var recv_cnt: i32 = 0;
+var status = @zeros([8]u32);
+var status_ptr: [*]u32 = &status;
+
+var tsc_start = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end   = @zeros([timestamp.tsc_size_words]u16);
+var time_buf  = @zeros([timestamp.tsc_size_words * 2]u16);
+var time_buf_ptr: [*]u16 = &time_buf;
+
+var data_buf = @zeros([1]u32);
+
+const tx_e_dsd = @get_dsd(fabout_dsd, .{
+    .extent = 1, .fabric_color = c_e, .output_queue = tx_e_oq,
+});
+const tx_s_dsd = @get_dsd(fabout_dsd, .{
+    .extent = 1, .fabric_color = c_s, .output_queue = tx_s_oq,
+});
+const src_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> data_buf[i] });
+
+// Is this PE on column 0 (spine)?
+const is_col0:    bool = (pe_x == 0);
+// Is this PE the global source?
+const is_source:  bool = (pe_x == 0) and (pe_y == 0);
+// Is this PE an east-source for its row (column 0, y > 0)?
+const is_row_src: bool = (pe_x == 0) and (pe_y > 0);
+// Does this PE receive from C_E (anywhere with x > 0)?
+const recv_from_e: bool = (pe_x > 0);
+
+fn emit_time_buf() void {
+    time_buf[0] = tsc_start[0];
+    time_buf[1] = tsc_start[1];
+    time_buf[2] = tsc_start[2];
+    time_buf[3] = tsc_end[0];
+    time_buf[4] = tsc_end[1];
+    time_buf[5] = tsc_end[2];
+    status[7] = 0xDEADBEEF;
+    sys_mod.unblock_cmd_stream();
+}
+
+// East-color arrival handler: for every PE with x > 0.
+task recv_e_task(w: u32) void {
+    timestamp.get_timestamp(&tsc_end);
+    recv_cnt += 1;
+    status[1] = @as(u32, recv_cnt);
+    status[3] = w;
+    @activate(done_task_id);
+}
+
+// South-color arrival handler: only armed on PE(0, y) with y > 0.
+// Records TSC and re-injects on C_E to fan the wavelet across row y.
+task recv_s_task(w: u32) void {
+    timestamp.get_timestamp(&tsc_end);
+    recv_cnt += 1;
+    status[2] = @as(u32, recv_cnt);
+    status[4] = w;
+    // Re-inject onto C_E so PE(x>0, pe_y) receive it.
+    data_buf[0] = w;
+    @mov32(tx_e_dsd, src_dsd);
+    @activate(done_task_id);
+}
+
+task done_task() void {
+    emit_time_buf();
+}
+
+fn start() void {
+    timestamp.enable_tsc();
+    timestamp.get_timestamp(&tsc_start);
+    if (is_source) {
+        // PE(0,0): inject on C_S (spine) AND on C_E (row 0 fan-out).
+        data_buf[0] = 0xABCD0000 | (@as(u32, @as(u16, pe_y)) << 8)
+                                | @as(u32, @as(u16, pe_x));
+        @mov32(tx_s_dsd, src_dsd);
+        @mov32(tx_e_dsd, src_dsd);
+        status[0] = 1;
+        // Source PE never appears on the fabric receive side; mark end=start.
+        tsc_end[0] = tsc_start[0];
+        tsc_end[1] = tsc_start[1];
+        tsc_end[2] = tsc_start[2];
+        @activate(done_task_id);
+    }
+    // Non-source PEs wait for their data task to fire.
+}
+
+comptime {
+    // Bind only the tasks that actually fire on this PE.
+    if (recv_from_e) {
+        @bind_data_task(recv_e_task, recv_e_tid);
+    }
+    if (is_row_src) {
+        @bind_data_task(recv_s_task, recv_s_tid);
+    }
+    @bind_local_task(done_task, done_task_id);
+
+    if (@is_arch("wse3")) {
+        if (recv_from_e) {
+            @initialize_queue(rx_e_iq, .{ .color = c_e });
+        }
+        if (is_col0) {
+            // Column-0 PEs either source C_E (py==0) or re-inject it (py>0).
+            @initialize_queue(tx_e_oq, .{ .color = c_e });
+        }
+        if (is_source) {
+            @initialize_queue(tx_s_oq, .{ .color = c_s });
+        }
+        if (is_row_src) {
+            @initialize_queue(rx_s_iq, .{ .color = c_s });
+        }
+    }
+
+    @export_symbol(time_buf_ptr, "time_buf");
+    @export_symbol(status_ptr,   "status");
+    @export_symbol(start);
+}

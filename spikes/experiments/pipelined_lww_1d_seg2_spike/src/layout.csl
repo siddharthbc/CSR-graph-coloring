@@ -1,0 +1,163 @@
+// 1D pipelined LWW — chained-bridge spike (layout).
+//
+// Step 2c from ../../LWW_PIPELINE_PLAN.md. Validates that a bridge PE can
+// consume an upstream bridge stream AND re-bridge onto a second bridge
+// color. If this works, color-reuse is composable across N segments by
+// chaining N-1 bridges.
+//
+// Layout (1x15, S=5, 3 segments, 2 bridges at PE 4 and PE 9):
+//
+//   seg 0 : PE 0..3 sources (c_0..c_3), PE 4 BRIDGE 0 (tx c_br0)
+//   seg 1 : PE 5..8 sources (c_0..c_3 reused), PE 9 BRIDGE 1
+//              (rx c_br0 + c_0..c_3, tx c_br1)
+//   seg 2 : PE 10..14 sources (c_0..c_4 reused). Terminates at PE 14.
+//
+// Bridge 0 emits 5 voices on c_br0 (PE 0..4).
+// Bridge 1 emits 10 voices on c_br1 (PE 0..9 = c_br0's 5 + seg1's 4 + own).
+// PE 14 receives 14 voices total.
+//
+// Queue budgets (WSE-3 cap: user queue IDs 0..7):
+//   Bridge 1 (PE 9) : 5 rx (c_br0 + c_0..c_3) + 1 tx (c_br1)  = 6  <- at ceiling
+//   PE 14           : 5 rx (c_br1 + c_0..c_3) + 1 tx (c_4)    = 6  <- at ceiling
+
+param WIDTH:     i16;  // total row width (must equal 3*S - 0 = 15 here)
+param HEIGHT:    i16;  // = 1
+param S:         i16;  // segment width (= 5)
+param C_BASE:    i16;  // source color base
+param C_BRIDGE0: i16;  // seg 0 -> seg 1 bridge color
+param C_BRIDGE1: i16;  // seg 1 -> seg 2 bridge color
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width  = WIDTH,
+    .height = HEIGHT,
+});
+
+layout {
+    @set_rectangle(WIDTH, HEIGHT);
+
+    const last_x: i16 = WIDTH - 1;
+    const bridge0_x: i16 = S - 1;       // PE 4
+    const bridge1_x: i16 = 2 * S - 1;   // PE 9
+
+    var px: i16 = 0;
+    while (px < WIDTH) : (px += 1) {
+        const mp = memcpy.get_params(px);
+
+        // Role identity.
+        //   seg_idx: 0, 1, or 2.
+        //   is_bridge: PE sits at segment boundary (PE 4 or PE 9).
+        //   is_last_seg: segment 2 has no bridge; its last PE terminates source colors.
+        const seg_idx: i16 =
+            if (px <  S)             0
+            else if (px < 2 * S)     1
+            else                     2;
+        const is_bridge: bool  = (px == bridge0_x) or (px == bridge1_x);
+        const is_last_seg: bool = (seg_idx == 2);
+        const local_x: i16     = px - seg_idx * S;
+
+        // Which bridge colors does this PE interact with?
+        //   seg 1 PEs rx on c_br0; bridge 1 also tx on c_br1.
+        //   seg 2 PEs rx on c_br1.
+        // Pass both bridge color IDs; kernel picks based on seg_idx.
+        @set_tile_code(px, 0, "kernel.csl", .{
+            .memcpy_params = mp,
+            .pe_x          = px,
+            .seg_idx       = seg_idx,
+            .local_x       = local_x,
+            .is_bridge     = is_bridge,
+            .is_last_seg   = is_last_seg,
+            .S             = S,
+            .c_base        = C_BASE,
+            .c_bridge0     = C_BRIDGE0,
+            .c_bridge1     = C_BRIDGE1,
+        });
+
+        // -------------------------------------------------------------------
+        // Source colors c_0 .. c_{S-1}
+        // -------------------------------------------------------------------
+        var j: i16 = 0;
+        while (j < S) : (j += 1) {
+            const cj: color = @get_color(C_BASE + j);
+
+            if (is_bridge) {
+                // Bridge PE terminates each seg's source color it receives
+                // from the west. It does NOT source any c_j — its own voice
+                // goes out on the bridge color it owns.
+                //
+                // In segments that have a bridge (0, 1), local sources cover
+                // c_0..c_{S-2}. The bridge gets c_0..c_{S-2} from west.
+                if (j <= S - 2) {
+                    @set_color_config(px, 0, cj, .{
+                        .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+                    });
+                }
+                // j == S-1: unused on bridges.
+            } else {
+                // Non-bridge source PE. Sources local_x; forwards j < local_x.
+                if (j == local_x) {
+                    @set_color_config(px, 0, cj, .{
+                        .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+                    });
+                } else if (j < local_x) {
+                    // Upstream within this segment. The last PE of the last
+                    // segment terminates these so they drop off the fabric
+                    // cleanly (symmetry with bridge terminators in other segs).
+                    const routes =
+                        if (is_last_seg and px == last_x)
+                            .{ .rx = .{ WEST }, .tx = .{ RAMP } }
+                        else
+                            .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } };
+                    @set_color_config(px, 0, cj, .{ .routes = routes });
+                }
+                // j > local_x: unconfigured (downstream).
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Bridge color 0 (c_br0) — carries voices from seg 0 into seg 1,
+        // terminates at bridge 1.
+        // -------------------------------------------------------------------
+        const cb0: color = @get_color(C_BRIDGE0);
+
+        if (px == bridge0_x) {
+            // Injector: own voice east.
+            @set_color_config(px, 0, cb0, .{
+                .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+            });
+        } else if (seg_idx == 1) {
+            // Seg 1 PEs listen; bridge 1 terminates it.
+            const routes =
+                if (px == bridge1_x)
+                    .{ .rx = .{ WEST }, .tx = .{ RAMP } }
+                else
+                    .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } };
+            @set_color_config(px, 0, cb0, .{ .routes = routes });
+        }
+        // seg 0 (px < bridge0_x) and seg 2: c_br0 unconfigured.
+
+        // -------------------------------------------------------------------
+        // Bridge color 1 (c_br1) — carries voices from segs 0+1 into seg 2.
+        // -------------------------------------------------------------------
+        const cb1: color = @get_color(C_BRIDGE1);
+
+        if (px == bridge1_x) {
+            @set_color_config(px, 0, cb1, .{
+                .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+            });
+        } else if (seg_idx == 2) {
+            const routes =
+                if (px == last_x)
+                    .{ .rx = .{ WEST }, .tx = .{ RAMP } }
+                else
+                    .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } };
+            @set_color_config(px, 0, cb1, .{ .routes = routes });
+        }
+        // Everywhere else: c_br1 unconfigured.
+    }
+
+    @export_name("recv_cnt",    [*]u32, true);
+    @export_name("max_payload", [*]u32, true);
+    @export_name("status",      [*]u32, true);
+    @export_name("time_buf",    [*]u16, true);
+    @export_name("start",       fn()void);
+}

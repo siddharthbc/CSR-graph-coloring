@@ -1,0 +1,45 @@
+# <Spike Title>
+
+Purpose: <one sentence describing the hypothesis or mechanism being tested>.
+
+Status: exploratory.
+
+Question:
+
+> <state the specific technical question this spike is answering>
+
+## Why This Exists
+
+- <reason 1>
+- <reason 2>
+
+## Run
+
+```bash
+./commands.sh
+```
+
+Optional parameterized run:
+
+```bash
+<ENV_VAR>=<value> ./commands.sh
+```
+
+Runs should write durable artifacts under `runs/<scope>/<run_id>/`.
+
+## Files
+
+- `src/` — spike-local source
+- `commands.sh` — canonical compile + run wrapper
+- `RESULTS.md` — findings, status, and next decision
+- `<runner file>` — optional host runner if needed
+
+## Success Criteria
+
+- <criterion 1>
+- <criterion 2>
+
+## Next
+
+- <what to do if the spike succeeds>
+- <what to do if the spike fails>

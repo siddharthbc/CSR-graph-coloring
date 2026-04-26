@@ -1,0 +1,86 @@
+// 2D wire-speed broadcast spike.
+//
+// Goal: extend the 1D static east route (rotating_root_spike) to a 2D grid
+// using TWO static colors, no switch rotation, no runtime reconfig.
+//
+// Topology:
+//
+//   C_S (south-bound, column 0 only): PE(0,0) sources; PE(0,y) for y>0
+//     receive via NORTH and consume via RAMP, then re-inject on C_E. The
+//     south spine delivers the source wavelet to each row's west edge.
+//
+//   C_E (east-bound, every row): PE(0,y) is the east-source for row y;
+//     PE(x,y) for x>0 receive via WEST and consume via RAMP. Row 0's
+//     PE(0,0) already has the data; rows y>0 get it from C_S re-inject.
+//
+// This avoids the multi-rx hazard (C_S only flows vertically, C_E only
+// flows horizontally) and uses only list-form routes in the base .routes
+// block — no compile-time switch positions required.
+
+param C_E_ID: i16;
+param C_S_ID: i16;
+param WIDTH:  i16;
+param HEIGHT: i16;
+
+const C_E: color = @get_color(C_E_ID);
+const C_S: color = @get_color(C_S_ID);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width  = WIDTH,
+    .height = HEIGHT,
+});
+
+layout {
+    @set_rectangle(WIDTH, HEIGHT);
+
+    const last_x: i16 = WIDTH  - 1;
+    const last_y: i16 = HEIGHT - 1;
+
+    var py: i16 = 0;
+    while (py < HEIGHT) : (py += 1) {
+        var px: i16 = 0;
+        while (px < WIDTH) : (px += 1) {
+            const mp = memcpy.get_params(px);
+
+            @set_tile_code(px, py, "kernel.csl", .{
+                .memcpy_params = mp,
+                .pe_x          = px,
+                .pe_y          = py,
+                .width         = WIDTH,
+                .height        = HEIGHT,
+                .c_e           = C_E,
+                .c_s           = C_S,
+            });
+
+            // ---- C_E (east-bound per row) -----------------------------------
+            // Source is always PE(0, py). Row y>0 gets its data from C_S
+            // re-inject at PE(0,y); row 0 has PE(0,0) as the global source.
+            const re =
+                if (px == 0)
+                    .{ .rx = .{ RAMP }, .tx = .{ EAST } }
+                else if (px == last_x)
+                    .{ .rx = .{ WEST }, .tx = .{ RAMP } }
+                else
+                    .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } };
+            @set_color_config(px, py, C_E, .{ .routes = re });
+
+            // ---- C_S (south-bound, column 0 only) ---------------------------
+            // Only configured on column 0. PE(0,0) sources; PE(0,y) for y>0
+            // consume via RAMP and also forward south to the next row.
+            if (px == 0) {
+                const rs =
+                    if (py == 0)
+                        .{ .rx = .{ RAMP }, .tx = .{ SOUTH } }
+                    else if (py == last_y)
+                        .{ .rx = .{ NORTH }, .tx = .{ RAMP } }
+                    else
+                        .{ .rx = .{ NORTH }, .tx = .{ SOUTH, RAMP } };
+                @set_color_config(px, py, C_S, .{ .routes = rs });
+            }
+        }
+    }
+
+    @export_name("time_buf", [*]u16, true);
+    @export_name("status",   [*]u32, true);
+    @export_name("start",    fn()void);
+}

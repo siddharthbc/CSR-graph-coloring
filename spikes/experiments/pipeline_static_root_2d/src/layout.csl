@@ -1,0 +1,95 @@
+// Pipeline static-root 2D implementation — layout.
+//
+// Static-root topology: PE(0,0) is the fixed broadcast source; all other
+// PEs are consumers. Every finalized (gid, color) tuple streams from
+// PE(0,0) via the two-color 2D broadcast tree measured in
+// rotating_root_2d_spike:
+//
+//   C_S (south-bound, column 0 only): PE(0,0) -> PE(0, y) for y > 0
+//   C_E (east-bound, every row):      row y's west edge -> PE(x, y) x > 0
+//
+// PE(0, y>0) receives on C_S, consumes, and re-injects on C_E to fan
+// the wavelet across its row. No rotating source, no runtime reconfig,
+// list-form routes only (compile-time, static).
+
+param C_E_ID: i16;
+param C_S_ID: i16;
+param WIDTH:  i16;
+param HEIGHT: i16;
+param MAX_V:  i32;  // max vertices (compile-time)
+param MAX_E:  i32;  // max total adjacency entries (compile-time)
+param MAX_LIST: i16;  // max per-vertex list length (used for color_lists sizing)
+param SEED:     i32;  // xorshift32 seed baseline
+
+const C_E: color = @get_color(C_E_ID);
+const C_S: color = @get_color(C_S_ID);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width  = WIDTH,
+    .height = HEIGHT,
+});
+
+layout {
+    @set_rectangle(WIDTH, HEIGHT);
+
+    const last_x: i16 = WIDTH  - 1;
+    const last_y: i16 = HEIGHT - 1;
+
+    var py: i16 = 0;
+    while (py < HEIGHT) : (py += 1) {
+        var px: i16 = 0;
+        while (px < WIDTH) : (px += 1) {
+            const mp = memcpy.get_params(px);
+
+            @set_tile_code(px, py, "kernel.csl", .{
+                .memcpy_params = mp,
+                .pe_x          = px,
+                .pe_y          = py,
+                .width         = WIDTH,
+                .height        = HEIGHT,
+                .c_e           = C_E,
+                .c_s           = C_S,
+                .MAX_V         = MAX_V,
+                .MAX_E         = MAX_E,
+                .MAX_LIST      = MAX_LIST,
+                .SEED          = SEED,
+            });
+
+            // C_E: east-bound per row. Source = PE(0, py).
+            const re =
+                if (px == 0)
+                    .{ .rx = .{ RAMP }, .tx = .{ EAST } }
+                else if (px == last_x)
+                    .{ .rx = .{ WEST }, .tx = .{ RAMP } }
+                else
+                    .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } };
+            @set_color_config(px, py, C_E, .{ .routes = re });
+
+            // C_S: south-bound, column 0 only. Source = PE(0, 0).
+            if (px == 0) {
+                const rs =
+                    if (py == 0)
+                        .{ .rx = .{ RAMP }, .tx = .{ SOUTH } }
+                    else if (py == last_y)
+                        .{ .rx = .{ NORTH }, .tx = .{ RAMP } }
+                    else
+                        .{ .rx = .{ NORTH }, .tx = .{ SOUTH, RAMP } };
+                @set_color_config(px, py, C_S, .{ .routes = rs });
+            }
+        }
+    }
+
+    @export_name("offsets",      [*]i32, true);
+    @export_name("adj",          [*]i32, true);
+    @export_name("palette_size", [*]i32, true);
+    @export_name("list_size",    [*]i32, true);
+    @export_name("final_col",    [*]i32, true);
+    @export_name("num_v",        [*]i32, true);
+    @export_name("num_e",        [*]i32, true);
+    @export_name("recv_gid",     [*]i32, true);
+    @export_name("recv_col",     [*]i32, true);
+    @export_name("recv_cnt",     [*]i32, true);
+    @export_name("status",       [*]u32, true);
+    @export_name("time_buf",     [*]u16, true);
+    @export_name("start",        fn()void);
+}
