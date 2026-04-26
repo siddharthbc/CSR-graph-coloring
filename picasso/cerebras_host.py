@@ -36,7 +36,7 @@ CS_FREQUENCY = 850_000_000
 def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
                  max_local_verts, max_local_edges, max_boundary,
                  max_list_size=0, palette_size=3, cmaddr=None,
-                 lww_layout='bidir'):
+                 lww_layout='bidir', level_epoch=0):
     """Load graph onto device, run coloring, read back results.
 
     Args:
@@ -97,13 +97,22 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
     # Fix 1: pe_mask = total_pes - 1 (power-of-2 hash partitioning)
     pe_mask_val = total_pes - 1
 
-    # Upload runtime_config = [pe_mask, palette_size] to every PE
-    config_arr = np.array([pe_mask_val, palette_size], dtype=np.int32)
+    # Upload runtime_config to every PE.
+    # 2d_seg2 (CP3.epoch fix) takes a 3-element config: [pe_mask,
+    # palette_size, level_epoch]. Other kernels still use 2 elements.
+    if lww_layout == '2d_seg2':
+        config_arr = np.array(
+            [pe_mask_val, palette_size, int(level_epoch) & 0x1],
+            dtype=np.int32)
+        config_len = 3
+    else:
+        config_arr = np.array([pe_mask_val, palette_size], dtype=np.int32)
+        config_len = 2
     for p_idx in range(total_pes):
         p_row = p_idx // num_cols
         p_col = p_idx % num_cols
         runner.memcpy_h2d(sym_runtime_config, config_arr, p_col, p_row, 1, 1,
-                          2, streaming=False,
+                          config_len, streaming=False,
                           data_type=MemcpyDataType.MEMCPY_32BIT,
                           order=MemcpyOrder.ROW_MAJOR, nonblock=False)
 
@@ -346,6 +355,12 @@ def main():
                         help='Pipelined-LWW kernel variant. Only consumed '
                              'by host upload logic when value triggers extra '
                              'symbols (currently 2d_multicast).')
+    parser.add_argument('--level-epoch', type=int, default=0,
+                        help='Per-level epoch (0 or 1) for the CP3.epoch '
+                             'fix on 2d_seg2. The runner toggles this each '
+                             'BSP level so the kernel can discard residual '
+                             'wavelets from the previous level still in '
+                             'fabric IQs. Ignored by other kernels.')
     args = parser.parse_args()
 
     with open(args.graph_data, 'r') as f:
@@ -357,7 +372,8 @@ def main():
         args.max_boundary, max_list_size=args.max_list_size,
         palette_size=args.palette_size,
         cmaddr=args.cmaddr,
-        lww_layout=args.lww_layout)
+        lww_layout=args.lww_layout,
+        level_epoch=args.level_epoch)
 
     # Output as JSON on stdout (the test runner parses this)
     print(json.dumps({

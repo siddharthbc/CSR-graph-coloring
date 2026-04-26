@@ -1,0 +1,8 @@
+# Epoch-fix validation matrix: configs that previously hung even with
+# the --launcher-per-level workaround. Both should now PASS in a
+# single shared wsjob (no per-level overhead).
+#
+# Columns: test_name | grid_rows | num_pes | impl | golden_dir | max_minutes
+
+test12_many_nodes_20nodes	4	16	2d_seg2	tests/golden_normal	20
+test1_all_commute_4nodes	8	64	2d_seg2	tests/golden_normal	20

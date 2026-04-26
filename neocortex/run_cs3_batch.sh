@@ -29,6 +29,7 @@ MAX_LIST_SIZE="8"
 MAX_ROUNDS="30"
 SKIP_COMPILE="0"
 EXCLUDE=""
+RUN_ID=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -43,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --max-palette-size)  MAX_PALETTE_SIZE="$2"; shift 2 ;;
     --max-list-size)     MAX_LIST_SIZE="$2"; shift 2 ;;
     --max-rounds)        MAX_ROUNDS="$2"; shift 2 ;;
+    --run-id)            RUN_ID="$2"; shift 2 ;;
     --no-compile)        SKIP_COMPILE="1"; shift ;;
     --exclude)           EXCLUDE="$2"; shift 2 ;;
     -h|--help)           sed -n '1,12p' "$0"; exit 0 ;;
@@ -51,8 +53,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-LOG_DIR="/tmp/cs3_batch_${NUM_PES}pe"
-mkdir -p "$LOG_DIR"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d)-hardware-batch-${NUM_PES}pe}"
+RUN_DIR="${REPO_ROOT}/runs/hardware/${RUN_ID}"
+RESULTS_DIR="${RUN_DIR}/results"
+STDOUT_LOG="${RUN_DIR}/stdout.log"
+mkdir -p "$RESULTS_DIR"
 
 echo "=== CS-3 batch hardware run on ${NUM_PES} PE(s) ==="
 echo "    config: --palette-frac=${PALETTE_FRAC} --alpha=${ALPHA} --golden-dir=${GOLDEN_DIR}"
@@ -162,20 +167,20 @@ else
       --max-boundary ${MAX_BND} --max-relay ${MAX_RELAY} \
       --max-palette-size ${MAX_PALETTE_SIZE} --max-list-size ${MAX_LIST_SIZE} \
       --hardware --output ${ARTIFACT}
-  '" 2>&1 | tee "${LOG_DIR}/compile.log"
+  '" 2>&1 | tee "${RUN_DIR}/compile.log"
   echo "    artifact: ${ARTIFACT}"
 fi
 echo
 
 # ---- Step 4: run all tests ----
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-REMOTE_LOG_DIR="${REMOTE_ROOT}/logs"
-REMOTE_LOG="${REMOTE_LOG_DIR}/batch_${NUM_PES}pe_${TS}.log"
+REMOTE_RUN_DIR="${REMOTE_ROOT}/runs/hardware/${RUN_ID}"
+REMOTE_LOG="${REMOTE_RUN_DIR}/stdout.log"
 echo "[4/5] Launching batch run on CS-3 hardware..."
 echo "      Golden: ${GOLDEN_DIR}  Palette frac: ${PALETTE_FRAC}  Alpha: ${ALPHA}"
 echo "      Remote log:  ssh ${REMOTE} 'tail -f ${REMOTE_LOG}'"
 ssh -tt "$REMOTE" "bash -lc '
-  mkdir -p ${REMOTE_LOG_DIR} &&
+  mkdir -p ${REMOTE_RUN_DIR}/results &&
   cd ${REMOTE_ROOT} &&
   source ~/picasso_venv/bin/activate &&
   export PYTHONUNBUFFERED=1 &&
@@ -186,15 +191,15 @@ ssh -tt "$REMOTE" "bash -lc '
     --golden-dir ${GOLDEN_DIR} \
     --palette-frac ${PALETTE_FRAC} --alpha ${ALPHA} \
     --max-rounds ${MAX_ROUNDS} \
-    --output-dir tests/cerebras-runs-batch-${NUM_PES}pe-hw \
+    --output-dir runs/hardware/${RUN_ID}/results \
     2>&1 | tee ${REMOTE_LOG}
-'" 2>&1 | tee "${LOG_DIR}/run.log"
+  '" 2>&1 | tee "${STDOUT_LOG}"
 echo
 
 # ---- Step 5: fetch artifacts ----
 echo "[5/5] Pulling per-test output back..."
-rsync -az "${REMOTE}:${REMOTE_ROOT}/tests/cerebras-runs-batch-${NUM_PES}pe-hw/" \
-    "${LOG_DIR}/cerebras-runs/" 2>/dev/null || true
-echo "    local logs: ${LOG_DIR}"
+  rsync -az "${REMOTE}:${REMOTE_ROOT}/runs/hardware/${RUN_ID}/results/" \
+    "${RESULTS_DIR}/" 2>/dev/null || true
+  echo "    local run dir: ${RUN_DIR}"
 echo
 echo "=== batch done ==="

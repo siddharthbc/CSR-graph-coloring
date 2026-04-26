@@ -1,0 +1,27 @@
+# Post-CP3.blocked-rx scaling sweep (2026-04-26).
+# Columns (tab-separated):
+#   test_name | grid_rows | num_pes | impl | golden_dir | max_minutes
+# impl is one of: sw-relay, 2d_seg2, east_seg
+#
+# Purpose: after 8x8 test1 2d_seg2 passed without --launcher-per-level,
+# collect apples-to-apples hardware timings for the scaling-study tables.
+
+# --- dense small graph: all three implementations ---
+test12_many_nodes_20nodes	4	16	2d_seg2	tests/golden_normal	20
+test12_many_nodes_20nodes	4	16	sw-relay	tests/golden_normal	20
+test12_many_nodes_20nodes	1	16	east_seg	tests/golden_normal	20
+
+# --- random medium graph: all three implementations ---
+test14_random_200nodes	8	64	2d_seg2	tests/golden_normal	45
+test14_random_200nodes	8	64	sw-relay	tests/golden_normal	45
+test14_random_200nodes	1	64	east_seg	tests/golden_normal	45
+
+# --- random large graph: all three implementations ---
+test15_random_500nodes	16	256	2d_seg2	tests/golden_normal	60
+test15_random_500nodes	16	256	sw-relay	tests/golden_normal	60
+test15_random_500nodes	1	256	east_seg	tests/golden_normal	60
+
+# --- chemistry workload: all three implementations ---
+H2_631g_89nodes	8	64	2d_seg2	tests/golden_normal	45
+H2_631g_89nodes	8	64	sw-relay	tests/golden_normal	45
+H2_631g_89nodes	1	64	east_seg	tests/golden_normal	45

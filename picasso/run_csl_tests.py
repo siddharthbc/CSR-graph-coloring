@@ -1196,13 +1196,16 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
 
 def run_on_cerebras(compiled_dir, pe_data, num_cols, num_rows, num_verts,
                     max_local_verts, max_local_edges, max_boundary,
-                    max_list_size=0, palette_size=30, lww_layout='bidir'):
+                    max_list_size=0, palette_size=30, lww_layout='bidir',
+                    level_epoch=0):
     """Run a single test on the Cerebras simulator via cs_python.
-    
+
     palette_size: runtime palette size for this test.
     lww_layout: forwarded to cerebras_host.py so it knows whether to
         upload kernel-variant-specific device symbols (e.g. multicast
         bitmaps for `2d_multicast`).
+    level_epoch: 0/1 toggle per BSP level for the CP3.epoch fix
+        (only consumed by 2d_seg2 host upload path).
     
     cs_python runs inside a singularity container that only binds the cwd
     and /tmp. So we copy the host script into compiled_dir and write
@@ -1242,6 +1245,7 @@ def run_on_cerebras(compiled_dir, pe_data, num_cols, num_rows, num_verts,
             '--max-list-size', str(max_list_size),
             '--palette-size', str(palette_size),
             '--lww-layout', str(lww_layout),
+            '--level-epoch', str(int(level_epoch) & 0x1),
         ]
         result = subprocess.run(cmd, capture_output=False, text=True,
                                 stdout=subprocess.PIPE, stderr=None,
@@ -1269,7 +1273,8 @@ def run_on_cerebras(compiled_dir, pe_data, num_cols, num_rows, num_verts,
 # ---------------------------------------------------------------------------
 
 def run_single_test_appliance(launcher, pe_data, compile_info, num_verts,
-                              palette_size=3, max_list_size=0, hardware=False):
+                              palette_size=3, max_list_size=0, hardware=False,
+                              lww_layout='bidir', level_epoch=0):
     """Run a single coloring level using SdkLauncher on the appliance.
 
     Stages graph data and cerebras_host.py, then executes on the
@@ -1302,7 +1307,9 @@ def run_single_test_appliance(launcher, pe_data, compile_info, num_verts,
         f"--max-local-edges {max_le} "
         f"--max-boundary {max_bnd} "
         f"--max-list-size {max_list_size} "
-        f"--palette-size {palette_size}"
+        f"--palette-size {palette_size} "
+        f"--lww-layout {lww_layout} "
+        f"--level-epoch {int(level_epoch) & 0x1}"
     )
     if hardware:
         cmd += " --cmaddr %CMADDR%"
@@ -1376,6 +1383,15 @@ def main():
     parser.add_argument('--hardware', action='store_true',
                         help='Run on real CS-3 hardware instead of appliance '
                              'simulator (appliance mode only)')
+    parser.add_argument('--launcher-per-level', action='store_true',
+                        help='Open a fresh SdkLauncher (and wsjob) per BSP '
+                             'level. Workaround for fabric-queue residuals '
+                             'observed on real WSE-3 with 2d_seg2 dual-axis '
+                             '(rows>=4): stale wavelets from level N pollute '
+                             "level N+1's IQs because runner.load() does not "
+                             'drain fabric. Per-level wsjob cycling adds '
+                             '~90s per level but resets wafer state cleanly. '
+                             'Appliance/hardware only.')
     parser.add_argument('--num-pes', type=int, default=2,
                         help='Total number of PEs')
     parser.add_argument('--grid-rows', type=int, default=1,
@@ -1514,14 +1530,11 @@ def main():
                          f"Got {num_rows}x{num_cols}. "
                          "Single-axis cases (1xN or Nx1) work at any size.")
         if args.lww_layout == '2d_seg2':
-            # CP2d.d.2 (2026-04-24) merged back-channel onto sync_reduce
-            # alternating chain via opcode dispatch. Frees Q6 IQ at
-            # interior-row interior-col PEs so col_reduce_recv has no
-            # conflict. Cap raised to 16x16 for exploratory validation.
-            if num_rows > 1 and num_cols > 1 and (num_rows > 16 or num_cols > 16):
-                sys.exit("ERROR: --lww-layout 2d_seg2 dual-axis is "
-                         "currently capped at 16x16 (CP2d.d.2 probe). "
-                         f"Got {num_rows}x{num_cols}.")
+            # CP2d.d.2 (2026-04-24) locked the dual-axis queue budget at
+            # 6/6 IQs at S=2 for any N. No architectural cap; the only
+            # remaining limits are routing-color reuse (handled per-segment)
+            # and memcpy/host-upload practicality at very large grids.
+            pass
         if args.lww_layout == '2d':
             # Checkpoint 1 (post Step 4a iter 2): barrier generalised to
             # multi-PE alternating reduce chains (east_seg pattern applied
@@ -1912,17 +1925,24 @@ def main():
     print()
 
     # --- Open execution context ---
-    # Appliance mode: SdkLauncher session wraps all tests.
+    # Appliance mode: SdkLauncher session wraps all tests UNLESS
+    # --launcher-per-level is set (then each BSP level gets a fresh
+    # wsjob to reset fabric residuals; outer ctx is a nullcontext).
     # Simulator mode: nullcontext (no-op).
+    SdkLauncherCls = None
     if args.mode == 'appliance':
         try:
-            from cerebras.sdk.client import SdkLauncher
+            from cerebras.sdk.client import SdkLauncher as SdkLauncherCls
         except ImportError:
             print("ERROR: cerebras_sdk not installed.")
             print("Install with: pip install cerebras_sdk==2.5.0")
             sys.exit(1)
-        ctx = SdkLauncher(artifact_path, simulator=not args.hardware,
-                          disable_version_check=True)
+        if args.launcher_per_level:
+            ctx = nullcontext()
+        else:
+            ctx = SdkLauncherCls(artifact_path,
+                                 simulator=not args.hardware,
+                                 disable_version_check=True)
     else:
         ctx = nullcontext()
 
@@ -2056,11 +2076,29 @@ def main():
                     print(f"  colored_gids={len(colored_gids)} remaining={len(remaining)}")
 
                 if args.mode == 'appliance':
-                    result_data = run_single_test_appliance(
-                        launcher, pe_data, compile_info, num_verts,
-                        palette_size=cur_pal,
-                        max_list_size=max(max_list_size, cur_T),
-                        hardware=args.hardware)
+                    if args.launcher_per_level:
+                        # Fresh wsjob per BSP level resets wafer fabric
+                        # state; outer `launcher` is None in this mode.
+                        with SdkLauncherCls(
+                                artifact_path,
+                                simulator=not args.hardware,
+                                disable_version_check=True) as level_launcher:
+                            result_data = run_single_test_appliance(
+                                level_launcher, pe_data, compile_info,
+                                num_verts,
+                                palette_size=cur_pal,
+                                max_list_size=max(max_list_size, cur_T),
+                                hardware=args.hardware,
+                                lww_layout=args.lww_layout,
+                                level_epoch=level & 0x1)
+                    else:
+                        result_data = run_single_test_appliance(
+                            launcher, pe_data, compile_info, num_verts,
+                            palette_size=cur_pal,
+                            max_list_size=max(max_list_size, cur_T),
+                            hardware=args.hardware,
+                            lww_layout=args.lww_layout,
+                            level_epoch=level & 0x1)
                 else:
                     result_data = run_on_cerebras(
                         compiled_dir, pe_data, num_cols,
@@ -2068,7 +2106,8 @@ def main():
                         max_le, max_bnd,
                         max_list_size=max(max_list_size, cur_T),
                         palette_size=cur_pal,
-                        lww_layout=args.lww_layout)
+                        lww_layout=args.lww_layout,
+                        level_epoch=level & 0x1)
                 if result_data is None:
                     print(f"  FAIL  Cerebras run returned no result at level {level}")
                     break

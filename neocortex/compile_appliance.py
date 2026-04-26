@@ -40,6 +40,18 @@ def main():
                         help='Output JSON file with artifact path')
     parser.add_argument('--hardware', action='store_true',
                         help='Compile for real hardware (full fabric dims)')
+    parser.add_argument('--lww-layout', type=str, default=None,
+                        choices=[None, 'bidir', 'east', 'east_seg', '2d',
+                                 '2d_seg', '2d_seg2', '2d_multicast'],
+                        help='Pipelined-LWW layout to compile (overrides default sw-relay layout.csl)')
+    parser.add_argument('--seg-size', type=int, default=2,
+                        help='Segment size S for segmented LWW kernels (default 2). '
+                             'For 2d_seg2, this is S_row; col-axis uses --s-col.')
+    parser.add_argument('--s-col', type=int, default=None,
+                        help='Col-axis segment size for 2d_seg2 (default = same '
+                             'as --seg-size). Set to 1 to drop south_slot_count to '
+                             '1 globally and free Q3 IQ for the dedicated '
+                             'back-channel (CP2d.e). Ignored by other layouts.')
     args = parser.parse_args()
 
     # Locate CSL sources
@@ -47,8 +59,21 @@ def main():
     repo_root = os.path.dirname(script_dir)
     csl_dir = args.csl_dir or os.path.join(repo_root, 'csl')
 
-    if not os.path.isfile(os.path.join(csl_dir, 'layout.csl')):
-        print(f"ERROR: layout.csl not found in {csl_dir}")
+    # Pick the right layout file based on --lww-layout
+    layout_map = {
+        None:           'layout.csl',
+        'bidir':        'layout_lww.csl',
+        'east':         'layout_lww_east.csl',
+        'east_seg':     'layout_lww_east_seg.csl',
+        '2d':           'layout_lww_2d.csl',
+        '2d_seg':       'layout_lww_2d_seg.csl',
+        '2d_seg2':      'layout_lww_2d_seg2.csl',
+        '2d_multicast': 'layout_lww_2d_multicast.csl',
+    }
+    layout_file = layout_map[args.lww_layout]
+
+    if not os.path.isfile(os.path.join(csl_dir, layout_file)):
+        print(f"ERROR: {layout_file} not found in {csl_dir}")
         sys.exit(1)
 
     # Import Cerebras appliance SDK
@@ -71,17 +96,58 @@ def main():
         fabric_h = args.num_rows + 2
 
     # Build compiler arguments (same as cslc CLI)
-    params = (
-        f"num_cols:{args.num_cols},"
-        f"num_rows:{args.num_rows},"
-        f"max_local_verts:{args.max_local_verts},"
-        f"max_local_edges:{args.max_local_edges},"
-        f"max_boundary:{args.max_boundary},"
-        f"max_relay:{args.max_relay},"
-        f"max_palette_size:{args.max_palette_size},"
-        f"max_list_size:{args.max_list_size},"
-        f"routing_mode:{args.routing_mode}"
-    )
+    if args.lww_layout is None:
+        # sw-relay / hw-filter need max_relay + routing_mode
+        params = (
+            f"num_cols:{args.num_cols},"
+            f"num_rows:{args.num_rows},"
+            f"max_local_verts:{args.max_local_verts},"
+            f"max_local_edges:{args.max_local_edges},"
+            f"max_boundary:{args.max_boundary},"
+            f"max_relay:{args.max_relay},"
+            f"max_palette_size:{args.max_palette_size},"
+            f"max_list_size:{args.max_list_size},"
+            f"routing_mode:{args.routing_mode}"
+        )
+    elif args.lww_layout in ('east_seg', '2d_seg'):
+        # segmented LWW: takes S (single axis)
+        params = (
+            f"num_cols:{args.num_cols},"
+            f"num_rows:{args.num_rows},"
+            f"max_local_verts:{args.max_local_verts},"
+            f"max_local_edges:{args.max_local_edges},"
+            f"max_boundary:{args.max_boundary},"
+            f"max_palette_size:{args.max_palette_size},"
+            f"max_list_size:{args.max_list_size},"
+            f"S:{args.seg_size}"
+        )
+    elif args.lww_layout == '2d_seg2':
+        # 2d_seg2: per-axis S split (CP2d.e). Defaults to S_col=S_row
+        # for backward compat; override with --s-col 1 to free Q3 IQ
+        # for the dedicated back-channel.
+        s_col = args.s_col if args.s_col is not None else args.seg_size
+        params = (
+            f"num_cols:{args.num_cols},"
+            f"num_rows:{args.num_rows},"
+            f"max_local_verts:{args.max_local_verts},"
+            f"max_local_edges:{args.max_local_edges},"
+            f"max_boundary:{args.max_boundary},"
+            f"max_palette_size:{args.max_palette_size},"
+            f"max_list_size:{args.max_list_size},"
+            f"S_row:{args.seg_size},"
+            f"S_col:{s_col}"
+        )
+    else:
+        # other lww layouts (bidir, east, 2d, 2d_multicast)
+        params = (
+            f"num_cols:{args.num_cols},"
+            f"num_rows:{args.num_rows},"
+            f"max_local_verts:{args.max_local_verts},"
+            f"max_local_edges:{args.max_local_edges},"
+            f"max_boundary:{args.max_boundary},"
+            f"max_palette_size:{args.max_palette_size},"
+            f"max_list_size:{args.max_list_size}"
+        )
 
     # --arch flag: wse2 (default) for simulator, wse3 for CS-3 hardware
     arch_flag = "--arch=wse3 " if args.hardware else ""
@@ -108,7 +174,7 @@ def main():
         print("Compile job submitted to appliance...")
         artifact_path = compiler.compile(
             csl_dir,           # directory containing CSL files
-            "layout.csl",     # top-level CSL file
+            layout_file,      # top-level CSL file (selected per --lww-layout)
             compiler_args,    # compiler arguments
             "."               # output directory (on appliance)
         )
@@ -116,6 +182,8 @@ def main():
         print(f"Artifact path: {artifact_path}")
 
     # Save artifact path for the runner
+    # pipelined-LWW kernels are routing_mode=2; otherwise honor --routing-mode
+    effective_routing_mode = 2 if args.lww_layout is not None else args.routing_mode
     output_data = {
         "artifact_path": artifact_path,
         "num_cols": args.num_cols,
@@ -126,7 +194,9 @@ def main():
         "max_relay": args.max_relay,
         "max_palette_size": args.max_palette_size,
         "max_list_size": args.max_list_size,
-        "routing_mode": args.routing_mode,
+        "routing_mode": effective_routing_mode,
+        "lww_layout": args.lww_layout,
+        "seg_size": args.seg_size,
         "hardware": args.hardware,
     }
     with open(args.output, 'w', encoding='utf8') as f:

@@ -1,0 +1,16 @@
+# Salvage matrix: sw-relay + east_seg at the larger sizes that the
+# original matrix would have produced if 2d_seg2 hadn't blocked progress.
+# Same columns as cs3_matrix.tsv:
+#   test_name | grid_rows | num_pes | impl | golden_dir | max_minutes
+
+# Medium scale (64 PE)
+# row5 sw-relay test14 8x64 already running orphan from prior matrix; don't re-run.
+test14_random_200nodes	1	64	east_seg	tests/golden_normal	20
+
+# Large (256 PE)
+test15_random_500nodes	16	256	sw-relay	tests/golden_normal	30
+test15_random_500nodes	1	256	east_seg	tests/golden_normal	30
+
+# Real chemistry workload at 64 PE for both
+H2_631g_89nodes	8	64	sw-relay	tests/golden_normal	20
+H2_631g_89nodes	1	64	east_seg	tests/golden_normal	20

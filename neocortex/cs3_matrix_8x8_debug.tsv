@@ -1,0 +1,20 @@
+# Bisect why test1 8x8 2d_seg2 hangs at Level 0 with the v5 epoch fix
+# (test1 4x4 and test12 4x4 pass).
+#
+# Columns: test_name | grid_rows | num_pes | impl | golden_dir | max_minutes
+#
+# Probe A: SOLO test1 8x8 (no preceding rows). Rules out matrix
+#          sequencing as the cause.
+test1_all_commute_4nodes	8	64	2d_seg2	tests/golden_normal	20
+#
+# Probe B: 8-row col chain ONLY. num_cols=1, num_rows=8 means row
+#          barrier short-circuits, only the col chain runs.
+#          PASS => col chain at length 8 is fine in isolation.
+#          HANG => col chain length 8 is the bug.
+test1_all_commute_4nodes	8	8	2d_seg2	tests/golden_normal	20
+#
+# Probe C: 8-col row chain ONLY. num_rows=1, num_cols=8 means col
+#          barrier short-circuits, only the row chain runs.
+#          PASS => row chain at length 8 is fine.
+#          HANG => row chain length 8 is the bug.
+test1_all_commute_4nodes	1	8	2d_seg2	tests/golden_normal	20

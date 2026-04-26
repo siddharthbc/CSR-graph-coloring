@@ -1,0 +1,23 @@
+# Phase 2: validate the --launcher-per-level fix on the previously-hung
+# 2d_seg2 configs, plus salvage runs for sw-relay/east_seg at sizes
+# we don't yet have data for. Run after fix1 (validated 2026-04-25 on
+# test1 4x4 2d_seg2 -- L0+L1 PASS).
+#
+# Columns: test_name | grid_rows | num_pes | impl | golden_dir | max_minutes
+# Per-level wsjob cycling adds ~90s per BSP level for 2d_seg2 entries;
+# wide budgets reflect that.
+
+# --- Fix validation: previously-hung configs ---
+test12_many_nodes_20nodes	4	16	2d_seg2	tests/golden_normal	30
+test1_all_commute_4nodes	8	64	2d_seg2	tests/golden_normal	30
+
+# --- 2d_seg2 medium scale with fix ---
+test14_random_200nodes	8	64	2d_seg2	tests/golden_normal	90
+
+# --- east_seg salvage at larger sizes ---
+test14_random_200nodes	1	64	east_seg	tests/golden_normal	30
+test15_random_500nodes	1	256	east_seg	tests/golden_normal	45
+
+# --- chemistry workload, both implementations for parity ---
+H2_631g_89nodes	8	64	2d_seg2	tests/golden_normal	60
+H2_631g_89nodes	8	64	sw-relay	tests/golden_normal	30

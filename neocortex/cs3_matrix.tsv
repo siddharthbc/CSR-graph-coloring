@@ -1,0 +1,31 @@
+# WSE-3 hardware run matrix for the Picasso scaling study.
+# Columns (tab-separated):
+#   test_name | grid_rows | num_pes | impl | golden_dir | max_minutes
+# impl is one of: sw-relay, 2d_seg2, east_seg
+# Lines starting with '#' are comments.
+#
+# Layout: smoke trio (3 small) -> medium (8x8 / 1x64) -> large (16x16) ->
+# top-end 2d_seg2 (32x32, 64x64) -> realistic chemistry workload.
+# max_minutes is a soft warning threshold; runs that exceed it print a
+# warning but the wsjob is NOT auto-cancelled.
+
+# --- smoke trio: same test on all three implementations ---
+test12_many_nodes_20nodes	4	16	2d_seg2	tests/golden_normal	15
+test12_many_nodes_20nodes	4	16	sw-relay	tests/golden_normal	15
+test12_many_nodes_20nodes	1	16	east_seg	tests/golden_normal	15
+
+# --- medium scale: 64 PEs ---
+test14_random_200nodes	8	64	2d_seg2	tests/golden_normal	20
+test14_random_200nodes	8	64	sw-relay	tests/golden_normal	20
+test14_random_200nodes	1	64	east_seg	tests/golden_normal	20
+
+# --- large: 256 PEs ---
+test15_random_500nodes	16	256	2d_seg2	tests/golden_normal	30
+test15_random_500nodes	16	256	sw-relay	tests/golden_normal	30
+
+# --- top-end 2d_seg2 scaling probe (newly enabled by cap lift) ---
+test15_random_500nodes	32	1024	2d_seg2	tests/golden_normal	45
+test15_random_500nodes	64	4096	2d_seg2	tests/golden_normal	60
+
+# --- real chemistry workload ---
+H2_631g_89nodes	8	64	2d_seg2	tests/golden_normal	20

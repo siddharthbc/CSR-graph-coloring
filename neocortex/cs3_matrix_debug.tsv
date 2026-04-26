@@ -1,0 +1,16 @@
+# Debug-bisection probes for the 2d_seg2 hardware-only hang.
+# Each probe targets a specific axis: density, grid size, single-vs-dual axis.
+# Same columns as cs3_matrix.tsv:
+#   test_name | grid_rows | num_pes | impl | golden_dir | max_minutes
+#
+# Probe A: trivial graph at 8x8 (no edges, but dual-axis fabric active)
+#          PASS => density triggers; HANG => grid alone triggers
+test1_all_commute_4nodes	8	64	2d_seg2	tests/golden_normal	15
+#
+# Probe B: dense graph, single row (col-chain unused)
+#          PASS => col-chain is the failing route
+test12_many_nodes_20nodes	1	4	2d_seg2	tests/golden_normal	15
+#
+# Probe C: dense graph, minimal dual-axis (4 cols x 2 rows)
+#          HANG => simplest failing config; ideal repro for kernel inspection
+test12_many_nodes_20nodes	2	8	2d_seg2	tests/golden_normal	15

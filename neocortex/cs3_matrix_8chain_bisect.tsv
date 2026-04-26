@@ -1,0 +1,12 @@
+# Bisect: which axis breaks at chain length 8?
+# (test1 8x8 hangs at Level 0 with v5 epoch fix; 4x4 works.)
+#
+# Columns: test_name | grid_rows | num_pes | impl | golden_dir | max_minutes
+#
+# Probe B: 8-row col chain ONLY. num_cols = 8/8 = 1, num_rows = 8.
+#          Row barrier short-circuits, only the col chain runs at length 8.
+test1_all_commute_4nodes	8	8	2d_seg2	tests/golden_normal	15
+#
+# Probe C: 8-col row chain ONLY. num_cols = 8/1 = 8, num_rows = 1.
+#          Col barrier short-circuits, only the row chain runs at length 8.
+test1_all_commute_4nodes	1	8	2d_seg2	tests/golden_normal	15
