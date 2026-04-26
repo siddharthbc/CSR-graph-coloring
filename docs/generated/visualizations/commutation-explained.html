@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Commuting vs Anticommuting Pauli Strings</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@300;400;600;700;800&display=swap');
+  :root{
+    --bg:#060710;--s1:#0d0f18;--s2:#141724;--s3:#1b1f30;
+    --bdr:#252a3e;--text:#e2e5f0;--dim:#5a5f7a;
+    --red:#ef4444;--orange:#f97316;--yellow:#eab308;
+    --green:#22c55e;--cyan:#06b6d4;--blue:#3b82f6;
+    --purple:#8b5cf6;--pink:#ec4899;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:var(--bg);color:var(--text);font-family:'Outfit',sans-serif;}
+
+  .hdr{display:flex;align-items:center;gap:14px;padding:16px 24px;border-bottom:1px solid var(--bdr);}
+  .hdr-icon{width:34px;height:34px;border-radius:8px;background:linear-gradient(135deg,var(--cyan),var(--pink));display:grid;place-items:center;font-weight:800;font-size:14px;color:#fff;}
+  .hdr h1{font-size:17px;font-weight:700;} .hdr em{font-style:normal;color:var(--cyan);}
+
+  .tabs{display:flex;background:var(--s1);border-bottom:1px solid var(--bdr);overflow-x:auto;}
+  .tab{padding:13px 22px;font-size:12px;font-weight:600;color:var(--dim);cursor:pointer;white-space:nowrap;border-bottom:2px solid transparent;transition:all .2s;font-family:'DM Mono',monospace;}
+  .tab:hover{color:var(--text);} .tab.on{color:var(--cyan);border-bottom-color:var(--cyan);}
+  .tab .tn{display:inline-block;width:18px;height:18px;border-radius:50%;background:var(--bdr);text-align:center;line-height:18px;font-size:10px;margin-right:6px;}
+  .tab.on .tn{background:var(--cyan);color:var(--bg);}
+
+  .wrap{max-width:1020px;margin:0 auto;padding:28px;}
+  .pnl{display:none;}.pnl.on{display:block;}
+
+  .info{background:linear-gradient(135deg,rgba(124,108,240,.06),rgba(0,212,207,.03));border:1px solid rgba(124,108,240,.15);border-radius:11px;padding:18px 22px;font-size:13.5px;line-height:1.85;margin-bottom:20px;}
+  .info b{color:var(--cyan);} .info strong{color:var(--yellow);}
+  .info code{background:rgba(0,212,207,.08);padding:1px 6px;border-radius:4px;font-family:'DM Mono',monospace;font-size:12px;color:var(--yellow);}
+
+  .note{border-radius:10px;padding:14px 18px;font-size:13px;line-height:1.75;margin:16px 0;}
+  .note-green{background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.2);} .note-green b{color:var(--green);}
+  .note-red{background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.2);} .note-red b{color:var(--red);}
+  .note-yellow{background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.2);} .note-yellow b{color:var(--yellow);}
+  .note-cyan{background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.2);} .note-cyan b{color:var(--cyan);}
+
+  .btns{display:flex;justify-content:space-between;margin-top:28px;}
+  .btn{padding:11px 26px;border:none;border-radius:9px;font-family:'Outfit',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;}
+  .btn:hover{transform:translateY(-1px);} .btn:disabled{opacity:.3;cursor:default;transform:none;}
+  .btn-p{background:var(--s2);color:var(--text);border:1px solid var(--bdr);}
+  .btn-n{background:linear-gradient(135deg,var(--purple),#9b6cf0);color:#fff;}
+
+  /* Pauli matrix cards */
+  .matrix-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:16px 0;}
+  .mx-card{background:var(--s1);border:1px solid var(--bdr);border-radius:12px;padding:18px;text-align:center;}
+  .mx-card .mx-symbol{font-size:28px;font-weight:800;font-family:'DM Mono',monospace;margin-bottom:8px;}
+  .mx-card .mx-name{font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;margin-bottom:10px;}
+  .mx-card .mx-matrix{font-family:'DM Mono',monospace;font-size:12px;line-height:1.8;color:var(--text);background:var(--s2);border-radius:8px;padding:10px;margin-bottom:10px;}
+  .mx-card .mx-prop{font-size:10px;color:var(--dim);line-height:1.6;}
+
+  /* Commutation table */
+  .comm-table{margin:20px auto;border-collapse:collapse;}
+  .comm-table th,.comm-table td{width:64px;height:48px;text-align:center;font-family:'DM Mono',monospace;font-size:13px;font-weight:600;border:1px solid var(--bdr);}
+  .comm-table th{background:var(--s2);color:var(--dim);font-size:11px;}
+  .comm-table .comm{background:rgba(239,68,68,.08);color:var(--red);}
+  .comm-table .anti{background:rgba(34,197,94,.08);color:var(--green);}
+  .comm-table .same{background:var(--s2);color:var(--dim);}
+
+  /* Interactive comparison */
+  .picker-row{display:flex;gap:20px;margin:16px 0;align-items:flex-start;}
+  .picker{flex:1;background:var(--s1);border:1px solid var(--bdr);border-radius:12px;padding:18px;}
+  .picker .pk-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;font-family:'DM Mono',monospace;margin-bottom:12px;}
+  .picker .pk-slots{display:flex;gap:6px;justify-content:center;}
+  .pk-slot{width:56px;display:flex;flex-direction:column;align-items:center;gap:4px;}
+  .pk-slot .slot-label{font-size:9px;color:var(--dim);font-family:'DM Mono',monospace;}
+  .pk-slot select{width:52px;padding:8px 4px;border-radius:8px;border:1px solid var(--bdr);background:var(--s2);color:var(--text);font-family:'DM Mono',monospace;font-size:16px;font-weight:700;text-align:center;cursor:pointer;-webkit-appearance:none;appearance:none;}
+  .pk-slot select option{font-size:14px;}
+
+  /* Comparison result area */
+  .compare-area{background:var(--s1);border:1px solid var(--bdr);border-radius:14px;padding:24px;margin:20px 0;}
+  .cmp-strings{display:flex;justify-content:center;gap:40px;align-items:center;margin-bottom:20px;}
+  .cmp-str{font-family:'DM Mono',monospace;font-size:32px;font-weight:800;letter-spacing:8px;}
+  .cmp-vs{font-size:16px;color:var(--dim);font-weight:600;}
+
+  .cmp-positions{display:flex;justify-content:center;gap:12px;margin:20px 0;}
+  .cmp-pos{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:80px;}
+  .cmp-pos .pos-label{font-size:9px;color:var(--dim);font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:1px;}
+  .cmp-pos .pos-chars{display:flex;flex-direction:column;align-items:center;gap:4px;}
+  .cmp-pos .pos-char{width:44px;height:44px;border-radius:8px;display:grid;place-items:center;font-family:'DM Mono',monospace;font-size:20px;font-weight:800;}
+  .cmp-pos .pos-arrow{font-size:14px;color:var(--dim);}
+  .cmp-pos .pos-result{font-size:10px;font-weight:700;font-family:'DM Mono',monospace;padding:3px 8px;border-radius:6px;margin-top:4px;}
+  .pos-result.match{background:rgba(90,95,122,.15);color:var(--dim);}
+  .pos-result.mismatch{background:rgba(236,72,153,.12);color:var(--pink);}
+
+  .cmp-verdict{text-align:center;margin-top:20px;padding:18px;border-radius:12px;}
+  .cmp-verdict .v-count{font-family:'DM Mono',monospace;font-size:14px;margin-bottom:8px;}
+  .cmp-verdict .v-result{font-size:20px;font-weight:800;}
+  .cmp-verdict .v-meaning{font-size:13px;margin-top:8px;line-height:1.7;}
+  .cmp-verdict .v-equation{font-family:'DM Mono',monospace;font-size:14px;margin-top:12px;padding:10px;background:rgba(255,255,255,.03);border-radius:8px;}
+
+  .cmp-verdict.anti{background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.2);}
+  .cmp-verdict.anti .v-result{color:var(--green);}
+  .cmp-verdict.comm{background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.2);}
+  .cmp-verdict.comm .v-result{color:var(--red);}
+
+  /* Preset examples */
+  .presets{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0;}
+  .preset-btn{padding:8px 14px;border:1px solid var(--bdr);border-radius:8px;background:var(--s2);color:var(--text);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;transition:all .2s;}
+  .preset-btn:hover{border-color:var(--cyan);background:rgba(6,182,212,.05);}
+
+  /* Summary chain */
+  .chain{display:flex;align-items:center;justify-content:center;gap:0;margin:20px 0;flex-wrap:wrap;}
+  .chain-box{background:var(--s1);border:1px solid var(--bdr);border-radius:10px;padding:14px 16px;text-align:center;min-width:120px;}
+  .chain-box .cb-top{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;font-family:'DM Mono',monospace;margin-bottom:4px;}
+  .chain-box .cb-main{font-size:12px;font-weight:600;}
+  .chain-arr{font-size:16px;color:var(--dim);padding:0 4px;}
+
+  /* All pairs grid */
+  .all-pairs{margin:20px 0;}
+  .pair-row{display:flex;align-items:center;gap:12px;padding:8px 14px;border-radius:8px;margin:4px 0;font-family:'DM Mono',monospace;font-size:12px;}
+  .pair-row.anti-row{background:rgba(34,197,94,.04);} .pair-row.comm-row{background:rgba(239,68,68,.04);}
+  .pair-strings{min-width:200px;font-weight:600;letter-spacing:1px;}
+  .pair-mismatches{min-width:100px;color:var(--dim);}
+  .pair-badge{padding:3px 10px;border-radius:6px;font-size:10px;font-weight:700;}
+  .pair-badge.anti{background:rgba(34,197,94,.12);color:var(--green);}
+  .pair-badge.comm{background:rgba(239,68,68,.12);color:var(--red);}
+  .pair-meaning{color:var(--dim);font-size:11px;flex:1;}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <div class="hdr-icon">↔</div>
+  <h1>Commuting vs Anticommuting <em>Pauli Strings</em></h1>
+</div>
+
+<div class="tabs" id="tabs">
+  <div class="tab on" data-s="0"><span class="tn">1</span>The Basics</div>
+  <div class="tab" data-s="1"><span class="tn">2</span>How to Check</div>
+  <div class="tab" data-s="2"><span class="tn">3</span>Try It Yourself</div>
+  <div class="tab" data-s="3"><span class="tn">4</span>Why It Matters</div>
+  <div class="tab" data-s="4"><span class="tn">5</span>Full Picture</div>
+</div>
+
+<div class="wrap">
+
+<!-- ======== PANEL 0: BASICS ======== -->
+<div class="pnl on" id="p0">
+  <div class="info">
+    Every Pauli string is built from four basic 2×2 matrices: <b>I, X, Y, Z</b>.
+    Before understanding commutation of strings, let's see how these <strong>individual matrices</strong> commute with each other.
+  </div>
+
+  <div class="matrix-grid">
+    <div class="mx-card">
+      <div class="mx-symbol" style="color:var(--dim);">I</div>
+      <div class="mx-name">Identity</div>
+      <div class="mx-matrix">[ 1  0 ]<br>[ 0  1 ]</div>
+      <div class="mx-prop">Does nothing.<br>Commutes with everything.</div>
+    </div>
+    <div class="mx-card">
+      <div class="mx-symbol" style="color:var(--pink);">X</div>
+      <div class="mx-name">Pauli-X (bit flip)</div>
+      <div class="mx-matrix">[ 0  1 ]<br>[ 1  0 ]</div>
+      <div class="mx-prop">Flips |0⟩ ↔ |1⟩<br>Like a NOT gate.</div>
+    </div>
+    <div class="mx-card">
+      <div class="mx-symbol" style="color:var(--cyan);">Y</div>
+      <div class="mx-name">Pauli-Y (flip + phase)</div>
+      <div class="mx-matrix">[ 0  -i ]<br>[ i   0 ]</div>
+      <div class="mx-prop">Flips with a phase.<br>Combines X and Z.</div>
+    </div>
+    <div class="mx-card">
+      <div class="mx-symbol" style="color:var(--yellow);">Z</div>
+      <div class="mx-name">Pauli-Z (phase flip)</div>
+      <div class="mx-matrix">[ 1   0 ]<br>[ 0  -1 ]</div>
+      <div class="mx-prop">Flips the phase of |1⟩.<br>Leaves |0⟩ alone.</div>
+    </div>
+  </div>
+
+  <div class="info" style="margin-top:20px;">
+    <b>Key fact:</b> Any two <strong>distinct</strong> non-identity Pauli matrices <strong>anticommute</strong>.
+    That means X·Y = −Y·X, and Y·Z = −Z·Y, and X·Z = −Z·X.
+    Same matrices commute: X·X = X·X. And I commutes with everything.
+  </div>
+
+  <div style="text-align:center;font-size:13px;font-weight:700;margin:16px 0;color:var(--dim);">Single-matrix commutation table:</div>
+  <table class="comm-table" style="margin:0 auto;">
+    <tr><th></th><th style="color:var(--dim);">I</th><th style="color:var(--pink);">X</th><th style="color:var(--cyan);">Y</th><th style="color:var(--yellow);">Z</th></tr>
+    <tr><th style="color:var(--dim);">I</th><td class="same">—</td><td class="same">C</td><td class="same">C</td><td class="same">C</td></tr>
+    <tr><th style="color:var(--pink);">X</th><td class="same">C</td><td class="same">—</td><td class="anti">A</td><td class="anti">A</td></tr>
+    <tr><th style="color:var(--cyan);">Y</th><td class="same">C</td><td class="anti">A</td><td class="same">—</td><td class="anti">A</td></tr>
+    <tr><th style="color:var(--yellow);">Z</th><td class="same">C</td><td class="anti">A</td><td class="anti">A</td><td class="same">—</td></tr>
+  </table>
+  <div style="text-align:center;font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;margin-top:8px;">
+    C = commute (same or involves I) &nbsp;|&nbsp; <span style="color:var(--green);">A = anticommute (different non-identity)</span>
+  </div>
+
+  <div class="note note-yellow">
+    <b>The rule for single matrices is simple:</b> Two non-identity Pauli matrices anticommute if and only if they are <b>different</b>. 
+    X vs Y → anticommute. X vs X → commute. Anything vs I → commute.
+    This is the building block for checking entire strings.
+  </div>
+
+  <div class="btns">
+    <button class="btn btn-p" disabled>← Previous</button>
+    <button class="btn btn-n" onclick="go(1)">Next: How to Check Strings →</button>
+  </div>
+</div>
+
+<!-- ======== PANEL 1: HOW TO CHECK ======== -->
+<div class="pnl" id="p1">
+  <div class="info">
+    A Pauli <b>string</b> is N matrices side by side, one per qubit. To check if two strings commute or anticommute,
+    compare them <strong>position by position</strong> and count the <strong>mismatches</strong>.
+  </div>
+
+  <div class="note note-cyan">
+    <b>The algorithm:</b><br>
+    1. Compare position by position<br>
+    2. At each position: if BOTH characters are non-I AND different → that's a <b>mismatch</b><br>
+    3. Count total mismatches<br>
+    4. <b>Odd count → anticommute</b> &nbsp;|&nbsp; <b>Even count (including 0) → commute</b>
+  </div>
+
+  <div style="font-size:14px;font-weight:700;margin:24px 0 12px;">Example 1: XXYY vs XXZZ</div>
+  <div class="compare-area" id="example1"></div>
+
+  <div style="font-size:14px;font-weight:700;margin:24px 0 12px;">Example 2: XXYY vs YYXX</div>
+  <div class="compare-area" id="example2"></div>
+
+  <div style="font-size:14px;font-weight:700;margin:24px 0 12px;">Example 3: XYXY vs YXYX</div>
+  <div class="compare-area" id="example3"></div>
+
+  <div class="note note-yellow">
+    <b>Why only odd/even matters:</b> Each position-wise anticommutation contributes a factor of −1.
+    Multiply all factors together: an odd number of −1s gives −1 overall (anticommute), 
+    an even number gives +1 (commute). It's just parity.
+  </div>
+
+  <div class="btns">
+    <button class="btn btn-p" onclick="go(0)">← Previous</button>
+    <button class="btn btn-n" onclick="go(2)">Next: Try It Yourself →</button>
+  </div>
+</div>
+
+<!-- ======== PANEL 2: INTERACTIVE ======== -->
+<div class="pnl" id="p2">
+  <div class="info">
+    Build your own two Pauli strings and see the comparison in real time.
+    Change any character and watch how the mismatch count and commutation result update instantly.
+  </div>
+
+  <div class="presets">
+    <span style="font-size:11px;color:var(--dim);font-family:'DM Mono',monospace;padding:8px 0;">Presets:</span>
+    <div class="preset-btn" onclick="setPreset('XXYY','XXZZ')">XXYY vs XXZZ</div>
+    <div class="preset-btn" onclick="setPreset('XXYY','YYXX')">XXYY vs YYXX</div>
+    <div class="preset-btn" onclick="setPreset('XYXY','YXYX')">XYXY vs YXYX</div>
+    <div class="preset-btn" onclick="setPreset('IIII','XXYY')">IIII vs XXYY</div>
+    <div class="preset-btn" onclick="setPreset('XYZZ','YXZZ')">XYZZ vs YXZZ</div>
+    <div class="preset-btn" onclick="setPreset('XXXX','YYYY')">XXXX vs YYYY</div>
+    <div class="preset-btn" onclick="setPreset('XYZI','YZXI')">XYZI vs YZXI</div>
+  </div>
+
+  <div class="picker-row">
+    <div class="picker">
+      <div class="pk-title" style="color:var(--pink);">String A</div>
+      <div class="pk-slots" id="pickA"></div>
+    </div>
+    <div class="picker">
+      <div class="pk-title" style="color:var(--cyan);">String B</div>
+      <div class="pk-slots" id="pickB"></div>
+    </div>
+  </div>
+
+  <div class="compare-area" id="liveCompare"></div>
+
+  <div class="btns">
+    <button class="btn btn-p" onclick="go(1)">← Previous</button>
+    <button class="btn btn-n" onclick="go(3)">Next: Why It Matters →</button>
+  </div>
+</div>
+
+<!-- ======== PANEL 3: WHY IT MATTERS ======== -->
+<div class="pnl" id="p3">
+  <div class="info">
+    Commutation isn't just math — it determines what you can <b>physically do</b> on a quantum computer.
+    Here's the chain of consequences.
+  </div>
+
+  <div style="font-size:14px;font-weight:700;margin:20px 0 12px;color:var(--green);">If two strings ANTICOMMUTE:</div>
+  <div class="chain">
+    <div class="chain-box"><div class="cb-top" style="color:var(--green);">Math</div><div class="cb-main">P₁P₂ = <b>−</b>P₂P₁</div></div>
+    <div class="chain-arr">→</div>
+    <div class="chain-box"><div class="cb-top" style="color:var(--green);">Eq. 2 holds</div><div class="cb-main">p*ᵢpⱼPᵢPⱼ cancels</div></div>
+    <div class="chain-arr">→</div>
+    <div class="chain-box"><div class="cb-top" style="color:var(--green);">Physics</div><div class="cb-main">Can combine into<br>one unitary</div></div>
+    <div class="chain-arr">→</div>
+    <div class="chain-box"><div class="cb-top" style="color:var(--green);">Practical</div><div class="cb-main">Measure together<br>in 1 round</div></div>
+  </div>
+
+  <div style="font-size:14px;font-weight:700;margin:28px 0 12px;color:var(--red);">If two strings COMMUTE:</div>
+  <div class="chain">
+    <div class="chain-box"><div class="cb-top" style="color:var(--red);">Math</div><div class="cb-main">P₁P₂ = <b>+</b>P₂P₁</div></div>
+    <div class="chain-arr">→</div>
+    <div class="chain-box"><div class="cb-top" style="color:var(--red);">Eq. 2 fails</div><div class="cb-main">Terms don't cancel</div></div>
+    <div class="chain-arr">→</div>
+    <div class="chain-box"><div class="cb-top" style="color:var(--red);">Physics</div><div class="cb-main">Cannot combine<br>into one unitary</div></div>
+    <div class="chain-arr">→</div>
+    <div class="chain-box"><div class="cb-top" style="color:var(--red);">Practical</div><div class="cb-main">Must measure<br>separately</div></div>
+  </div>
+
+  <div class="note note-yellow" style="margin-top:24px;">
+    <b>The key equation (Eq. 2 from the paper):</b><br><br>
+    For m Pauli strings to be combined, we need: Σᵢ,ⱼ p*ᵢpⱼPᵢPⱼ = 0<br><br>
+    This sum equals zero ONLY when every pair anticommutes, because:<br>
+    • If PᵢPⱼ = −PⱼPᵢ (anticommute), then p*ᵢpⱼPᵢPⱼ + p*ⱼpᵢPⱼPᵢ = 0 — the terms cancel!<br>
+    • If PᵢPⱼ = +PⱼPᵢ (commute), then p*ᵢpⱼPᵢPⱼ + p*ⱼpᵢPⱼPᵢ ≠ 0 — they add up instead of canceling<br><br>
+    So <b>mutual anticommutation is the mathematical condition</b> that makes grouping valid.
+  </div>
+
+  <div class="note note-green">
+    <b>Connection to graph coloring:</b><br><br>
+    • <b>Anticommute → edge in original graph G</b> → can be in the same clique → same group ✓<br>
+    • <b>Commute → edge in complement graph G'</b> → must have different colors → different groups ✓<br><br>
+    Valid coloring of G' ensures every group only contains mutually anticommuting strings.
+    That's the entire bridge from quantum physics to graph theory.
+  </div>
+
+  <div class="btns">
+    <button class="btn btn-p" onclick="go(2)">← Previous</button>
+    <button class="btn btn-n" onclick="go(4)">Next: Full Picture →</button>
+  </div>
+</div>
+
+<!-- ======== PANEL 4: FULL PICTURE ======== -->
+<div class="pnl" id="p4">
+  <div class="info">
+    Let's see all pairs from a set of Pauli strings, which ones commute, which anticommute,
+    and what that means for grouping. This is exactly what Picasso computes on-the-fly.
+  </div>
+
+  <div class="all-pairs" id="allPairs"></div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:24px 0;">
+    <div class="note note-green" style="margin:0;">
+      <b>Anticommuting pairs (edges in G):</b><br>
+      These strings CAN be grouped together. In the graph, they're connected.
+      A clique of mutually anticommuting strings = one unitary = one measurement round.
+    </div>
+    <div class="note note-red" style="margin:0;">
+      <b>Commuting pairs (edges in G'):</b><br>
+      These strings MUST be in different groups. In the complement graph,
+      they're connected. Same color = violation. Picasso colors G' to prevent this.
+    </div>
+  </div>
+
+  <div class="note note-cyan">
+    <b>The complete picture:</b><br><br>
+    1. Start with Pauli strings from molecular Hamiltonian<br>
+    2. Each pair either commutes or anticommutes (determined by position-wise mismatch parity)<br>
+    3. Anticommuting pairs → edges in original graph G (compatible for grouping)<br>
+    4. Commuting pairs → edges in complement graph G' (must separate)<br>
+    5. Color G' validly → same-color vertices form cliques in G → each clique is one unitary<br>
+    6. Picasso does step 5 memory-efficiently using O(n log³n) conflict subgraphs<br><br>
+    <b>Everything traces back to this one question: do these two strings commute or anticommute?</b>
+  </div>
+
+  <div class="btns">
+    <button class="btn btn-p" onclick="go(3)">← Previous</button>
+    <button class="btn btn-n" disabled>Complete ✓</button>
+  </div>
+</div>
+
+</div>
+
+<script>
+const CH_COLORS={I:'#5a5f7a',X:'#ec4899',Y:'#06b6d4',Z:'#eab308'};
+
+function checkPair(a,b){
+  const positions=[];
+  let mismatches=0;
+  for(let i=0;i<a.length;i++){
+    const ca=a[i],cb=b[i];
+    const bothNonI=ca!=='I'&&cb!=='I';
+    const diff=ca!==cb;
+    const isMismatch=bothNonI&&diff;
+    if(isMismatch) mismatches++;
+    let reason='';
+    if(ca==='I'||cb==='I') reason='I involved → no mismatch';
+    else if(!diff) reason='Same → no mismatch';
+    else reason='Different non-I → MISMATCH';
+    positions.push({ca,cb,isMismatch,reason});
+  }
+  return{positions,mismatches,anticommute:mismatches%2===1};
+}
+
+function renderComparison(containerId,a,b){
+  const el=document.getElementById(containerId);
+  const r=checkPair(a,b);
+
+  let posHTML='';
+  r.positions.forEach((p,i)=>{
+    posHTML+=`
+      <div class="cmp-pos">
+        <div class="pos-label">Qubit ${i+1}</div>
+        <div class="pos-chars">
+          <div class="pos-char" style="background:${CH_COLORS[p.ca]}20;color:${CH_COLORS[p.ca]};border:1px solid ${CH_COLORS[p.ca]}40;">${p.ca}</div>
+          <div class="pos-arrow">↕</div>
+          <div class="pos-char" style="background:${CH_COLORS[p.cb]}20;color:${CH_COLORS[p.cb]};border:1px solid ${CH_COLORS[p.cb]}40;">${p.cb}</div>
+        </div>
+        <div class="pos-result ${p.isMismatch?'mismatch':'match'}">${p.isMismatch?'✗ Mismatch':'— OK'}</div>
+      </div>`;
+  });
+
+  const cls=r.anticommute?'anti':'comm';
+  const resultText=r.anticommute?'ANTICOMMUTE':'COMMUTE';
+  const icon=r.anticommute?'✓':'✗';
+  const meaning=r.anticommute
+    ?'These strings can be <b>grouped together</b> into one unitary. They are compatible for joint measurement.'
+    :'These strings <b>must be in separate groups</b>. They cannot be combined into one unitary.';
+  const eqSign=r.anticommute?'−':'+';
+  const graphMeaning=r.anticommute
+    ?'Edge in original graph G (anticommutation graph) — connected, can be in same clique'
+    :'Edge in complement graph G\' — Picasso must give them different colors';
+
+  el.innerHTML=`
+    <div class="cmp-strings">
+      <div class="cmp-str">${a.split('').map(c=>`<span style="color:${CH_COLORS[c]}">${c}</span>`).join('')}</div>
+      <div class="cmp-vs">vs</div>
+      <div class="cmp-str">${b.split('').map(c=>`<span style="color:${CH_COLORS[c]}">${c}</span>`).join('')}</div>
+    </div>
+    <div class="cmp-positions">${posHTML}</div>
+    <div class="cmp-verdict ${cls}">
+      <div class="v-count">${r.mismatches} mismatch${r.mismatches!==1?'es':''} — ${r.mismatches%2===1?'ODD':'EVEN'}</div>
+      <div class="v-result">${icon} ${resultText}</div>
+      <div class="v-equation">${a} × ${b} = ${eqSign}(${b} × ${a})</div>
+      <div class="v-meaning">${meaning}</div>
+      <div style="font-size:11px;color:var(--dim);margin-top:8px;font-family:'DM Mono',monospace;">${graphMeaning}</div>
+    </div>`;
+}
+
+// Panel 1: Static examples
+function renderExamples(){
+  renderComparison('example1','XXYY','XXZZ');
+  renderComparison('example2','XXYY','YYXX');
+  renderComparison('example3','XYXY','YXYX');
+}
+
+// Panel 2: Interactive
+let strA=['X','X','Y','Y'], strB=['Y','Y','X','X'];
+
+function buildPickers(){
+  const opts=['I','X','Y','Z'];
+  ['pickA','pickB'].forEach((id,si)=>{
+    const el=document.getElementById(id);el.innerHTML='';
+    const arr=si===0?strA:strB;
+    arr.forEach((ch,i)=>{
+      const slot=document.createElement('div');slot.className='pk-slot';
+      slot.innerHTML=`<div class="slot-label">Qubit ${i+1}</div>`;
+      const sel=document.createElement('select');
+      opts.forEach(o=>{
+        const opt=document.createElement('option');
+        opt.value=o;opt.textContent=o;
+        opt.style.color=CH_COLORS[o];
+        if(o===ch)opt.selected=true;
+        sel.appendChild(opt);
+      });
+      sel.style.color=CH_COLORS[ch];
+      sel.onchange=e=>{
+        arr[i]=e.target.value;
+        sel.style.color=CH_COLORS[e.target.value];
+        updateLive();
+      };
+      slot.appendChild(sel);
+      el.appendChild(slot);
+    });
+  });
+}
+
+function updateLive(){
+  renderComparison('liveCompare',strA.join(''),strB.join(''));
+}
+
+function setPreset(a,b){
+  strA=a.split('');strB=b.split('');
+  buildPickers();updateLive();
+}
+
+// Panel 4: All pairs
+function renderAllPairs(){
+  const strings=['IIII','XXYY','YYXX','XXZZ','ZZXX','XYXY','YXYX','XZXZ'];
+  const el=document.getElementById('allPairs');el.innerHTML='';
+
+  let antiCount=0,commCount=0;
+
+  for(let i=0;i<strings.length;i++){
+    for(let j=i+1;j<strings.length;j++){
+      const a=strings[i],b=strings[j];
+      if(a==='IIII'&&b==='IIII') continue;
+      const r=checkPair(a,b);
+      if(r.anticommute) antiCount++; else commCount++;
+
+      const row=document.createElement('div');
+      row.className='pair-row '+(r.anticommute?'anti-row':'comm-row');
+      const mismatchPositions=r.positions.map((p,idx)=>p.isMismatch?(idx+1):'').filter(Boolean).join(',');
+      row.innerHTML=`
+        <div class="pair-strings">
+          <span style="color:var(--pink);">P${i}</span> ${a.split('').map(c=>`<span style="color:${CH_COLORS[c]}">${c}</span>`).join('')}
+          &nbsp;↔&nbsp;
+          <span style="color:var(--cyan);">P${j}</span> ${b.split('').map(c=>`<span style="color:${CH_COLORS[c]}">${c}</span>`).join('')}
+        </div>
+        <div class="pair-mismatches">${r.mismatches} mismatch${r.mismatches!==1?'es':''} ${mismatchPositions?'(pos '+mismatchPositions+')':''}</div>
+        <div class="pair-badge ${r.anticommute?'anti':'comm'}">${r.anticommute?'Anticommute':'Commute'}</div>
+        <div class="pair-meaning">${r.anticommute?'→ can group together':'→ must separate'}</div>
+      `;
+      el.appendChild(row);
+    }
+  }
+
+  const summary=document.createElement('div');
+  summary.style.cssText='padding:12px;font-family:"DM Mono",monospace;font-size:12px;margin-top:12px;display:flex;gap:24px;';
+  summary.innerHTML=`
+    <span style="color:var(--green);font-weight:700;">${antiCount} anticommuting pairs → edges in G (can group)</span>
+    <span style="color:var(--red);font-weight:700;">${commCount} commuting pairs → edges in G' (must separate, Picasso colors these)</span>
+  `;
+  el.appendChild(summary);
+}
+
+// Nav
+let cur=0;
+function go(s){
+  cur=s;
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('on',i===s));
+  document.querySelectorAll('.pnl').forEach((p,i)=>p.classList.toggle('on',i===s));
+  if(s===1) renderExamples();
+  if(s===2){buildPickers();updateLive();}
+  if(s===4) renderAllPairs();
+}
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>go(+t.dataset.s));
+</script>
+</body>
+</html>

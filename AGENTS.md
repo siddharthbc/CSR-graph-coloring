@@ -122,8 +122,128 @@ Unless the task explicitly asks for them, ignore these during initial exploratio
   to that layout.
 - 2D back-channel kernel (`--lww-layout 2d`) PASSES 12/12 at 2×2.
   Larger 2D grids are NOT yet supported — wait for Step 4b.
+- 2D segmented dual-axis (`--lww-layout 2d_seg2`, post-CP2d.d.2)
+  PASSES at 4×4 / 8×8 / 16×16 in simulator. On real WSE-3,
+  4×4 dual-axis fully validated post-CP3.epoch (test1, test12
+  PASS in single shared wsjob). 8×8+ on hardware needs the
+  `--launcher-per-level` workaround pending an init-race fix.
 - `test11_full_commute_10nodes` and `test12_many_nodes_20nodes` are no
   longer known-broken; treat them as regular tests.
+
+## CP3.epoch — Cross-Launch Fabric Residual Tagging (2026-04-26)
+
+When a kernel is launched per BSP level (host-driven recursion)
+the fabric IQs retain wavelets from the previous level's last
+rounds. After `runner.load()` flashes new ELFs the IQ-bound tasks
+fire on these stale wavelets; the parity-only classification
+(`current_round & 0x1`) cannot distinguish "previous level same
+parity" from "current round" → counters get corrupted → BSP
+deadlocks at Level 1+.
+
+**Fix shape (ship in `2d_seg2` first, generalize later):**
+
+- 1-bit level-epoch in every wavelet at **bit[7]**:
+  - data wavelets: bit[31]=0, bit[30]=parity, bits[29:8]=gid (20b),
+    bit[7]=epoch, bits[6:0]=color (7b → max 128 colors).
+  - sentinel/bcast/reduce wavelets: bit[31]=1, bit[30]=parity,
+    bit[29]=bcast opcode, bit[28]=reduce opcode, bit[7]=epoch,
+    bit[0]=value.
+  - col_reduce: minimal pack `(epoch<<7) | (val&0x1)`. NOT
+    `pack_row_reduce`-formatted — bit[31]=1 on col_reduce broke
+    8×8 dual-axis at Level 0 when tried (v4). The col_reduce
+    receiver does its own minimal extraction.
+- `runtime_config: [3]i32` carries `[pe_mask, palette_size,
+  level_epoch]`. Host toggles index [2] = `level & 0x1` per BSP
+  level. `cerebras_host.py` only uploads index [2] when
+  `--lww-layout 2d_seg2`; other kernels keep `[2]i32`.
+- `current_level_epoch` defaults to **2 (sentinel)** so any
+  wavelet that fires before `start_coloring` sets the epoch is
+  unconditionally discarded. `start_coloring` sets the epoch from
+  `runtime_config[2]` as its first instruction.
+- **Critical: epoch check at the TOP of every rx_task**, not just
+  inside `on_recv`/`on_recv_south`. The forwarders
+  (`send_south(w)`, `send_west_back(w)`, `bridge_reinject(w)`,
+  `col_bridge_reinject(w)`) re-emit the wavelet onto fabric
+  verbatim — if the gate is only inside `on_recv`, stale
+  wavelets get FORWARDED to neighbors and flood downstream IQs.
+
+**Init race fix (2026-04-26).** All rx data tasks bind blocked at
+comptime via `@block(task_id)` after `@bind_data_task`. The kernel-
+local helper `unblock_fabric_recv_tasks()` is called at the end of
+`start_coloring` (after `current_level_epoch` is latched and
+per-level state is reset), via `@unblock(task_id)` for each rx
+task. This guarantees no IQ task fires on a stale or fresh wavelet
+before the receiver's epoch is correctly set.
+
+## CP2d.e — Dense 8×8 Dual-Axis Scaling (2026-04-26)
+
+CP3.epoch unblocked **trivial** dual-axis scaling but dense graphs
+still hung at Level 0 due to two compounding issues. Five fixes
+ship together; all required.
+
+1. **Bounds derivation in wrappers** — `neocortex/run_cs3_lww.sh`
+   and `run_cs3.sh` now run a Python pre-step that mirrors
+   `_per_test_max_T()` from the runner, derives per-test
+   `MAX_LIST_SIZE` and `MAX_PALETTE_SIZE`, and **bumps the compile
+   defaults if needed**. Without this, the host's `cl_padded`
+   memcpy_h2d for `color_list[]` overruns the device symbol when
+   runtime `cur_T > artifact max_list_size`, corrupting adjacent
+   state. Runner cap was hardcoded to 2 (test12-only); test14 needs
+   10, test15 needs 12, H2 needs 8.
+2. **CP2d.e — dedicated back-channel route.** `c_W_back_color`
+   routes (per-row, alternating re/ro) restored. New OQ + IQ
+   bindings: `tx_back_oq` on Q4 OQ, `back_recv_iq` on Q3 IQ. New
+   `back_recv_task` simplifies to `on_recv_south(w)` only —
+   hardware auto-forwards westward via `tx={WEST, RAMP}` route at
+   interior PEs. `reduce_recv_task` simplifies to row reduce only
+   (no more opcode dispatch for back-channel data).
+3. **S_row / S_col split.** Single `param S` replaced with
+   `param S_row` and `param S_col`. **`S_col=1` is the default for
+   2d_seg2** (set by `run_cs3_lww.sh` unless `--s-col` overrides).
+   With S_col=1 the col chain becomes single-PE segments,
+   `south_slot_count` drops to 1 globally, `south_rx_iq_1` never
+   binds, and Q3 IQ is free for the dedicated back-channel.
+4. **`@block`/`@unblock` of all rx tasks** (see CP3.epoch section
+   above).
+5. **Send dedupe in `send_boundary`.** Per-vertex per-direction
+   markers (`sent_east_for_v[max_local_verts]`,
+   `sent_south_for_v[max_local_verts]`) skip duplicate `(gid, color)`
+   emissions. Reduces test14 8×8 traffic from ~6,800 wavelets/round
+   to ~256 (27× fewer). Markers reset in `reset_round_state`.
+
+**Static IQ-map validator** at `tools/validate_iq_map_2d_seg2.py`
+mirrors the layout's per-PE queue logic and reports any conflict.
+Run before any kernel/layout change that touches queue assignments:
+
+```bash
+python3 tools/validate_iq_map_2d_seg2.py --num-cols 8 --num-rows 8 \
+    --s-row 2 --s-col 1
+```
+
+**Validation snapshot:** `runs/hardware/matrix_20260426T174339Z/`
+covers test12 4×4 / test14 8×8 / H2 8×8 across all three impls.
+2d_seg2 wins every dual-axis row it ran on (1.35×–2.50× over
+sw-relay).
+
+## Hardware Run Automation (`neocortex/`)
+
+- `run_cs3.sh` — sw-relay / hw-filter wrapper.
+- `run_cs3_lww.sh` — pipelined-LWW wrapper. `--lww-layout`,
+  `--seg-size`, `--launcher-per-level` flags.
+- `run_cs3_matrix.sh <tsv>` — drive a TSV-defined matrix.
+  `timeout -k 60s` per row. On TIMEOUT the row is logged and
+  the matrix continues; **does not auto-cancel the orphan
+  wsjob** — that's an operator decision per project rule.
+- `cs3_status.sh` — read-only snapshot (`csctl get jobs` +
+  recent matrix dirs).
+- TSV format: tab-separated `test_name | grid_rows | num_pes |
+  impl | golden_dir | max_minutes`. impl ∈ {sw-relay, 2d_seg2,
+  east_seg}. The driver auto-dispatches to the right wrapper
+  per impl.
+- Cluster: `siddarthb-cloud@cg3-us27.dfw1.cerebrascloud.com`.
+  SDK 2.5.0 vs cluster server 3.1.x → harmless
+  `InconsistentVersion` warning every wsjob.
+- DNS to the cluster intermittently fails. Wait, don't loop.
 
 ## East-Data-Only Probe (`--lww-east-only`, validated 2026-04-21)
 

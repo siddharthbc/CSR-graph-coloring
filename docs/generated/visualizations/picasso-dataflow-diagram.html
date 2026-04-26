@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Picasso Graph Coloring — System Data Flow Diagram</title>
+<style>
+  :root {
+    --sw-bg: #EFF6FF;
+    --hw-bg: #F0FDF4;
+    --fabric-bg: #ECFDF5;
+    --host-accent: #2563EB;
+    --sdk-accent: #D97706;
+    --fabric-accent: #059669;
+    --data-color: #0891B2;
+    --conflict-color: #DC2626;
+    --border-radius: 10px;
+    --shadow: 0 2px 8px rgba(0,0,0,0.08);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #F9FAFB;
+    color: #1F2937;
+    padding: 24px;
+    min-height: 100vh;
+  }
+  h1 {
+    text-align: center;
+    font-size: 1.6rem;
+    margin-bottom: 6px;
+    color: #111827;
+  }
+  .subtitle {
+    text-align: center;
+    color: #6B7280;
+    font-size: 0.95rem;
+    margin-bottom: 28px;
+  }
+  .legend {
+    display: flex;
+    justify-content: center;
+    gap: 28px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    color: #374151;
+  }
+  .legend-swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: 1px solid rgba(0,0,0,0.12);
+  }
+
+  /* Main diagram container */
+  .diagram {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  /* Swim lanes */
+  .swim-lane {
+    border: 2px solid;
+    border-radius: var(--border-radius);
+    padding: 18px 20px 20px;
+    position: relative;
+  }
+  .swim-lane + .swim-lane { margin-top: -2px; }
+  .lane-label {
+    position: absolute;
+    top: -12px;
+    left: 20px;
+    background: white;
+    padding: 0 10px;
+    font-weight: 700;
+    font-size: 0.85rem;
+    letter-spacing: 0.03em;
+  }
+
+  .lane-sw {
+    border-color: var(--host-accent);
+    background: var(--sw-bg);
+  }
+  .lane-sw .lane-label { color: var(--host-accent); }
+
+  .lane-sdk {
+    border-color: var(--sdk-accent);
+    background: #FFFBEB;
+  }
+  .lane-sdk .lane-label { color: var(--sdk-accent); }
+
+  .lane-hw {
+    border-color: var(--fabric-accent);
+    background: var(--hw-bg);
+  }
+  .lane-hw .lane-label { color: var(--fabric-accent); }
+
+  /* Stage boxes */
+  .stages {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding-top: 8px;
+  }
+  .stage {
+    border-radius: 8px;
+    padding: 12px 14px;
+    min-width: 160px;
+    max-width: 220px;
+    box-shadow: var(--shadow);
+    border: 1.5px solid;
+    position: relative;
+  }
+  .stage-title {
+    font-weight: 700;
+    font-size: 0.82rem;
+    margin-bottom: 5px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .stage-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    font-size: 0.72rem;
+    font-weight: 800;
+    color: white;
+    flex-shrink: 0;
+  }
+  .stage-body {
+    font-size: 0.78rem;
+    color: #4B5563;
+    line-height: 1.45;
+  }
+  .stage-body code {
+    background: rgba(0,0,0,0.06);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 0.75rem;
+  }
+  .stage-file {
+    font-size: 0.7rem;
+    color: #9CA3AF;
+    margin-top: 5px;
+    font-style: italic;
+  }
+
+  .stage-sw {
+    background: white;
+    border-color: var(--host-accent);
+  }
+  .stage-sw .stage-num { background: var(--host-accent); }
+
+  .stage-sdk {
+    background: white;
+    border-color: var(--sdk-accent);
+  }
+  .stage-sdk .stage-num { background: var(--sdk-accent); }
+
+  .stage-hw {
+    background: white;
+    border-color: var(--fabric-accent);
+  }
+  .stage-hw .stage-num { background: var(--fabric-accent); }
+
+  .stage-data {
+    background: white;
+    border-color: var(--data-color);
+  }
+  .stage-data .stage-num { background: var(--data-color); }
+
+  /* Arrow connectors between stages */
+  .arrow-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 36px;
+    position: relative;
+  }
+  .arrow-row svg { display: block; }
+  .arrow-label {
+    font-size: 0.72rem;
+    color: #6B7280;
+    background: #F9FAFB;
+    padding: 0 8px;
+    position: absolute;
+    white-space: nowrap;
+  }
+
+  /* BSP loop detail */
+  .bsp-loop {
+    border: 2px dashed var(--fabric-accent);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-top: 12px;
+    position: relative;
+  }
+  .bsp-label {
+    position: absolute;
+    top: -10px;
+    left: 16px;
+    background: var(--hw-bg);
+    padding: 0 8px;
+    font-weight: 700;
+    font-size: 0.78rem;
+    color: var(--fabric-accent);
+  }
+  .bsp-phases {
+    display: flex;
+    gap: 10px;
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+  .bsp-phase {
+    flex: 1;
+    min-width: 140px;
+    max-width: 200px;
+    background: white;
+    border: 1.5px solid var(--fabric-accent);
+    border-radius: 6px;
+    padding: 10px 12px;
+    box-shadow: var(--shadow);
+  }
+  .bsp-phase-title {
+    font-weight: 700;
+    font-size: 0.78rem;
+    color: var(--fabric-accent);
+    margin-bottom: 4px;
+  }
+  .bsp-phase-body {
+    font-size: 0.73rem;
+    color: #4B5563;
+    line-height: 1.4;
+  }
+  .bsp-arrow {
+    display: flex;
+    align-items: center;
+    font-size: 1.2rem;
+    color: var(--fabric-accent);
+    font-weight: bold;
+    flex-shrink: 0;
+    padding: 0 2px;
+  }
+  .loop-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 8px;
+    font-size: 0.78rem;
+    color: var(--conflict-color);
+    font-weight: 600;
+    gap: 6px;
+  }
+
+  /* Transfer summary table */
+  .transfer-table {
+    width: 100%;
+    max-width: 600px;
+    margin: 16px auto 0;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .transfer-table th {
+    background: #F3F4F6;
+    padding: 6px 10px;
+    text-align: left;
+    font-weight: 600;
+    border-bottom: 2px solid #D1D5DB;
+  }
+  .transfer-table td {
+    padding: 5px 10px;
+    border-bottom: 1px solid #E5E7EB;
+  }
+  .transfer-table tr:last-child td { font-weight: 600; }
+
+  /* Interaction arrows (SVG overlay) */
+  .interaction-note {
+    text-align: center;
+    font-size: 0.75rem;
+    color: #6B7280;
+    margin-top: 6px;
+    font-style: italic;
+  }
+
+  /* Section separators */
+  .sep {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 0;
+  }
+  .sep-arrow {
+    font-size: 1.5rem;
+    color: #9CA3AF;
+  }
+  .sep-text {
+    font-size: 0.75rem;
+    color: #6B7280;
+    margin: 0 12px;
+    white-space: nowrap;
+  }
+
+  /* Data format boxes */
+  .data-format {
+    display: inline-flex;
+    align-items: center;
+    gap: 0;
+    margin: 8px 0;
+    font-size: 0.72rem;
+  }
+  .data-format .field {
+    padding: 4px 8px;
+    border: 1px solid #D1D5DB;
+    font-family: monospace;
+  }
+  .data-format .field:first-child { border-radius: 4px 0 0 4px; }
+  .data-format .field:last-child  { border-radius: 0 4px 4px 0; }
+  .data-format .field + .field    { border-left: none; }
+  .f-gid  { background: #DBEAFE; }
+  .f-dest { background: #FEF3C7; }
+  .f-col  { background: #D1FAE5; }
+
+  @media (max-width: 800px) {
+    .stages, .bsp-phases { flex-direction: column; }
+    .stage, .bsp-phase { max-width: 100%; }
+    .bsp-arrow { transform: rotate(90deg); }
+  }
+</style>
+</head>
+<body>
+
+<h1>Picasso Graph Coloring on Cerebras WSE</h1>
+<p class="subtitle">End-to-End System Data Flow — Software ↔ Hardware Boundary</p>
+
+<div class="legend">
+  <div class="legend-item">
+    <div class="legend-swatch" style="background: var(--host-accent);"></div>
+    Host CPU (Python)
+  </div>
+  <div class="legend-item">
+    <div class="legend-swatch" style="background: var(--sdk-accent);"></div>
+    Cerebras SDK Layer
+  </div>
+  <div class="legend-item">
+    <div class="legend-swatch" style="background: var(--fabric-accent);"></div>
+    WSE Fabric Hardware
+  </div>
+  <div class="legend-item">
+    <div class="legend-swatch" style="background: var(--data-color);"></div>
+    Data Transfer (memcpy)
+  </div>
+</div>
+
+<div class="diagram">
+
+  <!-- ==================== SOFTWARE LANE ==================== -->
+  <div class="swim-lane lane-sw">
+    <span class="lane-label">HOST CPU — Software (Python)</span>
+    <div class="stages">
+
+      <div class="stage stage-sw">
+        <div class="stage-title">
+          <span class="stage-num">1</span> Load Pauli Strings
+        </div>
+        <div class="stage-body">
+          Parse JSON test input<br>
+          Sort operator strings alphabetically<br>
+          Output: list of <em>n</em> Pauli strings
+        </div>
+        <div class="stage-file">run_csl_tests.py → load_pauli_json()</div>
+      </div>
+
+      <div class="stage stage-sw">
+        <div class="stage-title">
+          <span class="stage-num">2</span> Build Conflict Graph
+        </div>
+        <div class="stage-body">
+          O(n²) pairwise commutativity check<br>
+          Commuting pairs → edges<br>
+          Output: <em>n</em> vertices, <em>E</em> undirected edges
+        </div>
+        <div class="stage-file">run_csl_tests.py → build_conflict_graph()</div>
+      </div>
+
+      <div class="stage stage-sw">
+        <div class="stage-title">
+          <span class="stage-num">3</span> CSR Construction
+        </div>
+        <div class="stage-body">
+          Convert edge list to symmetric CSR<br>
+          <code>offsets[n+1]</code> + <code>adj[2E]</code><br>
+          Output: flat arrays, int32
+        </div>
+        <div class="stage-file">run_csl_tests.py → build_csr()</div>
+      </div>
+
+      <div class="stage stage-sw">
+        <div class="stage-title">
+          <span class="stage-num">4</span> Graph Partitioning
+        </div>
+        <div class="stage-body">
+          Contiguous vertex chunking across P PEs<br>
+          Per-PE: local CSR, boundary table, direction<br>
+          Precompute <code>expected_total_recv</code> per PE<br>
+          Compute relay buffer depth (<code>max_relay</code>)
+        </div>
+        <div class="stage-file">run_csl_tests.py → partition_graph()</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Arrow: Software → SDK -->
+  <div class="sep">
+    <span class="sep-arrow">▼</span>
+    <span class="sep-text">Partitioned graph data (per-PE arrays)</span>
+    <span class="sep-arrow">▼</span>
+  </div>
+
+  <!-- ==================== SDK LAYER ==================== -->
+  <div class="swim-lane lane-sdk">
+    <span class="lane-label">CEREBRAS SDK — Compile &amp; Runtime Interface</span>
+    <div class="stages">
+
+      <div class="stage stage-sdk">
+        <div class="stage-title">
+          <span class="stage-num">5a</span> CSL Compilation
+        </div>
+        <div class="stage-body">
+          <code>cslc layout.csl</code> with compile-time params:<br>
+          <code>num_cols, num_rows, max_local_verts,</code><br>
+          <code>max_local_edges, max_boundary,</code><br>
+          <code>max_relay, palette_size</code><br>
+          Sizes all PE-local arrays at compile time
+        </div>
+        <div class="stage-file">cslc (Cerebras compiler)</div>
+      </div>
+
+      <div class="stage stage-sdk">
+        <div class="stage-title">
+          <span class="stage-num">5b</span> Fabric Wiring
+        </div>
+        <div class="stage-body">
+          <b>layout.csl</b> instantiates PE grid<br>
+          11 fabric colors wired:<br>
+          • C0–C3: E/W data (checkerboard)<br>
+          • C4–C7: N/S data (2D only)<br>
+          • C8–C10: sync barrier (1D only)<br>
+          Edge flags and parity set per PE
+        </div>
+        <div class="stage-file">csl/layout.csl</div>
+      </div>
+
+      <div class="stage stage-data">
+        <div class="stage-title">
+          <span class="stage-num">5c</span> H2D Upload
+        </div>
+        <div class="stage-body">
+          <code>SdkRuntime.memcpy_h2d()</code> per PE:<br>
+          • <code>csr_offsets, csr_adj</code><br>
+          • <code>colors</code> (init −1), <code>global_vertex_ids</code><br>
+          • Boundary: <code>local_idx, neighbor_gid, direction</code><br>
+          • <code>verts_per_pe, num_boundary</code><br>
+          • <code>expected_total_recv</code><br>
+          Arrays padded to compile-time max sizes
+        </div>
+        <div class="stage-file">cerebras_host.py → run_coloring()</div>
+      </div>
+
+      <div class="stage stage-sdk">
+        <div class="stage-title">
+          <span class="stage-num">5d</span> Launch Kernel
+        </div>
+        <div class="stage-body">
+          <code>runner.launch('start_coloring')</code><br>
+          All PEs start simultaneously<br>
+          <b>Host blocks — zero intervention until done</b>
+        </div>
+        <div class="stage-file">cerebras_host.py</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Arrow: SDK → Hardware -->
+  <div class="sep">
+    <span class="sep-arrow">▼</span>
+    <span class="sep-text">memcpy via DMA fabric colors → PE SRAM</span>
+    <span class="sep-arrow">▼</span>
+  </div>
+
+  <!-- ==================== HARDWARE LANE ==================== -->
+  <div class="swim-lane lane-hw">
+    <span class="lane-label">WSE FABRIC — Hardware (PE Kernel in CSL)</span>
+
+    <div class="stages" style="margin-bottom: 14px;">
+      <div class="stage stage-hw" style="min-width: 280px; max-width: 400px;">
+        <div class="stage-title">
+          <span class="stage-num">6</span> On-Fabric Autonomous Coloring
+        </div>
+        <div class="stage-body">
+          <b>No host involvement between rounds.</b><br>
+          Each PE executes the same task-driven BSP loop.<br>
+          Hardware TSC timestamps start/end for cycle-accurate timing.<br>
+          7 perf counters track per-phase activity.
+        </div>
+        <div class="stage-file">csl/pe_program.csl — start_coloring()</div>
+      </div>
+    </div>
+
+    <!-- BSP Loop Detail -->
+    <div class="bsp-loop">
+      <span class="bsp-label">BSP Round Loop (repeats until global convergence)</span>
+      <div class="bsp-phases">
+
+        <div class="bsp-phase">
+          <div class="bsp-phase-title">① Speculate</div>
+          <div class="bsp-phase-body">
+            For each uncolored local vertex:<br>
+            • Build forbidden set from local + remote neighbor colors<br>
+            • Pick smallest available color<br>
+            • Intra-PE conflict check: higher GID yields<br>
+            → <code>@activate(send_boundary)</code>
+          </div>
+        </div>
+
+        <div class="bsp-arrow">→</div>
+
+        <div class="bsp-phase">
+          <div class="bsp-phase-title">② Send Boundary</div>
+          <div class="bsp-phase-body">
+            Sort boundary wavelets into per-direction buffers (E/W/S/N)<br>
+            Open receive window (<code>unblock_all_recv</code>)<br>
+            Kick off cooperative send chain<br>
+            <div class="data-format" style="margin-top: 6px;">
+              <span class="field f-gid" title="Sender global vertex ID">GID [31:16]</span>
+              <span class="field f-dest" title="Destination PE index">dest [15:8]</span>
+              <span class="field f-col" title="Color value + 1">col+1 [7:0]</span>
+            </div>
+            <div style="font-size: 0.68rem; color: #9CA3AF;">SW relay wavelet format (32-bit)</div>
+          </div>
+        </div>
+
+        <div class="bsp-arrow">→</div>
+
+        <div class="bsp-phase">
+          <div class="bsp-phase-title">③ Send + Recv + Relay</div>
+          <div class="bsp-phase-body">
+            <b>One wavelet per task activation</b> (prevents FIFO deadlock)<br>
+            Relay buffers: circular queues, drained with priority<br>
+            Recv handlers: route → local delivery or relay buffer<br>
+            <code>recv_remaining</code> decremented on local delivery<br>
+            Completion: send done ∧ recv done ∧ relay drained
+          </div>
+        </div>
+
+        <div class="bsp-arrow">→</div>
+
+        <div class="bsp-phase">
+          <div class="bsp-phase-title">④ Sync Barrier</div>
+          <div class="bsp-phase-body">
+            <b>1D mode:</b> OR-reduce (E→W) + broadcast (W→E)<br>
+            Carries <code>has_uncolored</code> flag<br>
+            Two-flag gate: <code>local_data_done</code> ∧ <code>sync_barrier_done</code><br>
+            If global OR = 0 → converged → <code>exit_task</code>
+          </div>
+        </div>
+
+        <div class="bsp-arrow">→</div>
+
+        <div class="bsp-phase">
+          <div class="bsp-phase-title">⑤ Detect / Resolve</div>
+          <div class="bsp-phase-body">
+            Scan boundary table:<br>
+            • If <code>my_color == remote_color</code> and <code>my_gid > nbr_gid</code> → yield (revert to −1)<br>
+            Set <code>sync_buf[0]</code> = has_uncolored<br>
+            Reset state → <code>@activate(speculate)</code>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="loop-arrow">
+        ↩ Not converged: loop back to ① Speculate &nbsp;&nbsp;|&nbsp;&nbsp;
+        Converged (all colored): → exit_task → stop TSC → unblock host
+      </div>
+    </div>
+  </div>
+
+  <!-- Arrow: Hardware → SDK (readback) -->
+  <div class="sep">
+    <span class="sep-arrow">▲</span>
+    <span class="sep-text">D2H: colors[], coloring_timer[], perf_counters[]</span>
+    <span class="sep-arrow">▲</span>
+  </div>
+
+  <!-- ==================== SDK READBACK ==================== -->
+  <div class="swim-lane lane-sdk">
+    <span class="lane-label">CEREBRAS SDK — Result Readback</span>
+    <div class="stages">
+
+      <div class="stage stage-data">
+        <div class="stage-title">
+          <span class="stage-num">7a</span> D2H Color Readback
+        </div>
+        <div class="stage-body">
+          <code>memcpy_d2h(colors)</code> per PE<br>
+          Reassemble into global array<br>
+          <code>all_colors[pe*chunk + i] = buf[i]</code>
+        </div>
+        <div class="stage-file">cerebras_host.py</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Arrow: SDK → Host -->
+  <div class="sep">
+    <span class="sep-arrow">▲</span>
+    <span class="sep-text">JSON result: { colors, max_cycles, per_pe_perf }</span>
+    <span class="sep-arrow">▲</span>
+  </div>
+
+  <!-- ==================== VALIDATION ==================== -->
+  <div class="swim-lane lane-sw">
+    <span class="lane-label">HOST CPU — Validation</span>
+    <div class="stages">
+
+      <div class="stage stage-sw">
+        <div class="stage-title">
+          <span class="stage-num">8a</span> Correctness Check
+        </div>
+        <div class="stage-body">
+          For every edge (u,v): verify <code>colors[u] ≠ colors[v]</code><br>
+          Verify zero uncolored vertices<br>
+          Count distinct colors used
+        </div>
+        <div class="stage-file">run_csl_tests.py → validate_coloring()</div>
+      </div>
+
+      <div class="stage stage-sw">
+        <div class="stage-title">
+          <span class="stage-num">8b</span> Golden Comparison
+        </div>
+        <div class="stage-body">
+          Compare node/edge counts with reference<br>
+          Verify color count ≤ golden reference<br>
+          Report PASS/FAIL with timing details
+        </div>
+        <div class="stage-file">run_csl_tests.py → main()</div>
+      </div>
+
+    </div>
+  </div>
+
+</div>
+
+<!-- ==================== SIMULATION RESULTS TABLE ==================== -->
+<h2 style="text-align: center; margin-top: 36px; font-size: 1.15rem; color: #374151;">
+  Simulation Results: H<sub>2</sub> / 6-31G (89 Pauli Operators, 1988 Conflict Edges)
+</h2>
+<p style="text-align: center; color: #6B7280; font-size: 0.85rem; margin-bottom: 14px;">
+  All runs converge to 43 colors in 43 BSP rounds (greedy-minimum coloring).
+</p>
+<table class="transfer-table" style="max-width: 820px;">
+  <tr>
+    <th>PEs</th>
+    <th>Max Verts/PE</th>
+    <th>Max Boundary/PE</th>
+    <th>Max Relay Through/PE</th>
+    <th>Total Wavelets/Round</th>
+    <th>Rounds</th>
+    <th>Colors Used</th>
+  </tr>
+  <tr>
+    <td><b>4</b></td><td>23</td><td>800</td><td>1,040</td><td>3,048</td><td>43</td><td style="color: var(--host-accent); font-weight: 600;">43</td>
+  </tr>
+  <tr>
+    <td><b>8</b></td><td>12</td><td>508</td><td>1,522</td><td>3,530</td><td>43</td><td style="color: var(--host-accent); font-weight: 600;">43</td>
+  </tr>
+  <tr>
+    <td><b>16</b></td><td>6</td><td>298</td><td>1,772</td><td>3,768</td><td>43</td><td style="color: var(--host-accent); font-weight: 600;">43</td>
+  </tr>
+  <tr>
+    <td><b>32</b></td><td>3</td><td>176</td><td>1,898</td><td>3,908</td><td>43</td><td style="color: var(--host-accent); font-weight: 600;">43</td>
+  </tr>
+</table>
+<p style="text-align: center; color: #6B7280; font-size: 0.8rem; margin-top: 8px; max-width: 820px; margin-left: auto; margin-right: auto;">
+  <b>Max Boundary/PE</b> = most boundary edges any single PE must send per round. 
+  <b>Max Relay Through/PE</b> = most pass-through wavelets any PE must relay per round.
+  As PE count grows, local work decreases but relay traffic increases — the fundamental communication/computation trade-off.
+</p>
+
+<!-- ==================== KEY DATA TRANSFERS TABLE ==================== -->
+<h2 style="text-align: center; margin-top: 36px; font-size: 1.15rem; color: #374151;">
+  Key Data Transfers Across the Software ↔ Hardware Boundary
+</h2>
+
+<table class="transfer-table">
+  <tr>
+    <th>Direction</th>
+    <th>Data</th>
+    <th>Format</th>
+    <th>Per PE</th>
+  </tr>
+  <tr>
+    <td rowspan="8" style="font-weight: 600; color: var(--data-color);">H2D ↓</td>
+    <td><code>csr_offsets</code></td>
+    <td>int32[max_local_verts+1]</td>
+    <td>CSR row pointers</td>
+  </tr>
+  <tr>
+    <td><code>csr_adj</code></td>
+    <td>int32[max_local_edges]</td>
+    <td>CSR adjacency (global IDs)</td>
+  </tr>
+  <tr>
+    <td><code>colors</code></td>
+    <td>int32[max_local_verts]</td>
+    <td>Initialized to −1</td>
+  </tr>
+  <tr>
+    <td><code>global_vertex_ids</code></td>
+    <td>int32[max_local_verts]</td>
+    <td>GID for each local vertex</td>
+  </tr>
+  <tr>
+    <td><code>boundary_*</code> (3 arrays)</td>
+    <td>int32[max_boundary] × 3</td>
+    <td>local_idx, neighbor_gid, direction</td>
+  </tr>
+  <tr>
+    <td><code>verts_per_pe</code></td>
+    <td>int32[1]</td>
+    <td>Chunk size for GID→PE routing</td>
+  </tr>
+  <tr>
+    <td><code>num_boundary</code></td>
+    <td>int32[1]</td>
+    <td>Active boundary entries</td>
+  </tr>
+  <tr>
+    <td><code>expected_total_recv</code></td>
+    <td>int32[1]</td>
+    <td>Precomputed wavelet count</td>
+  </tr>
+  <tr>
+    <td rowspan="3" style="font-weight: 600; color: var(--conflict-color);">D2H ↑</td>
+    <td><code>colors</code></td>
+    <td>int32[max_local_verts]</td>
+    <td>Final color assignment</td>
+  </tr>
+  <tr>
+    <td><code>coloring_timer</code></td>
+    <td>f32[3]</td>
+    <td>Packed TSC timestamps</td>
+  </tr>
+  <tr>
+    <td><code>perf_counters</code></td>
+    <td>int32[7]</td>
+    <td>rounds, sends, recvs, relays, ...</td>
+  </tr>
+</table>
+
+<p class="interaction-note" style="margin-top: 20px;">
+  On-fabric communication uses 32-bit wavelets on checkerboard-routed fabric colors.<br>
+  SW relay mode: <span style="background: #DBEAFE; padding: 1px 6px; border-radius: 3px; font-family: monospace; font-size: 0.8rem;">GID [31:16]</span>
+  <span style="background: #FEF3C7; padding: 1px 6px; border-radius: 3px; font-family: monospace; font-size: 0.8rem;">dest_pe [15:8]</span>
+  <span style="background: #D1FAE5; padding: 1px 6px; border-radius: 3px; font-family: monospace; font-size: 0.8rem;">color+1 [7:0]</span>
+  &nbsp;|&nbsp;
+  HW filter mode: <span style="background: #DBEAFE; padding: 1px 6px; border-radius: 3px; font-family: monospace; font-size: 0.8rem;">dest_pe [31:16]</span>
+  <span style="background: #FEF3C7; padding: 1px 6px; border-radius: 3px; font-family: monospace; font-size: 0.8rem;">GID [15:5]</span>
+  <span style="background: #D1FAE5; padding: 1px 6px; border-radius: 3px; font-family: monospace; font-size: 0.8rem;">color+1 [4:0]</span>
+</p>
+
+</body>
+</html>

@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Picasso BSP Barrier — Line-by-Line Trace on WSE Fabric</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; }
+h1 { text-align: center; padding: 18px 0 6px; font-size: 1.4em; color: #58a6ff; }
+h2 { font-size: 1.05em; color: #8b949e; text-align: center; margin-bottom: 12px; }
+
+/* ── Layout ── */
+.container { display: flex; gap: 0; height: calc(100vh - 80px); padding: 0 8px 8px; }
+.left-panel { flex: 0 0 420px; display: flex; flex-direction: column; gap: 8px; }
+.right-panel { flex: 1; display: flex; flex-direction: column; gap: 8px; overflow: hidden; }
+
+/* ── Controls ── */
+.controls { display: flex; gap: 8px; justify-content: center; padding: 6px; background: #161b22; border-radius: 8px; border: 1px solid #30363d; flex-shrink: 0; }
+.controls button { padding: 6px 16px; background: #21262d; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; cursor: pointer; font-size: 0.85em; transition: all 0.15s; }
+.controls button:hover { background: #30363d; border-color: #58a6ff; }
+.controls button:disabled { opacity: 0.3; cursor: default; }
+.controls button.play { background: #238636; border-color: #2ea043; color: #fff; }
+.controls button.play:hover { background: #2ea043; }
+.step-info { display: flex; align-items: center; gap: 6px; color: #8b949e; font-size: 0.8em; }
+.step-info strong { color: #58a6ff; }
+
+/* ── Fabric Diagram ── */
+.fabric-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; flex-shrink: 0; }
+.fabric-box h3 { color: #58a6ff; font-size: 0.9em; margin-bottom: 10px; }
+.fabric-row { display: flex; justify-content: center; gap: 0; align-items: center; margin-bottom: 6px; }
+
+.pe-cell { width: 110px; min-height: 130px; background: #0d1117; border: 2px solid #30363d; border-radius: 8px; padding: 6px; position: relative; transition: all 0.35s; }
+.pe-cell.active { border-color: #f0883e; box-shadow: 0 0 12px rgba(240,136,62,0.3); }
+.pe-cell.barrier-active { border-color: #da3633; box-shadow: 0 0 14px rgba(218,54,51,0.4); }
+.pe-cell.done { border-color: #2ea043; box-shadow: 0 0 10px rgba(46,160,67,0.3); }
+.pe-label { font-weight: bold; font-size: 0.75em; color: #58a6ff; text-align: center; margin-bottom: 3px; }
+.pe-phase { font-size: 0.65em; text-align: center; padding: 2px 5px; border-radius: 4px; margin-bottom: 3px; }
+.pe-vars { font-size: 0.6em; line-height: 1.5; color: #8b949e; }
+.pe-vars .val { color: #e6edf3; }
+.pe-vars .true-val { color: #3fb950; }
+.pe-vars .false-val { color: #f85149; }
+
+.task-blocked { background: #f8514922; color: #f85149; }
+.task-unblocked { background: #3fb95022; color: #3fb950; }
+
+/* Queue badges inside PE */
+.queue-row { display: flex; gap: 2px; justify-content: center; margin-top: 3px; flex-wrap: wrap; }
+.q-badge { font-size: 0.55em; padding: 1px 4px; border-radius: 3px; }
+.q-blocked { background: #f8514933; color: #f85149; border: 1px solid #f8514955; }
+.q-open { background: #3fb95033; color: #3fb950; border: 1px solid #3fb95055; }
+.q-unused { background: #30363d55; color: #484f58; border: 1px solid #30363d; }
+
+/* ── Fabric wires between PEs ── */
+.wire-area { display: flex; flex-direction: column; justify-content: center; align-items: center; width: 60px; position: relative; }
+.wire-label { font-size: 0.55em; color: #484f58; text-align: center; margin: 1px 0; }
+.wire { height: 4px; width: 50px; border-radius: 2px; position: relative; margin: 1px 0; }
+.wire.idle { background: #21262d; }
+.wire.c0-active { background: #f0883e; box-shadow: 0 0 6px #f0883e88; }
+.wire.c1-active { background: #a371f7; box-shadow: 0 0 6px #a371f788; }
+.wire.reduce-active { background: #da3633; box-shadow: 0 0 8px #da363388; }
+.wire.bcast-active { background: #3fb950; box-shadow: 0 0 8px #3fb95088; }
+.wire-arrow { position: absolute; top: -3px; font-size: 9px; }
+.wire-arrow.right { right: -2px; color: inherit; }
+.wire-arrow.left { left: -2px; color: inherit; }
+
+/* ── Code Panel ── */
+.code-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.code-box h3 { color: #58a6ff; font-size: 0.9em; padding: 8px 12px; border-bottom: 1px solid #30363d; flex-shrink: 0; }
+.code-scroll { overflow-y: auto; flex: 1; }
+.code-line { display: flex; padding: 0 8px; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 0.72em; line-height: 1.65; }
+.code-line .ln { width: 36px; text-align: right; color: #484f58; padding-right: 10px; flex-shrink: 0; user-select: none; }
+.code-line .src { white-space: pre; }
+.code-line.highlight { background: #f0883e22; }
+.code-line.highlight .ln { color: #f0883e; font-weight: bold; }
+.code-line.highlight .src { color: #f0883e; }
+.code-line.barrier-hl { background: #da363322; }
+.code-line.barrier-hl .ln { color: #da3633; }
+.code-line.barrier-hl .src { color: #f85149; }
+.code-line.done-hl { background: #2ea04322; }
+.code-line.done-hl .ln { color: #3fb950; }
+.code-line.done-hl .src { color: #3fb950; }
+
+/* ── Narrative ── */
+.narrative-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 14px; flex-shrink: 0; min-height: 70px; }
+.narrative-box h3 { color: #58a6ff; font-size: 0.85em; margin-bottom: 6px; }
+.narrative-box p { font-size: 0.78em; line-height: 1.6; color: #e6edf3; }
+.narrative-box .phase-tag { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 0.85em; font-weight: 600; margin-right: 4px; }
+.phase-speculate { background: #1f6feb33; color: #58a6ff; }
+.phase-send { background: #f0883e33; color: #f0883e; }
+.phase-recv { background: #a371f733; color: #a371f7; }
+.phase-barrier { background: #da363333; color: #f85149; }
+.phase-detect { background: #3fb95033; color: #3fb950; }
+
+/* ── Legend ── */
+.legend { display: flex; gap: 14px; justify-content: center; padding: 4px; flex-wrap: wrap; }
+.legend-item { display: flex; align-items: center; gap: 4px; font-size: 0.65em; color: #8b949e; }
+.legend-swatch { width: 28px; height: 5px; border-radius: 3px; }
+
+/* ── Speed slider ── */
+.speed-ctl { display: flex; align-items: center; gap: 6px; font-size: 0.75em; color: #8b949e; }
+.speed-ctl input[type=range] { width: 80px; accent-color: #58a6ff; }
+</style>
+</head>
+<body>
+
+<h1>Picasso BSP Barrier — Line-by-Line Execution Trace</h1>
+<h2>3-PE 1D Grid (PE0=west/P0,0 &nbsp;·&nbsp; PE1=interior &nbsp;·&nbsp; PE2=east) — Round 1 of Graph Coloring</h2>
+
+<div class="container">
+  <!-- LEFT: Fabric + Controls -->
+  <div class="left-panel">
+    <div class="controls">
+      <button id="btnFirst" title="First">⏮</button>
+      <button id="btnPrev" title="Previous">◀</button>
+      <button id="btnPlay" class="play" title="Play/Pause">▶ Play</button>
+      <button id="btnNext" title="Next">▶</button>
+      <button id="btnLast" title="Last">⏭</button>
+      <div class="speed-ctl"><label>Speed</label><input type="range" id="speedSlider" min="1" max="10" value="4"></div>
+    </div>
+    <div class="step-info" style="justify-content:center;">
+      Step <strong id="stepNum">0</strong> / <strong id="stepTotal">0</strong>
+      &nbsp;·&nbsp; <span id="stepPhase"></span>
+    </div>
+
+    <div class="fabric-box">
+      <h3>WSE Fabric — 3×1 PE Grid</h3>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-swatch" style="background:#f0883e"></div>Data C0 →</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#a371f7"></div>Data C1 ←</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#da3633"></div>Reduce ←</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#3fb950"></div>Broadcast →</div>
+      </div>
+      <div class="fabric-row" id="fabricRow"></div>
+    </div>
+
+    <div class="narrative-box">
+      <h3>What's Happening</h3>
+      <p id="narrative"></p>
+    </div>
+  </div>
+
+  <!-- RIGHT: Code -->
+  <div class="right-panel">
+    <div class="code-box">
+      <h3>pe_program.csl — Executing Code</h3>
+      <div class="code-scroll" id="codeScroll"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════
+// CSL Source (simplified for readability — line numbers match real file)
+// ══════════════════════════════════════════════════════════════════════
+
+const cslSource = [
+// --- Sync barrier section (lines 259-366) ---
+{ln:259, src:'// Sync barrier (1D mode): row-reduce + broadcast using data tasks'},
+{ln:260, src:'// Two-flag protocol:'},
+{ln:261, src:'//   local_data_done:    set when all expected data wavelets received'},
+{ln:262, src:'//   sync_barrier_done:  set when broadcast received (or sent by P0,0)'},
+{ln:263, src:'//   Both true → activate detect_resolve'},
+{ln:269, src:'var local_data_done: bool = false;'},
+{ln:270, src:'var sync_barrier_done: bool = false;'},
+{ln:271, src:'var sync_buf = @zeros([1]u32);'},
+{ln:273, src:'fn send_sync_reduce() void {'},
+{ln:274, src:'  // @mov32(fabout→sync_reduce_send_color, sync_buf, .{.async=true});'},
+{ln:275, src:'}'},
+{ln:277, src:'fn send_sync_bcast() void {'},
+{ln:278, src:'  // @mov32(fabout→sync_bcast_color, sync_buf, .{.async=true});'},
+{ln:279, src:'}'},
+{ln:281, src:''},
+{ln:315, src:'fn maybe_proceed() void {'},
+{ln:316, src:'  if (local_data_done and sync_barrier_done) {'},
+{ln:317, src:'    @activate(detect_resolve_task_id);'},
+{ln:318, src:'  }'},
+{ln:319, src:'}'},
+{ln:320, src:''},
+{ln:321, src:'fn on_data_complete() void {'},
+{ln:322, src:'  if (use_sync_barrier) {'},
+{ln:323, src:'    local_data_done = true;'},
+{ln:324, src:'    if (is_east_edge) {'},
+{ln:325, src:'      // East PE: initiate row reduce — send sync west'},
+{ln:326, src:'      send_sync_reduce();'},
+{ln:327, src:'      @unblock(sync_bcast_task_id);'},
+{ln:328, src:'    } else {'},
+{ln:329, src:'      // Non-east PEs: unblock reduce task to receive sync'},
+{ln:330, src:'      @unblock(sync_reduce_task_id);'},
+{ln:331, src:'    }'},
+{ln:332, src:'    maybe_proceed();'},
+{ln:333, src:'  } else {'},
+{ln:334, src:'    @activate(detect_resolve_task_id);'},
+{ln:335, src:'  }'},
+{ln:336, src:'}'},
+{ln:337, src:''},
+{ln:345, src:'task sync_reduce_recv(wval: u32) void {'},
+{ln:346, src:'  @block(sync_reduce_task_id);   // one-shot per round'},
+{ln:347, src:'  if (is_west_edge) {'},
+{ln:348, src:'    // P(0,0): all done → send broadcast'},
+{ln:349, src:'    send_sync_bcast();'},
+{ln:350, src:'    sync_barrier_done = true;'},
+{ln:351, src:'    maybe_proceed();'},
+{ln:352, src:'  } else {'},
+{ln:353, src:'    // Interior PE: forward reduce west'},
+{ln:354, src:'    send_sync_reduce();'},
+{ln:355, src:'    @unblock(sync_bcast_task_id);'},
+{ln:356, src:'  }'},
+{ln:357, src:'}'},
+{ln:358, src:''},
+{ln:362, src:'task sync_bcast_recv(wval: u32) void {'},
+{ln:363, src:'  @block(sync_bcast_task_id);    // one-shot per round'},
+{ln:364, src:'  sync_barrier_done = true;'},
+{ln:365, src:'  maybe_proceed();'},
+{ln:366, src:'}'},
+{ln:367, src:''},
+// --- Speculate (line 372) ---
+{ln:370, src:'// Phase 1: Speculate'},
+{ln:372, src:'task speculate() void {'},
+{ln:373, src:'  // ... assign tentative colors to uncolored vertices ...'},
+{ln:374, src:'  // ... build forbidden set, pick min available color ...'},
+{ln:375, src:'  // ... local conflict check (higher GID yields) ...'},
+{ln:450, src:'  @activate(send_boundary_task_id);'},
+{ln:451, src:'}'},
+{ln:452, src:''},
+// --- Send boundary (line 454) ---
+{ln:453, src:'// Phase 2: Send boundary colors as wavelets'},
+{ln:454, src:'task send_boundary() void {'},
+{ln:455, src:'  // ... sort boundary into per-direction buffers ...'},
+{ln:490, src:'  // ── Send East (C0) ──'},
+{ln:491, src:'  @mov32(fabout→send_east_color, east_send_buf, .{.async=true});'},
+{ln:502, src:'  // ── Send West (C1) ──'},
+{ln:503, src:'  @mov32(fabout→send_west_color, west_send_buf, .{.async=true});'},
+{ln:553, src:'  // Open receive window'},
+{ln:554, src:'  unblock_all_recv();  // @unblock recv_east, recv_west'},
+{ln:555, src:''},
+{ln:556, src:'  // If no wavelets expected, go to barrier immediately'},
+{ln:557, src:'  if (all_wavelets_received()) {'},
+{ln:558, src:'    block_all_recv();'},
+{ln:559, src:'    on_data_complete();'},
+{ln:560, src:'  }'},
+{ln:561, src:'}'},
+{ln:562, src:''},
+// --- Recv tasks (line 568) ---
+{ln:566, src:'// Data tasks: receive wavelets from neighboring PEs'},
+{ln:568, src:'task recv_east(wval: u32) void {'},
+{ln:569, src:'  process_incoming_wavelet(unpack_gid(wval), unpack_color(wval));'},
+{ln:570, src:'  num_recv_east += 1;'},
+{ln:571, src:'  if (all_wavelets_received()) {'},
+{ln:572, src:'    block_all_recv();'},
+{ln:573, src:'    on_data_complete();   // → enters barrier'},
+{ln:574, src:'  }'},
+{ln:575, src:'}'},
+{ln:576, src:''},
+{ln:577, src:'task recv_west(wval: u32) void {'},
+{ln:578, src:'  process_incoming_wavelet(...);'},
+{ln:579, src:'  num_recv_west += 1;'},
+{ln:580, src:'  if (all_wavelets_received()) {'},
+{ln:581, src:'    block_all_recv();'},
+{ln:582, src:'    on_data_complete();   // → enters barrier'},
+{ln:583, src:'  }'},
+{ln:584, src:'}'},
+{ln:585, src:''},
+// --- Detect/resolve (line 608) ---
+{ln:606, src:'// Phase 3: Detect boundary conflicts + resolve + loop'},
+{ln:608, src:'task detect_resolve() void {'},
+{ln:609, src:'  // ... compare my_col vs remote_col on boundary edges ...'},
+{ln:610, src:'  // ... if conflict: higher GID yields (resets color to -1) ...'},
+{ln:635, src:'  current_round += 1;'},
+{ln:636, src:'  // Reset for next round'},
+{ln:637, src:'  num_recv_east = 0; num_recv_west = 0;'},
+{ln:638, src:'  local_data_done = false;'},
+{ln:639, src:'  sync_barrier_done = false;'},
+{ln:641, src:'  @activate(speculate_task_id);  // → Round N+1'},
+{ln:642, src:'}'},
+];
+
+// Build code panel once
+const codeScroll = document.getElementById('codeScroll');
+cslSource.forEach(({ln, src}) => {
+  const div = document.createElement('div');
+  div.className = 'code-line';
+  div.dataset.ln = ln;
+  div.innerHTML = `<span class="ln">${ln}</span><span class="src">${escHtml(src)}</span>`;
+  codeScroll.appendChild(div);
+});
+
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ══════════════════════════════════════════════════════════════════════
+// PE State Model
+// ══════════════════════════════════════════════════════════════════════
+
+function initPE(id, label, flags) {
+  return {
+    id, label, ...flags,
+    phase: 'idle',
+    colors: [-1,-1],  // 2 local vertices each
+    tentative: [-1,-1],
+    local_data_done: false,
+    sync_barrier_done: false,
+    num_recv_east: 0,
+    num_recv_west: 0,
+    expected_recv_east: 0,
+    expected_recv_west: 0,
+    sync_reduce_blocked: true,
+    sync_bcast_blocked: true,
+    recv_east_blocked: true,
+    recv_west_blocked: true,
+    cellClass: '',
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Wire State
+// ══════════════════════════════════════════════════════════════════════
+// wires[0] = PE0↔PE1, wires[1] = PE1↔PE2
+let wires = [
+  { dataEast: false, dataWest: false, reduce: false, bcast: false },
+  { dataEast: false, dataWest: false, reduce: false, bcast: false },
+];
+
+// ══════════════════════════════════════════════════════════════════════
+// Steps — Each step: { highlight, barrierHl, doneHl, narrative, apply(pes,wires) }
+// ══════════════════════════════════════════════════════════════════════
+
+const steps = [];
+
+function S(highlight, narrative, apply, opts={}) {
+  steps.push({ highlight, narrative, apply,
+    barrierHl: opts.barrierHl || [],
+    doneHl: opts.doneHl || [],
+    phase: opts.phase || '' });
+}
+
+// ── INIT ──
+S([], '<span class="phase-tag phase-speculate">INIT</span> Host loads graph data into 3 PEs. Each PE has 2 local vertices. Boundary edges cross PE boundaries. All sync tasks start <b>BLOCKED</b>.', (pes) => {
+  pes[0] = initPE(0,'PE0 (west, P0,0)',{is_west:true,is_east:false});
+  pes[1] = initPE(1,'PE1 (interior)',{is_west:false,is_east:false});
+  pes[2] = initPE(2,'PE2 (east)',{is_west:false,is_east:true});
+  // Test graph: 6 vertices, 0-1 on PE0, 2-3 on PE1, 4-5 on PE2
+  // Edges: 1↔2 (PE0↔PE1), 3↔4 (PE1↔PE2)
+  pes[0].expected_recv_east = 0; pes[0].expected_recv_west = 1; // recv from PE1 via west
+  pes[1].expected_recv_east = 1; pes[1].expected_recv_west = 1; // recv from PE0 and PE2
+  pes[2].expected_recv_east = 1; pes[2].expected_recv_west = 0; // recv from PE1 via east
+}, {phase: 'Init'});
+
+// ── SPECULATE on all 3 PEs ──
+S([372,373,374,375], '<span class="phase-tag phase-speculate">SPECULATE</span> All 3 PEs execute <code>task speculate()</code> in parallel. Each PE assigns tentative colors to its uncolored vertices using greedy-first-fit from forbidden set.', (pes) => {
+  pes.forEach(p => { p.phase = 'speculate'; p.cellClass = 'active'; p.tentative = [0,1]; p.colors = [0,1]; });
+}, {phase: 'Speculate'});
+
+S([450,451], '<span class="phase-tag phase-speculate">SPECULATE</span> Speculate complete on all PEs. <code>@activate(send_boundary_task_id)</code> chains each PE to Phase 2.', (pes) => {
+  pes.forEach(p => { p.phase = '→send'; });
+}, {phase: 'Speculate→Send'});
+
+// ── SEND on all PEs ──
+S([454,455,490,491], '<span class="phase-tag phase-send">SEND</span> All 3 PEs execute <code>task send_boundary()</code>. PE0 sends vertex 1\'s color east to PE1 via C0. PE1 sends vertex 2\'s color west to PE0 via C1, and vertex 3\'s color east to PE2 via C0.', (pes,w) => {
+  pes.forEach(p => { p.phase = 'send'; p.cellClass = 'active'; });
+  w[0].dataEast = true; w[0].dataWest = true;
+  w[1].dataEast = true; w[1].dataWest = false;
+}, {phase: 'Send Boundary'});
+
+S([502,503], '<span class="phase-tag phase-send">SEND</span> PE2 sends vertex 4\'s color west to PE1 via C1. Wavelets now flying on fabric in both directions.', (pes,w) => {
+  w[1].dataWest = true;
+}, {phase: 'Send Boundary'});
+
+S([553,554], '<span class="phase-tag phase-send">SEND</span> All PEs call <code>unblock_all_recv()</code> — opens the receive window. recv_east and recv_west data tasks are now UNBLOCKED, ready to accept wavelets.', (pes) => {
+  pes.forEach(p => { p.recv_east_blocked = false; p.recv_west_blocked = false; p.phase = 'recv'; });
+}, {phase: 'Send → Open Recv'});
+
+// ── RECV — PE2 finishes first (only expects 1 wavelet from west) ──
+S([568,569,570,571], '<span class="phase-tag phase-recv">RECV</span> PE2 receives wavelet from PE1 (vertex 3, color=1). <code>recv_east(wval)</code> fires. <code>num_recv_east</code> → 1. <code>all_wavelets_received()</code> → <b>true</b> (expected 1, got 1).', (pes,w) => {
+  pes[2].num_recv_east = 1;
+  pes[2].cellClass = 'active';
+  w[1].dataEast = false;
+}, {phase: 'Recv (PE2 done first)'});
+
+S([572,573], '<span class="phase-tag phase-recv">RECV→BARRIER</span> PE2: <code>block_all_recv()</code> closes receive window. Calls <code>on_data_complete()</code> — enters the barrier!', (pes) => {
+  pes[2].recv_east_blocked = true; pes[2].recv_west_blocked = true;
+  pes[2].phase = 'barrier';
+}, {phase: 'PE2 → Barrier'});
+
+// ── BARRIER ENTRY — PE2 (east) ──
+S([321,322,323], '<span class="phase-tag phase-barrier">BARRIER</span> PE2 (east): <code>on_data_complete()</code> → sets <code>local_data_done = true</code>.', (pes) => {
+  pes[2].local_data_done = true;
+  pes[2].cellClass = 'barrier-active';
+}, {phase: 'Barrier — PE2 enters', barrierHl: [321,322,323]});
+
+S([324,325,326], '<span class="phase-tag phase-barrier">BARRIER</span> PE2: <code>is_east_edge == true</code> → calls <code>send_sync_reduce()</code>. Sends sync wavelet on C8/C9 (reduce) heading WEST toward PE1.', (pes,w) => {
+  w[1].reduce = true;
+  pes[2].phase = 'barrier-wait';
+}, {phase: 'Barrier — PE2 sends reduce', barrierHl: [324,325,326]});
+
+S([327], '<span class="phase-tag phase-barrier">BARRIER</span> PE2: <code>@unblock(sync_bcast_task_id)</code> — arms PE2 to receive the broadcast when it arrives later.', (pes) => {
+  pes[2].sync_bcast_blocked = false;
+}, {phase: 'Barrier — PE2 arms bcast', barrierHl: [327]});
+
+S([332,315,316], '<span class="phase-tag phase-barrier">BARRIER</span> PE2: <code>maybe_proceed()</code> — checks flags: <code>local_data_done=true</code> but <code>sync_barrier_done=false</code>. Cannot proceed yet. PE2 <b>waits</b>.', (pes) => {
+  // no state change, just check
+}, {phase: 'Barrier — PE2 waits', barrierHl: [332,315,316]});
+
+// ── Meanwhile PE0 receives its wavelet ──
+S([577,578,579,580], '<span class="phase-tag phase-recv">RECV</span> Meanwhile: PE0 receives wavelet from PE1 (vertex 2, color=0). <code>recv_west(wval)</code> fires. <code>num_recv_west</code> → 1. <code>all_wavelets_received()</code> → <b>true</b>.', (pes,w) => {
+  pes[0].num_recv_west = 1;
+  pes[0].cellClass = 'active';
+  w[0].dataWest = false;
+}, {phase: 'Recv (PE0 done)'});
+
+S([581,582], '<span class="phase-tag phase-recv">RECV→BARRIER</span> PE0: <code>block_all_recv() → on_data_complete()</code>. PE0 enters the barrier.', (pes) => {
+  pes[0].recv_east_blocked = true; pes[0].recv_west_blocked = true;
+  pes[0].phase = 'barrier';
+}, {phase: 'PE0 → Barrier'});
+
+S([321,322,323], '<span class="phase-tag phase-barrier">BARRIER</span> PE0 (west/P0,0): <code>local_data_done = true</code>.', (pes) => {
+  pes[0].local_data_done = true;
+  pes[0].cellClass = 'barrier-active';
+}, {phase: 'Barrier — PE0 enters', barrierHl: [321,322,323]});
+
+S([328,329,330], '<span class="phase-tag phase-barrier">BARRIER</span> PE0: <code>is_east_edge == false</code> → <code>@unblock(sync_reduce_task_id)</code>. Arms PE0 to receive the reduce signal. The reduce wavelet from PE2 hasn\'t arrived yet (still at PE1).', (pes) => {
+  pes[0].sync_reduce_blocked = false;
+  pes[0].phase = 'barrier-wait';
+}, {phase: 'Barrier — PE0 arms reduce', barrierHl: [328,329,330]});
+
+S([332,315,316], '<span class="phase-tag phase-barrier">BARRIER</span> PE0: <code>maybe_proceed()</code> → <code>sync_barrier_done=false</code>. PE0 <b>waits</b>.', (pes) => {
+}, {phase: 'Barrier — PE0 waits', barrierHl: [332,315,316]});
+
+// ── PE1 receives BOTH wavelets ──
+S([568,569,570,571], '<span class="phase-tag phase-recv">RECV</span> PE1 receives wavelet from PE0 (vertex 1, color=0). <code>recv_east(wval)</code> fires. <code>num_recv_east</code> → 1. But PE1 still needs 1 more from west. <code>all_wavelets_received()</code> → false.', (pes,w) => {
+  pes[1].num_recv_east = 1;
+  pes[1].cellClass = 'active';
+  w[0].dataEast = false;
+}, {phase: 'Recv (PE1 partial)'});
+
+S([577,578,579,580,581,582], '<span class="phase-tag phase-recv">RECV</span> PE1 receives wavelet from PE2 (vertex 4, color=0). <code>recv_west(wval)</code> fires. <code>num_recv_west</code> → 1. Now <code>all_wavelets_received()</code> → <b>true</b>! <code>block_all_recv() → on_data_complete()</code>.', (pes,w) => {
+  pes[1].num_recv_west = 1;
+  pes[1].recv_east_blocked = true;
+  pes[1].recv_west_blocked = true;
+  pes[1].phase = 'barrier';
+  w[1].dataWest = false;
+}, {phase: 'Recv (PE1 done → Barrier)'});
+
+// ── BARRIER — PE1 enters ──
+S([321,322,323], '<span class="phase-tag phase-barrier">BARRIER</span> PE1 (interior): <code>local_data_done = true</code>.', (pes) => {
+  pes[1].local_data_done = true;
+  pes[1].cellClass = 'barrier-active';
+}, {phase: 'Barrier — PE1 enters', barrierHl: [321,322,323]});
+
+S([328,329,330], '<span class="phase-tag phase-barrier">BARRIER</span> PE1: <code>@unblock(sync_reduce_task_id)</code>. Now the reduce wavelet from PE2 (which was <b>queued</b> in PE1\'s hardware input queue) can fire!', (pes) => {
+  pes[1].sync_reduce_blocked = false;
+}, {phase: 'Barrier — PE1 unblocks reduce', barrierHl: [328,329,330]});
+
+// ── Reduce fires on PE1 ──
+S([345,346], '<span class="phase-tag phase-barrier">REDUCE</span> PE1: <code>sync_reduce_recv()</code> fires — the queued reduce wavelet is consumed! <code>@block(sync_reduce_task_id)</code> re-locks it (one-shot).', (pes,w) => {
+  w[1].reduce = false;
+  pes[1].sync_reduce_blocked = true;
+}, {phase: 'Reduce fires on PE1', barrierHl: [345,346]});
+
+S([352,353,354], '<span class="phase-tag phase-barrier">REDUCE</span> PE1: <code>is_west_edge==false</code> → Interior PE: <code>send_sync_reduce()</code> — forwards reduce wavelet west to PE0!', (pes,w) => {
+  w[0].reduce = true;
+}, {phase: 'PE1 forwards reduce → PE0', barrierHl: [352,353,354]});
+
+S([355], '<span class="phase-tag phase-barrier">REDUCE</span> PE1: <code>@unblock(sync_bcast_task_id)</code> — arms PE1 to receive the broadcast.', (pes) => {
+  pes[1].sync_bcast_blocked = false;
+}, {phase: 'PE1 arms broadcast recv', barrierHl: [355]});
+
+// ── Reduce fires on PE0 (P0,0) ──
+S([345,346], '<span class="phase-tag phase-barrier">REDUCE</span> PE0 (P0,0): <code>sync_reduce_recv()</code> fires — PE0\'s reduce task was already unblocked; wavelet from PE1 is consumed. <code>@block</code> re-locks.', (pes,w) => {
+  w[0].reduce = false;
+  pes[0].sync_reduce_blocked = true;
+}, {phase: 'Reduce arrives at P0,0', barrierHl: [345,346]});
+
+S([347,348,349], '<span class="phase-tag phase-barrier">BROADCAST</span> PE0: <code>is_west_edge==true</code> → P(0,0)! Calls <code>send_sync_bcast()</code> — sends broadcast wavelet on C10 heading EAST to ALL PEs!', (pes,w) => {
+  w[0].bcast = true;
+  w[1].bcast = false; // will set in next step
+}, {phase: 'P0,0 sends broadcast', barrierHl: [347,348,349]});
+
+S([350,351,315,316,317], '<span class="phase-tag phase-barrier">BROADCAST</span> PE0: <code>sync_barrier_done = true</code>. <code>maybe_proceed()</code> → both flags TRUE! <code>@activate(detect_resolve_task_id)</code>. PE0 <b>proceeds</b>! ✅', (pes) => {
+  pes[0].sync_barrier_done = true;
+  pes[0].phase = 'detect';
+  pes[0].cellClass = 'done';
+}, {phase: 'PE0 barrier complete ✅', doneHl: [350,351,315,316,317]});
+
+// ── Broadcast reaches PE1 ──
+S([362,363,364], '<span class="phase-tag phase-barrier">BROADCAST</span> Broadcast wavelet reaches PE1. <code>sync_bcast_recv()</code> fires. <code>sync_barrier_done = true</code>.', (pes,w) => {
+  w[0].bcast = false;
+  w[1].bcast = true;
+  pes[1].sync_barrier_done = true;
+}, {phase: 'Broadcast → PE1', barrierHl: [362,363,364]});
+
+S([365,315,316,317], '<span class="phase-tag phase-barrier">BROADCAST</span> PE1: <code>maybe_proceed()</code> → both flags TRUE! PE1 <b>proceeds</b>! ✅', (pes) => {
+  pes[1].phase = 'detect';
+  pes[1].cellClass = 'done';
+  pes[1].sync_bcast_blocked = true;
+}, {phase: 'PE1 barrier complete ✅', doneHl: [365,315,316,317]});
+
+// ── Broadcast reaches PE2 ──
+S([362,363,364], '<span class="phase-tag phase-barrier">BROADCAST</span> Broadcast wavelet reaches PE2 (last PE). <code>sync_bcast_recv()</code> fires. <code>sync_barrier_done = true</code>.', (pes,w) => {
+  w[1].bcast = false;
+  pes[2].sync_barrier_done = true;
+}, {phase: 'Broadcast → PE2', barrierHl: [362,363,364]});
+
+S([365,315,316,317], '<span class="phase-tag phase-barrier">BROADCAST</span> PE2: <code>maybe_proceed()</code> → both flags TRUE! PE2 <b>proceeds</b>! ✅ <b>ALL 3 PEs now in detect_resolve.</b>', (pes) => {
+  pes[2].phase = 'detect';
+  pes[2].cellClass = 'done';
+  pes[2].sync_bcast_blocked = true;
+}, {phase: 'PE2 barrier complete ✅', doneHl: [365,315,316,317]});
+
+// ── DETECT/RESOLVE ──
+S([608,609,610], '<span class="phase-tag phase-detect">DETECT</span> All 3 PEs execute <code>task detect_resolve()</code> in parallel. Each PE compares its boundary vertex colors with received remote colors. Conflicts: higher GID yields.', (pes) => {
+  pes.forEach(p => { p.phase = 'detect'; p.cellClass = 'done'; });
+}, {phase: 'Detect/Resolve'});
+
+S([635,636,637,638,639], '<span class="phase-tag phase-detect">DETECT</span> <code>current_round += 1</code>. Reset all counters and sync flags for next round: <code>local_data_done = false</code>, <code>sync_barrier_done = false</code>.', (pes) => {
+  pes.forEach(p => { p.local_data_done = false; p.sync_barrier_done = false; p.num_recv_east = 0; p.num_recv_west = 0; });
+}, {phase: 'Detect — Reset', doneHl: [635,636,637,638,639]});
+
+S([641,642], '<span class="phase-tag phase-detect">LOOP</span> <code>@activate(speculate_task_id)</code> — all PEs start <b>Round 2</b>. The entire BSP cycle repeats until all vertices are conflict-free or max_rounds reached.', (pes) => {
+  pes.forEach(p => { p.phase = 'speculate'; p.cellClass = 'active'; });
+}, {phase: 'Round 2 → Speculate', doneHl: [641,642]});
+
+
+// ══════════════════════════════════════════════════════════════════════
+// Rendering
+// ══════════════════════════════════════════════════════════════════════
+
+const pes = [{},{},{}];
+let curStep = 0;
+let playing = false;
+let playTimer = null;
+
+function renderFabric() {
+  const row = document.getElementById('fabricRow');
+  row.innerHTML = '';
+  for (let i = 0; i < 3; i++) {
+    const p = pes[i];
+    // PE cell
+    const cell = document.createElement('div');
+    cell.className = 'pe-cell ' + (p.cellClass || '');
+    cell.innerHTML = `
+      <div class="pe-label">${p.label || 'PE'+i}</div>
+      <div class="pe-phase ${phaseClass(p.phase)}">${phaseLabel(p.phase)}</div>
+      <div class="pe-vars">
+        <div>colors: <span class="val">[${p.colors?.join(', ') ?? ''}]</span></div>
+        <div>local_data_done: <span class="${p.local_data_done?'true-val':'false-val'}">${p.local_data_done}</span></div>
+        <div>sync_barrier_done: <span class="${p.sync_barrier_done?'true-val':'false-val'}">${p.sync_barrier_done}</span></div>
+        <div>recv E/W: <span class="val">${p.num_recv_east}/${p.expected_recv_east}</span>, <span class="val">${p.num_recv_west}/${p.expected_recv_west}</span></div>
+      </div>
+      <div class="queue-row">
+        <span class="q-badge ${p.recv_east_blocked?'q-blocked':'q-open'}">E:${p.recv_east_blocked?'BLK':'OPEN'}</span>
+        <span class="q-badge ${p.recv_west_blocked?'q-blocked':'q-open'}">W:${p.recv_west_blocked?'BLK':'OPEN'}</span>
+        <span class="q-badge ${p.sync_reduce_blocked?'q-blocked':'q-open'}">Red:${p.sync_reduce_blocked?'BLK':'OPEN'}</span>
+        <span class="q-badge ${p.sync_bcast_blocked?'q-blocked':'q-open'}">Bcast:${p.sync_bcast_blocked?'BLK':'OPEN'}</span>
+      </div>`;
+    row.appendChild(cell);
+
+    // Wire between PEs
+    if (i < 2) {
+      const w = wires[i];
+      const area = document.createElement('div');
+      area.className = 'wire-area';
+      area.innerHTML = `
+        <div class="wire-label">C0 →</div>
+        <div class="wire ${w.dataEast?'c0-active':'idle'}"><span class="wire-arrow right">▶</span></div>
+        <div class="wire-label">← C1</div>
+        <div class="wire ${w.dataWest?'c1-active':'idle'}"><span class="wire-arrow left">◀</span></div>
+        <div class="wire-label">← Reduce</div>
+        <div class="wire ${w.reduce?'reduce-active':'idle'}"><span class="wire-arrow left">◀</span></div>
+        <div class="wire-label">Bcast →</div>
+        <div class="wire ${w.bcast?'bcast-active':'idle'}"><span class="wire-arrow right">▶</span></div>`;
+      row.appendChild(area);
+    }
+  }
+}
+
+function phaseClass(ph) {
+  if (!ph) return '';
+  if (ph.includes('speculate') || ph === '→send') return 'task-unblocked';
+  if (ph === 'send' || ph === 'recv') return 'task-unblocked';
+  if (ph.includes('barrier')) return 'task-blocked';
+  if (ph === 'detect') return 'task-unblocked';
+  return '';
+}
+function phaseLabel(ph) {
+  const map = { idle:'Idle', speculate:'Speculate', '→send':'→ Send', send:'Send Boundary',
+    recv:'Recv Wavelets', barrier:'→ BARRIER', 'barrier-wait':'BARRIER (waiting)',
+    detect:'Detect/Resolve' };
+  return map[ph] || ph;
+}
+
+function renderCode(step) {
+  document.querySelectorAll('.code-line').forEach(el => {
+    el.className = 'code-line';
+  });
+  const s = steps[step];
+  (s.highlight || []).forEach(ln => {
+    const el = document.querySelector(`.code-line[data-ln="${ln}"]`);
+    if (el) el.classList.add('highlight');
+  });
+  (s.barrierHl || []).forEach(ln => {
+    const el = document.querySelector(`.code-line[data-ln="${ln}"]`);
+    if (el) { el.classList.remove('highlight'); el.classList.add('barrier-hl'); }
+  });
+  (s.doneHl || []).forEach(ln => {
+    const el = document.querySelector(`.code-line[data-ln="${ln}"]`);
+    if (el) { el.classList.remove('highlight'); el.classList.add('done-hl'); }
+  });
+  // Scroll first highlighted line into view
+  const allHl = [...(s.highlight||[]), ...(s.barrierHl||[]), ...(s.doneHl||[])];
+  if (allHl.length > 0) {
+    const first = document.querySelector(`.code-line[data-ln="${allHl[0]}"]`);
+    if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+function goToStep(n) {
+  // Replay from beginning
+  wires = [
+    { dataEast: false, dataWest: false, reduce: false, bcast: false },
+    { dataEast: false, dataWest: false, reduce: false, bcast: false },
+  ];
+  for (let i = 0; i <= n && i < steps.length; i++) {
+    steps[i].apply(pes, wires);
+  }
+  curStep = n;
+  renderFabric();
+  renderCode(n);
+  document.getElementById('stepNum').textContent = n + 1;
+  document.getElementById('stepTotal').textContent = steps.length;
+  document.getElementById('stepPhase').textContent = steps[n].phase || '';
+  document.getElementById('narrative').innerHTML = steps[n].narrative;
+  document.getElementById('btnPrev').disabled = (n <= 0);
+  document.getElementById('btnFirst').disabled = (n <= 0);
+  document.getElementById('btnNext').disabled = (n >= steps.length - 1);
+  document.getElementById('btnLast').disabled = (n >= steps.length - 1);
+}
+
+// Controls
+document.getElementById('btnNext').addEventListener('click', () => {
+  if (curStep < steps.length - 1) goToStep(curStep + 1);
+});
+document.getElementById('btnPrev').addEventListener('click', () => {
+  if (curStep > 0) goToStep(curStep - 1);
+});
+document.getElementById('btnFirst').addEventListener('click', () => goToStep(0));
+document.getElementById('btnLast').addEventListener('click', () => goToStep(steps.length - 1));
+
+document.getElementById('btnPlay').addEventListener('click', () => {
+  playing = !playing;
+  const btn = document.getElementById('btnPlay');
+  if (playing) {
+    btn.textContent = '⏸ Pause';
+    tick();
+  } else {
+    btn.textContent = '▶ Play';
+    clearTimeout(playTimer);
+  }
+});
+
+function tick() {
+  if (!playing) return;
+  if (curStep < steps.length - 1) {
+    goToStep(curStep + 1);
+    const speed = document.getElementById('speedSlider').value;
+    const ms = 2200 - speed * 180;
+    playTimer = setTimeout(tick, ms);
+  } else {
+    playing = false;
+    document.getElementById('btnPlay').textContent = '▶ Play';
+  }
+}
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); if (curStep < steps.length-1) goToStep(curStep+1); }
+  if (e.key === 'ArrowLeft') { if (curStep > 0) goToStep(curStep-1); }
+  if (e.key === 'Home') goToStep(0);
+  if (e.key === 'End') goToStep(steps.length-1);
+});
+
+// Init
+goToStep(0);
+</script>
+</body>
+</html>

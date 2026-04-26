@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-04-24
+Last updated: 2026-04-26
 
 ## Project Status
 
@@ -88,6 +88,199 @@ The active optimization effort is the pipelined LWW transport:
   simulator slows substantially; real WSE-3 needs the appliance path.
 - Plan of record: `LWW_PIPELINE_PLAN.md`.
 - Wider roadmap: `IMPLEMENTATION_ROADMAP.md`.
+
+## CP3.epoch — Cross-Launch Fabric Residual Fix (2026-04-26)
+
+Pipelined-LWW kernels are invoked once per BSP level by the host
+(`run_csl_tests.py` per-level loop → `cs_python cerebras_host.py`).
+On real WSE-3 the **SdkLauncher session is shared across levels**
+(one wsjob, multiple `cs_python` invocations). Between Level N
+exit and Level N+1's `runner.load()` the wafer's fabric IQs retain
+in-flight wavelets from Level N. When the next kernel re-launches,
+those stale wavelets fire the freshly-bound IQ tasks. The kernel's
+parity-only classification (`current_round & 0x1`) cannot
+distinguish "this round" from "previous level same parity" so the
+stale wavelets get counted as fresh, corrupting the BSP barrier
+counters and deadlocking Level N+1.
+
+**Two fixes shipped in series:**
+
+1. **`--launcher-per-level`** (workaround, runs first). New CLI
+   flag in `picasso/run_csl_tests.py` cycles the SdkLauncher (and
+   thus the wsjob) per BSP level. ~90s/level overhead but fully
+   resets fabric state. Plumbed through `neocortex/run_cs3_lww.sh`
+   and matrix driver. Validated 2026-04-25 on test1 4×4: Level 0 +
+   Level 1 PASS where the bug previously hung Level 1.
+
+2. **CP3.epoch (kernel-side, reduces overhead)**. Every wavelet
+   carries a 1-bit level-epoch tag at bit[7]. Receivers
+   (`epoch_matches`) drop wavelets whose epoch ≠
+   `current_level_epoch`. Host toggles `runtime_config[2]` per BSP
+   level (`level & 0x1`). `cerebras_host.py` conditionally uploads
+   the 3-element runtime_config when `--lww-layout 2d_seg2`; other
+   kernels still get 2 elements.
+
+   Kernel changes in `csl/pe_program_lww_2d_seg2.csl`:
+   - `var runtime_config: [3]i32` (was `[2]`)
+   - `var current_level_epoch: u32 = 2` (sentinel default)
+   - `pack_data` / `pack_data_done` / `pack_bcast` / `pack_row_reduce`
+     all set bit[7] = epoch
+   - `send_col_reduce` packs `(epoch<<7) | (val&0x1)` (originally
+     sent raw u32; receiver extracts value via `w & 0x1`)
+   - All seven rx tasks (`rx_task_0..3`, `south_rx_task_0..2`,
+     `reduce_recv_task`, `col_reduce_recv_task`) drop on epoch
+     mismatch BEFORE any forwarder side-effect (send_south /
+     send_west_back / bridge_reinject / col_bridge_reinject)
+   - `start_coloring` reads `current_level_epoch` from
+     `runtime_config[2]` first thing
+   - Follow-up CP3.blocked-rx fix (2026-04-26): all 2d_seg2 fabric
+     receive tasks are bound blocked at comptime and unblocked only
+     after `start_coloring` latches `runtime_config[2]` and resets
+     per-level state. This closes the launch/start race where fresh
+     current-level wavelets reached downstream PEs while their local
+     epoch still held the sentinel.
+
+**Validation results on real WSE-3** (single shared wsjob, no
+per-level cycling):
+- test1 4×4 (`runs/hardware/20260426-epoch-test1-4x4-v5/`): 2 levels,
+  26,274 cyc, 0.031 ms — **PASS** (the originally-Level-1-hang case).
+- test12 4×4 (`runs/hardware/matrix20260426T051411Z-row1-...`): 5
+  levels, 734,472 cyc, 0.864 ms, 312s wall — **PASS**. Previously
+  hung at Level 0 even with the workaround.
+- test1 1×8 (row chain only) and test1 8×1 (col chain only): both
+  PASS at chain length 8.
+- test1 8×8 dual-axis, after CP3.blocked-rx
+  (`runs/hardware/20260426-cp3-blockrx-8x8-test1-hw/`): 2 levels,
+  86,263 cyc, 0.101 ms — **PASS** with a single shared wsjob and no
+  `--launcher-per-level`. This was the previously-consistent Level 1
+  hang.
+
+**Status of CP3.epoch:** correctness fix proven for 4×4 dual-axis
+(test1 + test12) and the 8×8 dual-axis init race is fixed for the
+test1 validation target. Dense 8×8+ scaling still needs the post-fix
+hardware matrix before removing the workaround from every production
+run recipe.
+
+## CP2d.e + dedupe — Dense 8×8 Dual-Axis Scaling Fix (2026-04-26)
+
+The CP3.epoch fix unblocked **trivial** 8×8 dual-axis (test1) but
+dense 8×8 (test14, 200 nodes, ~107 boundary edges per PE) still hung
+at Level 0. Five additional fixes shipped together to make dense
+dual-axis scale properly on real WSE-3:
+
+1. **Bounds derivation in wrappers (`neocortex/run_cs3_lww.sh`,
+   `neocortex/run_cs3.sh`).** Auto-derives compile-time
+   `MAX_LIST_SIZE` and `MAX_PALETTE_SIZE` from each test using the
+   same `_per_test_max_T()` formula as `run_csl_tests.py`. Previous
+   hardcoded `MAX_LIST_SIZE=2` was correct only for `test12_*`;
+   larger graphs needed 8–12 and the host's `cl_padded` upload was
+   silently overrunning the device `color_list[]` symbol, corrupting
+   adjacent state and hanging the kernel.
+2. **CP2d.e — dedicated back-channel route.** Restored `c_W_back_color`
+   routes (per-row, alternating `c_W_back_re/ro`), bound to a new
+   `back_recv_iq` on Q3 IQ + `tx_back_oq` on Q4 OQ. Decouples
+   back-channel data from the row-reduce chain that CP2d.d.2 had
+   merged onto `tx_reduce_oq`. Eliminates head-of-line blocking
+   between back-channel + row barrier under dense traffic.
+3. **S_row / S_col split.** The single `param S` was replaced with
+   per-axis params: `S_row=2` for the row chain (preserves existing
+   queue ceiling at 6/6), `S_col=1` for the col chain (single-PE
+   segments, drops `south_slot_count` to 1 globally, frees Q3 IQ
+   for the dedicated back-channel). The split also prevents future
+   queue conflicts on rectangular grids. **`S_col=1` is the default
+   for `2d_seg2` in `run_cs3_lww.sh`**; user can override via
+   `--s-col`.
+4. **`@block` / `@unblock` of all rx tasks** until `start_coloring`
+   finishes initialization. Fabric receive tasks bind blocked at
+   comptime; `unblock_fabric_recv_tasks()` runs at the end of
+   `start_coloring` after `current_level_epoch` is latched and per-
+   level state is reset. Closes the launch-init race where fresh
+   wavelets reached downstream PEs before their epoch was set.
+5. **Send dedupe in `send_boundary`.** Per-vertex per-direction
+   boolean markers (`sent_east_for_v`, `sent_south_for_v`) skip
+   duplicate emissions of the same `(gid, color)` pair. The wavelet
+   payload carries only `(gid, color)`, so multiple emissions per
+   round are pure overhead — the receiver scans every boundary entry
+   matching the gid anyway. For test14 8×8 this drops per-round
+   east+south traffic from O(num_boundary_edges) ≈ 6,800 to
+   O(num_local_vertices) ≈ 256 per PE — a 27× reduction. Markers
+   reset in `reset_round_state`.
+
+A static IQ-map validator (`tools/validate_iq_map_2d_seg2.py`)
+mirrors the layout's per-PE queue derivation and fails fast on any
+queue conflict. Confirmed clean at 4×4..64×64 with `S_row=2`,
+`S_col=1`.
+
+**Validation (matrix `runs/hardware/matrix_20260426T174339Z`):**
+
+| Test | Grid | Impl | Cycles | Levels | ms | Notes |
+|---|---|---|---:|---:|---:|---|
+| test12 (20n) | 4×4 | **2d_seg2** | **306,032** | 5 | **0.36** | dedupe: 2.34× faster than sw-relay |
+| test12 | 4×4 | sw-relay | 716,356 | 6 | 0.84 | baseline |
+| test12 | 1×16 | east_seg | 601,008 | 5 | 0.71 | 1D baseline |
+| test14 (200n) | 8×8 | **2d_seg2** | **102,446,775** | 12 | **120.53** | **the dense unblocked case** |
+| test14 | 8×8 | sw-relay | 137,997,169 | 15 | 162.35 | 2d_seg2 1.35× faster |
+| H2 (89n) | 8×8 | **2d_seg2** | **5,793,595** | 10 | **6.82** | 2d_seg2 2.50× faster than sw-relay |
+| H2 | 8×8 | sw-relay | 14,491,119 | 11 | 17.05 | |
+| H2 | 1×64 | east_seg | 29,367,984 | 10 | 34.55 | 1D 2× slower than 2d_seg2 |
+
+`test15 (500n)` SRAM-overflows at 256 PEs (~54 KB/PE > 48 KB user
+SRAM). Independent fix: bump grid to 32×32 / 1×1024 so per-PE
+boundary stays under SRAM. Tracked separately.
+
+## Hardware-Run Automation (2026-04-25)
+
+New scripts under `neocortex/`:
+
+- **`run_cs3_lww.sh`** — wrapper for pipelined-LWW kernels (mirror
+  of the existing `run_cs3.sh` for sw-relay). Args: test name,
+  `--num-pes`, `--grid-rows`, `--lww-layout`, `--seg-size`,
+  `--launcher-per-level`, `--run-id`, `--no-compile`.
+- **`run_cs3_matrix.sh`** — drives a TSV-defined matrix of runs.
+  TSV columns: `test_name | grid_rows | num_pes | impl |
+  golden_dir | max_minutes`. impl is one of `sw-relay`, `2d_seg2`,
+  `east_seg`. `timeout -k 60s ${MAX_MIN}m` per row; on timeout the
+  row is logged as TIMEOUT and the matrix moves on (does NOT
+  cancel the remote wsjob — operator decides).
+- **`cs3_status.sh`** — read-only snapshot of appliance wsjob queue
+  + last 3 matrix dirs + in-flight row tail.
+- TSVs: `cs3_matrix.tsv` (full study), `cs3_matrix_phase2.tsv`,
+  `cs3_matrix_epoch_validation.tsv`, etc.
+
+CSV summary format: `row,test,grid_rows,num_pes,impl,status,
+kernel_cycles,kernel_ms,wall_seconds,levels,run_id,notes`.
+
+`compile_appliance.py` extended (2026-04-25) to support all
+pipelined-LWW layouts via a `--lww-layout` argument and a
+`layout_map` dict; the produced artifact JSON now records
+`routing_mode=2`, `lww_layout`, and `seg_size` so the runner can
+cross-check before launching.
+
+## Hardware Validation Status (2026-04-25/26)
+
+| Implementation | 4×4 | 8×8 | Notes |
+|---|---|---|---|
+| sw-relay | ✅ test12 (715k cyc, 6 lvls) | ✅ test14 (106M cyc, 27 lvls) | Baseline; stable. |
+| east_seg | ✅ test12 1×16 (601k cyc, 5 lvls) | – | 1D only by design. |
+| 2d_seg2 + workaround | ✅ test12 (CP3 superseded) | ⚠️ partial | `--launcher-per-level` works but slow. |
+| 2d_seg2 + CP3.epoch + blocked rx | ✅ **test1 + test12** | ✅ test1 (86k cyc, 2 lvls) | Init race fixed for 8×8 sparse validation; dense scaling matrix pending. |
+
+Picasso golden config used: `--palette-frac 0.125 --alpha 2.0
+--max-rounds 30 --golden-dir tests/golden_normal`.
+
+## Cluster Operational Notes
+
+- Cluster: `siddarthb-cloud@cg3-us27.dfw1.cerebrascloud.com`.
+- SDK on user node: `cerebras-sdk==2.5.0` (in `~/picasso_venv`);
+  cluster server runs 3.1.x → every wsjob fires an
+  `InconsistentVersion` warning that is harmless in practice.
+- DNS to the cluster intermittently fails (`Name or service not
+  known`) — **wait for transient recovery**, do NOT auto-retry in
+  a tight loop. The matrix driver uses `timeout -k 60s` to
+  guarantee local cleanup even when ssh hangs on DNS.
+- Orphan wsjobs after a local script kill: surface via
+  `cs3_status.sh`; **ask the user before `csctl cancel`** per
+  project convention.
 
 ## Current LWW Scope
 

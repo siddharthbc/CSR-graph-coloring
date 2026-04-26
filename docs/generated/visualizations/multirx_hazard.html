@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Color-swap multi-rx hazard — visual walkthrough</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2027;
+    --ink: #d4d4d4;
+    --dim: #8a8a8a;
+    --accent: #6cb6ff;
+    --c0: #ffb454;    /* color 0 — orange */
+    --c1: #7fd962;    /* color 1 — green */
+    --hot: #ff5555;   /* collision */
+    --ok: #4a9a4a;
+    --mute: #333a44;
+    --rule: #2a323c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 14px/1.5 "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    background: var(--bg);
+    color: var(--ink);
+    padding: 24px;
+    max-width: 1180px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 20px; color: var(--accent); margin: 0 0 6px; }
+  h2 { font-size: 15px; color: var(--accent); margin: 28px 0 8px; border-bottom: 1px solid var(--rule); padding-bottom: 4px; }
+  p { color: var(--ink); }
+  .subtitle { color: var(--dim); margin: 0 0 24px; }
+  .panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+
+  /* Router chain */
+  .chain { display: flex; justify-content: space-between; align-items: stretch; gap: 8px; margin: 12px 0; }
+  .pe {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 10px;
+    position: relative;
+    min-height: 220px;
+  }
+  .pe-title { font-weight: bold; color: var(--accent); text-align: center; margin-bottom: 6px; }
+  .pe-sub { text-align: center; color: var(--dim); font-size: 11px; margin-bottom: 10px; }
+  .router {
+    border: 1px dashed var(--rule);
+    border-radius: 4px;
+    padding: 6px;
+    margin-top: 4px;
+  }
+  .router h4 { margin: 0 0 4px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .link-row { display: flex; justify-content: space-between; font-size: 11px; margin: 2px 0; }
+  .link-name { color: var(--dim); }
+  .slot {
+    display: inline-block;
+    width: 22px;
+    height: 16px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    margin-left: 3px;
+    vertical-align: middle;
+    background: #0a0e12;
+    transition: background 120ms, box-shadow 120ms;
+  }
+  .slot.c0 { background: var(--c0); color: #000; font-weight: bold; text-align: center; line-height: 16px; font-size: 10px; }
+  .slot.c1 { background: var(--c1); color: #000; font-weight: bold; text-align: center; line-height: 16px; font-size: 10px; }
+  .slot.hot { background: var(--hot); box-shadow: 0 0 10px var(--hot); color: #fff; animation: blink 0.6s infinite; }
+  @keyframes blink { 50% { opacity: 0.4; } }
+
+  .ce { background: #0a0e12; border: 1px solid var(--rule); border-radius: 4px; padding: 4px 6px; font-size: 11px; margin-top: 6px; }
+  .ce .ramp-label { color: var(--dim); }
+
+  /* Controls */
+  .controls { display: flex; gap: 10px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+  button { background: var(--accent); color: #0a0e12; border: 0; padding: 6px 12px; border-radius: 4px; font-family: inherit; font-weight: bold; cursor: pointer; }
+  button:hover { filter: brightness(1.1); }
+  button.secondary { background: var(--mute); color: var(--ink); }
+  .cycle-readout { color: var(--accent); font-weight: bold; }
+  .collision-flag {
+    color: var(--hot);
+    font-weight: bold;
+    padding: 4px 8px;
+    border: 1px solid var(--hot);
+    border-radius: 4px;
+    background: rgba(255, 85, 85, 0.1);
+    display: none;
+  }
+  .collision-flag.shown { display: inline-block; }
+
+  /* Legend */
+  .legend { display: flex; gap: 18px; margin: 10px 0; font-size: 12px; color: var(--dim); flex-wrap: wrap; }
+  .legend span.swatch { display: inline-block; width: 14px; height: 12px; vertical-align: middle; border-radius: 2px; margin-right: 4px; }
+
+  /* Log */
+  .log {
+    background: #0a0e12;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 12px;
+    max-height: 260px;
+    overflow-y: auto;
+    white-space: pre;
+    color: var(--ink);
+  }
+  .log .ev-collision { color: var(--hot); font-weight: bold; }
+  .log .ev-inject { color: var(--c0); }
+  .log .ev-fwd { color: var(--c1); }
+  .log .ev-deliver { color: var(--dim); }
+
+  /* Reasoning box */
+  .reason-box { background: rgba(108, 182, 255, 0.08); border-left: 3px solid var(--accent); padding: 10px 14px; margin: 10px 0; }
+  .reason-box code { background: #0a0e12; padding: 1px 4px; border-radius: 2px; font-size: 12px; }
+
+  kbd { background: var(--mute); border: 1px solid var(--rule); border-radius: 3px; padding: 1px 5px; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<h1>color_swap_x multi-rx hazard — 4 PE walkthrough</h1>
+<p class="subtitle">Why color swap can't save multi-source broadcast on WSE-2.</p>
+
+<div class="panel">
+  <h2 style="margin-top:0">The setup</h2>
+  <p>4 PEs in a row. Every PE wants to broadcast. Routing:</p>
+  <ul>
+    <li><b>east_color_0 (orange)</b> — inject color. rx = <code>{RAMP, WEST}</code>, tx = <code>{RAMP, EAST}</code> at interior PEs (for both own-inject and forwarding). color_swap_x on.</li>
+    <li><b>east_color_1 (green)</b> — forward-only color. rx = <code>{WEST}</code>, tx = <code>{RAMP, EAST}</code> at interior PEs. Wavelets land here after one X-link hop (because of the swap).</li>
+  </ul>
+  <p>At each X-link traversal, color swaps <code>0↔1</code>. So a wavelet injected on color 0 at PE0 appears as color 1 at PE1's WEST input, color 0 at PE2's WEST input, color 1 at PE3's WEST input.</p>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">Legend</h2>
+  <div class="legend">
+    <div><span class="swatch" style="background:var(--c0)"></span>color 0 (east_color_0)</div>
+    <div><span class="swatch" style="background:var(--c1)"></span>color 1 (east_color_1)</div>
+    <div><span class="swatch" style="background:var(--hot)"></span>collision: two wavelets on the same color from different links, same cycle</div>
+  </div>
+  <p style="color:var(--dim); margin-top:6px">Each "slot" on a link shows what's traversing it this cycle. An <b>rx slot</b> with two lit entries in the same color = HW error.</p>
+</div>
+
+<div class="panel">
+  <div class="controls">
+    <button id="stepBtn">Step ▶</button>
+    <button id="playBtn" class="secondary">Play</button>
+    <button id="resetBtn" class="secondary">Reset</button>
+    <span class="cycle-readout">Cycle: <span id="cycleReadout">0</span></span>
+    <span id="collisionFlag" class="collision-flag">⚠ COLLISION at PE<span id="collisionPE">—</span></span>
+  </div>
+
+  <div class="chain" id="chain">
+    <!-- PE panels injected by JS -->
+  </div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">Event log</h2>
+  <div class="log" id="log"></div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">Why color swap can't fix this</h2>
+  <div class="reason-box">
+    Color swap prevents <b>adjacent-hop</b> wavelets from sharing a color on the wire. A single-source broadcast cleanly alternates <code>0→1→0→1</code> as it propagates, so any one PE's WEST input only ever sees a single source of color 0 at a time.
+  </div>
+  <div class="reason-box">
+    With <b>multiple simultaneous sources</b>, every PE does two things on the inject color:
+    <ol style="margin: 6px 0 0 18px;">
+      <li>Pulls from RAMP (its own CE injects a wavelet)</li>
+      <li>Pulls from WEST (a wavelet from <i>another</i> source, having bounced through an even number of swaps, happens to land here on the same color)</li>
+    </ol>
+    The router has a single rx port per color. Two wavelets, one color, different links, same cycle → architectural error. The fabric reports:
+    <p style="color:var(--hot); margin:8px 0 0"><code>two wavelets of the same color C0 arrived from different links R and W. This violates architecture rules.</code></p>
+  </div>
+  <p>Color swap solves <b>between-hop</b> collisions. The remaining <b>source-inject vs far-source-forward</b> collision at a shared injection color is unsolvable with plain rx broadcast routing. Fix options: serialize injections via token, use per-source colors, or inject via a one-hop detour color that never mixes with the forward chain.</p>
+</div>
+
+<script>
+// ============================================================
+// Simulation model
+// ============================================================
+// 4 PEs, all inject a burst of wavelets simultaneously on color 0 eastward.
+// We simulate per-cycle router state: what's on each rx input of each PE
+// for each color, and what exits on each tx output.
+//
+// Link model: each X-link has a one-cycle fabric latency. A wavelet sent
+// east from PE(i) at cycle C appears at PE(i+1)'s WEST input at cycle C+1,
+// with color flipped due to color_swap_x.
+//
+// CE model: each PE's CE can inject one wavelet per cycle on color 0 via
+// RAMP. In our scenario PEs 0..2 inject N=3 wavelets in cycles 0,1,2.
+// PE3 (east edge) also injects once at cycle 2 to provoke the collision.
+//
+// Router semantics: on each cycle, for each color C at each PE, the router
+// collects all rx-side arrivals (RAMP if CE is injecting, WEST if a fabric
+// wavelet lands on this color). If >1 arrive on the same color in the same
+// cycle, it's a COLLISION (hardware error).
+// Otherwise the single wavelet is fanned to the tx set: EAST is passed to
+// the next PE's WEST input next cycle (with swap); RAMP is delivered to CE.
+//
+// We track wavelets as {src_pe, seq} tuples for display.
+
+const NUM_PES = 4;
+const CHAIN_CYCLES = 12;
+
+// Schedule: which cycles does each PE's CE inject on color 0?
+// PE0..2: cycles 0, 1, 2 (3 wavelets each)
+// PE3:   cycle 2 only (1 wavelet)  — this is what collides with PE0's 2-hop
+//        arrival at PE3. PE0 injects at cycle 0, it appears at PE1.W (c1) at
+//        cycle 1, forwarded east at cycle 1, appears at PE2.W (c0) cycle 2,
+//        forwarded east at cycle 2, appears at PE3.W (c0) cycle 4 — wait.
+//
+// Let's be precise. Link latency = 1 cycle. Forwarding takes 1 cycle for
+// router to process (combined here into the "arrive" step for simplicity).
+// So injection at cycle T at PE(i) appears at PE(i+k).W on cycle T+k.
+//
+// We want PE3 to see RAMP + WEST on color 0 at the same cycle.
+// PE0 injects cycle 0 → at PE3.W on cycle 3. Arrives on color X where
+//   X = parity of hops = 3 hops = color 1 (since 0→1→0→1).
+// So PE0's 3-hop arrival is on color 1 at PE3.W. Not a collision with RAMP(c0).
+//
+// But PE1 injects cycle 0 → at PE3.W on cycle 2, hops=2 → color 0.
+// If PE3 injects at cycle 2 via RAMP on c0, AND PE1's wavelet lands at
+// PE3.W on c0 at cycle 2, that's a collision on PE3 color 0.
+
+const INJECT_SCHED = [
+  // pe -> list of cycles at which CE fires a RAMP inject on color 0
+  { pe: 0, cycles: [0, 1, 2] },
+  { pe: 1, cycles: [0, 1, 2] },
+  { pe: 2, cycles: [0, 1, 2] },
+  { pe: 3, cycles: [2, 3, 4] },  // east edge also injects (own broadcast)
+];
+
+// Per-PE routing. Matches layout_colorswap.csl
+//   west_edge (PE0): c0 rx=RAMP tx=EAST, c1 rx=WEST tx=RAMP
+//   interior (PE1,2): c0 rx={RAMP,WEST} tx={RAMP,EAST}, c1 rx=WEST tx={RAMP,EAST}
+//   east_edge (PE3): c0 rx={RAMP,WEST} tx=RAMP, c1 rx=WEST tx=RAMP
+function routeFor(pe) {
+  if (pe === 0) return {
+    c0: { rx: ['RAMP'], tx: ['EAST'] },
+    c1: { rx: ['WEST'], tx: ['RAMP'] },
+  };
+  if (pe === NUM_PES - 1) return {
+    c0: { rx: ['RAMP', 'WEST'], tx: ['RAMP'] },
+    c1: { rx: ['WEST'], tx: ['RAMP'] },
+  };
+  return {
+    c0: { rx: ['RAMP', 'WEST'], tx: ['RAMP', 'EAST'] },
+    c1: { rx: ['WEST'], tx: ['RAMP', 'EAST'] },
+  };
+}
+
+// State that evolves per cycle
+let cycle = 0;
+// pendingArrivals[pe][color][link] = wavelet (or null)  — what's on this rx link this cycle
+let pendingArrivals = [];
+// delivered: wavelets delivered to each PE's CE (cumulative)
+let delivered = [];
+let collisions = [];
+let firstCollision = null;
+let injectIdx = [0, 0, 0, 0];
+
+function resetState() {
+  cycle = 0;
+  pendingArrivals = [];
+  delivered = [];
+  collisions = [];
+  firstCollision = null;
+  injectIdx = [0, 0, 0, 0];
+  for (let p = 0; p < NUM_PES; p++) {
+    pendingArrivals.push({ 0: { RAMP: null, WEST: null }, 1: { RAMP: null, WEST: null } });
+    delivered.push([]);
+  }
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('collisionFlag').classList.remove('shown');
+  render();
+}
+
+function logEv(html) {
+  const log = document.getElementById('log');
+  log.innerHTML += html + '\n';
+  log.scrollTop = log.scrollHeight;
+}
+
+function stepCycle() {
+  if (firstCollision !== null) return;  // freeze after collision
+
+  // Snapshot what arrives on each rx port this cycle.
+  // Arrivals come from: (1) this PE's CE inject on RAMP, (2) previous cycle's EAST-tx from PE(i-1).
+  const nextArrivals = [];
+  for (let p = 0; p < NUM_PES; p++) {
+    nextArrivals.push({ 0: { RAMP: null, WEST: null }, 1: { RAMP: null, WEST: null } });
+  }
+
+  // RAMP injects for this cycle
+  for (const sched of INJECT_SCHED) {
+    if (sched.cycles.includes(cycle)) {
+      const p = sched.pe;
+      const seq = injectIdx[p]++;
+      nextArrivals[p][0].RAMP = { src: p, seq: seq, from: 'RAMP', arrivedColor: 0 };
+      logEv(`<span class="ev-inject">[c${cycle}] PE${p} CE injects on C0 via RAMP {src=PE${p}, seq=${seq}}</span>`);
+    }
+  }
+
+  // Forwards from previous cycle's tx
+  // We compute what each PE tx'd last cycle, then advance by 1 hop.
+  // Simpler: we already recorded prev-cycle router outputs. But to keep
+  // this self-contained we recompute from pendingArrivals (the state about
+  // to be consumed).
+  for (let p = 0; p < NUM_PES; p++) {
+    for (let c = 0; c < 2; c++) {
+      const route = routeFor(p);
+      const rxSet = route[c === 0 ? 'c0' : 'c1'].rx;
+      const arrivals = rxSet.map(link => pendingArrivals[p][c][link]).filter(x => x !== null);
+
+      if (arrivals.length === 0) continue;
+
+      // Collision check happens when we render the arrival step (below, in the
+      // previous cycle's tick). Here we just forward the single (or first) arrival.
+      if (arrivals.length > 1) continue;  // collision — don't propagate
+
+      const w = arrivals[0];
+      const txSet = route[c === 0 ? 'c0' : 'c1'].tx;
+      for (const dir of txSet) {
+        if (dir === 'EAST' && p + 1 < NUM_PES) {
+          // Swap color on hop
+          const nc = c ^ 1;
+          // If target already has something on this link-color this cycle, it's fine
+          // because in fabric multiple wavelets can't be on same link-color same cycle
+          // (each X-link is one wavelet wide per cycle).  We'll just track; if another
+          // wavelet is already queued on same link-color, we drop the second (fabric
+          // serialization) — not our error condition here.
+          if (nextArrivals[p + 1][nc].WEST === null) {
+            nextArrivals[p + 1][nc].WEST = { src: w.src, seq: w.seq, from: 'WEST', arrivedColor: nc };
+          }
+        }
+        if (dir === 'RAMP') {
+          delivered[p].push({ ...w, deliveredOnColor: c, atCycle: cycle });
+          logEv(`<span class="ev-deliver">[c${cycle}] PE${p} CE receives on C${c} via RAMP {src=PE${w.src}, seq=${w.seq}}</span>`);
+        }
+      }
+    }
+  }
+
+  // Advance state
+  pendingArrivals = nextArrivals;
+  cycle += 1;
+
+  // Collision check on the NEW state (what arrives NEXT cycle on rx ports)
+  for (let p = 0; p < NUM_PES; p++) {
+    for (let c = 0; c < 2; c++) {
+      const arrivals = ['RAMP', 'WEST', 'EAST'].map(link => pendingArrivals[p][c][link]).filter(x => x !== null);
+      if (arrivals.length > 1) {
+        const tag = `PE${p} color C${c} at cycle ${cycle}`;
+        collisions.push({ pe: p, color: c, cycle, arrivals });
+        if (firstCollision === null) {
+          firstCollision = { pe: p, color: c, cycle, arrivals };
+          const flag = document.getElementById('collisionFlag');
+          flag.classList.add('shown');
+          document.getElementById('collisionPE').textContent = `${p} (color C${c})`;
+          logEv(`<span class="ev-collision">[c${cycle}] ⚠ COLLISION — ${tag}: ${arrivals.map(a => `{src=PE${a.src}, seq=${a.seq}, from=${a.from}}`).join(' + ')}</span>`);
+          logEv(`<span class="ev-collision">          → HW error: "two wavelets of the same color C${c} arrived from different links ${arrivals.map(a => a.from[0]).join(' and ')}"</span>`);
+        }
+      }
+    }
+  }
+
+  // Log a fwd-arrival summary line for eastward forwards (non-collision case)
+  for (let p = 0; p < NUM_PES; p++) {
+    for (let c = 0; c < 2; c++) {
+      const w = pendingArrivals[p][c].WEST;
+      if (w !== null) {
+        logEv(`<span class="ev-fwd">[c${cycle}] PE${p} WEST-input holds C${c} {src=PE${w.src}, seq=${w.seq}} (${c === 0 ? '2n-hop' : '(2n+1)-hop'} from source)</span>`);
+      }
+    }
+  }
+
+  render();
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function render() {
+  document.getElementById('cycleReadout').textContent = cycle;
+  const chain = document.getElementById('chain');
+  chain.innerHTML = '';
+
+  for (let p = 0; p < NUM_PES; p++) {
+    const div = document.createElement('div');
+    div.className = 'pe';
+    const route = routeFor(p);
+
+    const collideC0 = firstCollision && firstCollision.pe === p && firstCollision.color === 0;
+    const collideC1 = firstCollision && firstCollision.pe === p && firstCollision.color === 1;
+
+    function slotHtml(color, link) {
+      const w = pendingArrivals[p][color][link];
+      const arrivalsThisColor = ['RAMP', 'WEST', 'EAST'].map(l => pendingArrivals[p][color][l]).filter(x => x !== null);
+      const colliding = arrivalsThisColor.length > 1 && w !== null;
+      if (w === null) return `<span class="slot"></span>`;
+      const cls = colliding ? 'hot' : (color === 0 ? 'c0' : 'c1');
+      return `<span class="slot ${cls}" title="src=PE${w.src} seq=${w.seq}">${w.seq}</span>`;
+    }
+
+    const edge = p === 0 ? 'west edge' : p === NUM_PES - 1 ? 'east edge' : 'interior';
+    div.innerHTML = `
+      <div class="pe-title">PE${p}</div>
+      <div class="pe-sub">${edge}</div>
+
+      <div class="router">
+        <h4>color 0 (inject color)</h4>
+        <div class="link-row"><span class="link-name">rx RAMP</span>${slotHtml(0, 'RAMP')}</div>
+        <div class="link-row"><span class="link-name">rx WEST</span>${slotHtml(0, 'WEST')}</div>
+        <div class="link-row" style="color:var(--dim); font-size:10px">tx → ${route.c0.tx.join(', ')}</div>
+      </div>
+
+      <div class="router">
+        <h4>color 1 (forward color)</h4>
+        <div class="link-row"><span class="link-name">rx WEST</span>${slotHtml(1, 'WEST')}</div>
+        <div class="link-row" style="color:var(--dim); font-size:10px">tx → ${route.c1.tx.join(', ')}</div>
+      </div>
+
+      <div class="ce"><span class="ramp-label">CE delivered:</span> ${delivered[p].length === 0 ? '—' : delivered[p].map(d => `C${d.deliveredOnColor}{PE${d.src}.${d.seq}}`).join(' ')}</div>
+    `;
+    chain.appendChild(div);
+  }
+}
+
+document.getElementById('stepBtn').addEventListener('click', stepCycle);
+document.getElementById('resetBtn').addEventListener('click', resetState);
+
+let playTimer = null;
+document.getElementById('playBtn').addEventListener('click', (e) => {
+  if (playTimer) {
+    clearInterval(playTimer);
+    playTimer = null;
+    e.target.textContent = 'Play';
+    return;
+  }
+  e.target.textContent = 'Pause';
+  playTimer = setInterval(() => {
+    if (firstCollision !== null || cycle > CHAIN_CYCLES) {
+      clearInterval(playTimer);
+      playTimer = null;
+      document.getElementById('playBtn').textContent = 'Play';
+      return;
+    }
+    stepCycle();
+  }, 700);
+});
+
+resetState();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Picasso on Cerebras WSE — Implementation Visualization</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #181b23;
+    --border: #2a2e3a;
+    --text: #e0e0e6;
+    --dim: #8b8fa3;
+    --accent: #6c8cff;
+    --accent2: #a78bfa;
+    --green: #34d399;
+    --red: #f87171;
+    --orange: #fbbf24;
+    --cyan: #22d3ee;
+    --pink: #f472b6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.6; padding: 0;
+  }
+  .header {
+    background: linear-gradient(135deg, #1a1d2e 0%, #0d1020 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 2rem 2rem 1.5rem; text-align: center;
+  }
+  .header h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; }
+  .header h1 span { color: var(--cyan); }
+  .header p { color: var(--dim); margin-top: 0.5rem; font-size: 0.95rem; }
+
+  .container { max-width: 1250px; margin: 0 auto; padding: 2rem; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;
+  }
+  .card h2 {
+    font-size: 1.15rem; margin-bottom: 0.75rem;
+    display: flex; align-items: center; gap: 0.5rem;
+  }
+  .badge {
+    font-size: 0.7rem; padding: 0.15rem 0.6rem;
+    border-radius: 99px; font-weight: 600;
+  }
+  .badge-cyan { background: rgba(34,211,238,0.15); color: var(--cyan); }
+  .badge-green { background: rgba(52,211,153,0.15); color: var(--green); }
+  .badge-orange { background: rgba(251,191,36,0.15); color: var(--orange); }
+  .badge-purple { background: rgba(167,139,250,0.15); color: var(--accent2); }
+  .badge-pink { background: rgba(244,114,182,0.15); color: var(--pink); }
+  .badge-blue { background: rgba(108,140,255,0.15); color: var(--accent); }
+
+  .desc { color: var(--dim); font-size: 0.9rem; margin-bottom: 1rem; }
+
+  svg { width: 100%; height: auto; display: block; }
+  svg text { font-family: 'Segoe UI', system-ui, sans-serif; }
+
+  .step-controls {
+    display: flex; align-items: center; gap: 1rem;
+    margin-top: 1rem; justify-content: center;
+  }
+  .step-btn {
+    padding: 0.45rem 1.2rem; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--card);
+    color: var(--text); cursor: pointer; font-size: 0.85rem;
+    transition: all 0.2s;
+  }
+  .step-btn:hover { background: var(--cyan); border-color: var(--cyan); color: #111; }
+  .step-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .step-btn:disabled:hover { background: var(--card); color: var(--text); }
+  .step-info { color: var(--dim); font-size: 0.85rem; min-width: 100px; text-align: center; }
+
+  .annotation-box {
+    background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.2);
+    border-radius: 8px; padding: 0.75rem 1rem; margin-top: 1rem;
+    font-size: 0.88rem; color: var(--text); min-height: 2.5rem;
+  }
+  .annotation-box code {
+    background: rgba(255,255,255,0.08); padding: 0.1rem 0.4rem;
+    border-radius: 4px; font-size: 0.82rem;
+  }
+
+  .phase-nav {
+    display: flex; gap: 0.5rem; flex-wrap: wrap;
+    justify-content: center; margin-bottom: 2rem;
+  }
+  .phase-btn {
+    padding: 0.5rem 1.2rem; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--card);
+    color: var(--dim); cursor: pointer; font-size: 0.85rem;
+    transition: all 0.2s;
+  }
+  .phase-btn:hover { border-color: var(--cyan); color: var(--text); }
+  .phase-btn.active {
+    background: var(--cyan); color: #111;
+    border-color: var(--cyan); font-weight: 600;
+  }
+  .phase-panel { display: none; }
+  .phase-panel.active { display: block; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+
+  .legend {
+    display: flex; gap: 1.5rem; flex-wrap: wrap;
+    margin-top: 0.75rem; font-size: 0.8rem; color: var(--dim);
+  }
+  .legend-item { display: flex; align-items: center; gap: 0.35rem; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+
+  table.compare {
+    width: 100%; border-collapse: collapse; margin: 1rem 0;
+    font-size: 0.85rem;
+  }
+  table.compare th, table.compare td {
+    padding: 0.6rem 0.8rem; border: 1px solid var(--border);
+    text-align: left;
+  }
+  table.compare th {
+    background: rgba(34,211,238,0.08); color: var(--cyan);
+    font-weight: 600;
+  }
+  table.compare td { color: var(--text); }
+  table.compare tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+  .highlight-cell { color: var(--green) !important; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Picasso on <span>Cerebras WSE</span> — Implementation Plan</h1>
+  <p>Mapping graph coloring onto the Wafer-Scale Engine &nbsp;·&nbsp; CSL / SdkRuntime</p>
+</div>
+
+<div class="container">
+
+<!-- Comparison Table -->
+<div class="card">
+  <h2>CPU vs Cerebras WSE — Side-by-Side</h2>
+  <table class="compare">
+    <tr><th>Aspect</th><th>Current CPU (Python)</th><th>Cerebras WSE (CSL)</th></tr>
+    <tr><td>Execution model</td><td>Sequential — one vertex at a time</td><td class="highlight-cell">Massively parallel — up to 750K PEs</td></tr>
+    <tr><td>Graph storage</td><td>scipy.sparse CSR (single copy)</td><td class="highlight-cell">Partitioned CSR slices across PEs</td></tr>
+    <tr><td>Coloring</td><td>Bucket greedy (sequential picks)</td><td class="highlight-cell">Speculative parallel + conflict resolve</td></tr>
+    <tr><td>Communication</td><td>N/A (single process)</td><td class="highlight-cell">Fabric wavelets (EAST/WEST/NORTH/SOUTH)</td></tr>
+    <tr><td>Memory per unit</td><td>Entire graph in RAM (GBs)</td><td>48 KB per PE</td></tr>
+    <tr><td>Conflict resolve</td><td>Immediate (sequential)</td><td class="highlight-cell">Priority-based (vertex ID), O(log n) rounds</td></tr>
+  </table>
+</div>
+
+<!-- Phase navigation -->
+<div class="phase-nav">
+  <button class="phase-btn active" onclick="showPhase(0)">① WSE Architecture</button>
+  <button class="phase-btn" onclick="showPhase(1)">② Graph Partitioning</button>
+  <button class="phase-btn" onclick="showPhase(2)">③ Speculative Coloring</button>
+  <button class="phase-btn" onclick="showPhase(3)">④ Wavelet Communication</button>
+  <button class="phase-btn" onclick="showPhase(4)">⑤ Conflict Resolution</button>
+  <button class="phase-btn" onclick="showPhase(5)">⑥ Full CSL Architecture</button>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 0: WSE Architecture                                     -->
+<!-- ============================================================ -->
+<div class="phase-panel active" id="phase-0">
+<div class="card">
+  <h2>Cerebras Wafer-Scale Engine <span class="badge badge-cyan">Hardware Overview</span></h2>
+  <p class="desc">The WSE-2 has 850,000 cores arranged in a 2D grid. Each Processing Element (PE) has its own compute, 48KB memory, and a router connected to 4 cardinal neighbors + its own RAMP.</p>
+  <svg id="svg-wse" viewBox="0 0 900 450"></svg>
+  <div class="annotation-box">
+    Each PE is an independent processor with local SRAM. PEs communicate via <b>fabric colors</b> — named wavelet channels routed through the 2D mesh. The host (Python, <code>SdkRuntime</code>) orchestrates data transfer and kernel launches.
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 1: Graph Partitioning                                   -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-1">
+<div class="card">
+  <h2>Graph Partitioning onto PEs <span class="badge badge-green">Host → memcpy_h2d</span></h2>
+  <p class="desc">The host partitions the conflict graph's CSR arrays across PEs. Each PE gets a contiguous slice of vertices and their adjacency data. Edges crossing PE boundaries are "boundary edges" — they require inter-PE communication.</p>
+  <svg id="svg-partition" viewBox="0 0 900 400"></svg>
+  <div class="step-controls">
+    <button class="step-btn" id="part-prev" onclick="partStep(-1)">← Prev</button>
+    <span class="step-info" id="part-info">Step 1 / 4</span>
+    <button class="step-btn" id="part-next" onclick="partStep(1)">Next →</button>
+  </div>
+  <div class="annotation-box" id="part-annot">We have a graph with 8 vertices. We'll partition it across 4 PEs (2 vertices each).</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 2: Speculative Coloring                                 -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-2">
+<div class="card">
+  <h2>Speculative Parallel Coloring <span class="badge badge-purple">pe_program.csl → color_step()</span></h2>
+  <p class="desc">Unlike the sequential bucket algorithm, on WSE each PE <b>simultaneously</b> picks tentative colors for all its uncolored vertices. Conflicts are detected and resolved in a subsequent phase.</p>
+  <svg id="svg-speculative" viewBox="0 0 900 420"></svg>
+  <div class="step-controls">
+    <button class="step-btn" id="spec-prev" onclick="specStep(-1)">← Prev</button>
+    <span class="step-info" id="spec-info">Step 1 / 5</span>
+    <button class="step-btn" id="spec-next" onclick="specStep(1)">Next →</button>
+  </div>
+  <div class="annotation-box" id="spec-annot">Each PE operates independently — no locks, no barriers within a phase.</div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#22d3ee"></div> Tentative color</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#34d399"></div> Confirmed color</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div> Conflict → retry</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#555"></div> Uncolored</div>
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 3: Wavelet Communication                                -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-3">
+<div class="card">
+  <h2>Wavelet Communication <span class="badge badge-orange">Fabric DSDs / Routes</span></h2>
+  <p class="desc">After tentative coloring, each PE sends its boundary vertex colors to neighbors via <b>fabric colors</b>. The router at each PE has 5 ports: RAMP (to local CE), NORTH, SOUTH, EAST, WEST. Colors define wavelet channels.</p>
+  <svg id="svg-wavelet" viewBox="0 0 900 400"></svg>
+  <div class="step-controls">
+    <button class="step-btn" id="wave-prev" onclick="waveStep(-1)">← Prev</button>
+    <span class="step-info" id="wave-info">Step 1 / 4</span>
+    <button class="step-btn" id="wave-next" onclick="waveStep(1)">Next →</button>
+  </div>
+  <div class="annotation-box" id="wave-annot">PEs use <code>fabout_dsd</code> and <code>fabin_dsd</code> to send/receive wavelets along routed fabric colors.</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 4: Conflict Resolution                                  -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-4">
+<div class="card">
+  <h2>Conflict Detection &amp; Resolution <span class="badge badge-pink">Priority Rule</span></h2>
+  <p class="desc">After receiving neighbor colors, each PE checks boundary edges for conflicts. Resolution: for edge (u,v) with same color, the vertex with <b>higher ID yields</b> — resets to uncolored and retries next round.</p>
+  <svg id="svg-resolve" viewBox="0 0 900 380"></svg>
+  <div class="step-controls">
+    <button class="step-btn" id="res-prev" onclick="resStep(-1)">← Prev</button>
+    <span class="step-info" id="res-info">Step 1 / 4</span>
+    <button class="step-btn" id="res-next" onclick="resStep(1)">Next →</button>
+  </div>
+  <div class="annotation-box" id="res-annot">Priority-based resolution guarantees progress: each round, at least one endpoint of each conflicting edge keeps its color.</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PHASE 5: Full CSL Architecture                                -->
+<!-- ============================================================ -->
+<div class="phase-panel" id="phase-5">
+<div class="card">
+  <h2>Full CSL File Architecture <span class="badge badge-blue">3-file structure</span></h2>
+  <p class="desc">A Cerebras CSL program consists of a layout file (PE grid setup), a PE program (kernel code), and a host Python driver.</p>
+  <svg id="svg-arch" viewBox="0 0 900 520"></svg>
+  <div class="annotation-box">
+    <b>Compile:</b> <code>cslc layout.csl --fabric-dims=11,3 --fabric-offsets=4,1 --params=... --memcpy --channels=1 -o out</code><br>
+    <b>Run:</b> <code>cs_python run.py --name out</code> (simulator) &nbsp;|&nbsp; <code>cs_python run.py --name out --cmaddr IP:PORT</code> (real hardware)
+  </div>
+</div>
+</div>
+
+</div><!-- container -->
+
+<script>
+// ========== Navigation ==========
+const panels = document.querySelectorAll('.phase-panel');
+const btns = document.querySelectorAll('.phase-btn');
+function showPhase(idx) {
+  panels.forEach((p,i) => p.classList.toggle('active', i===idx));
+  btns.forEach((b,i) => b.classList.toggle('active', i===idx));
+}
+
+// ========== Drawing helpers ==========
+const COLORS = ['#6c8cff','#34d399','#f87171','#fbbf24','#a78bfa','#22d3ee','#f472b6','#fb923c'];
+function el(tag, attrs) {
+  const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k,v] of Object.entries(attrs||{})) e.setAttribute(k, v);
+  return e;
+}
+function drawRect(svg, x,y,w,h, fill, stroke, rx) {
+  const r = el('rect',{x,y,width:w,height:h,fill,rx:rx||4});
+  if (stroke) { r.setAttribute('stroke',stroke); r.setAttribute('stroke-width','1.5'); }
+  svg.appendChild(r); return r;
+}
+function drawCircle(svg, cx,cy,r, fill, stroke) {
+  const c = el('circle',{cx,cy,r,fill,stroke:stroke||'none','stroke-width':'2'});
+  svg.appendChild(c); return c;
+}
+function drawText(svg, x,y, text, size, fill, anchor, weight) {
+  const t = el('text',{x,y,'font-size':size||13,fill:fill||'#e0e0e6','text-anchor':anchor||'middle','dominant-baseline':'central'});
+  if (weight) t.setAttribute('font-weight', weight);
+  t.textContent = text; svg.appendChild(t); return t;
+}
+function drawLine(svg, x1,y1,x2,y2, stroke, width, dash) {
+  const l = el('line',{x1,y1,x2,y2,stroke:stroke||'#555','stroke-width':width||1.5});
+  if (dash) l.setAttribute('stroke-dasharray', dash);
+  svg.appendChild(l); return l;
+}
+function drawArrowLine(svg, x1,y1,x2,y2, color, width) {
+  const mid = 'a'+Math.random().toString(36).substr(2,5);
+  const defs = el('defs'); const marker = el('marker',{id:mid,markerWidth:8,markerHeight:8,refX:7,refY:4,orient:'auto'});
+  const path = el('path',{d:'M0,1 L7,4 L0,7 Z',fill:color||'#555'});
+  marker.appendChild(path); defs.appendChild(marker); svg.appendChild(defs);
+  const l = drawLine(svg,x1,y1,x2,y2,color,width||1.5);
+  l.setAttribute('marker-end',`url(#${mid})`); return l;
+}
+
+// ========== PHASE 0: WSE Architecture ==========
+(function drawWSE() {
+  const svg = document.getElementById('svg-wse');
+
+  // Draw PE grid (6x4 subset)
+  const ox = 80, oy = 60, sz = 70, gap = 8;
+  drawText(svg, 300, 25, 'WSE-2 PE Grid (6×4 shown of 757×996)', 13, '#8b8fa3');
+
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 6; c++) {
+      const x = ox + c*(sz+gap), y = oy + r*(sz+gap);
+      const isProgram = r >= 1 && r <= 2 && c >= 1 && c <= 4;
+      const fill = isProgram ? '#22d3ee15' : '#1a1d28';
+      const stroke = isProgram ? '#22d3ee50' : '#2a2e3a';
+      drawRect(svg, x, y, sz, sz, fill, stroke, 6);
+
+      if (isProgram) {
+        drawText(svg, x+sz/2, y+20, `PE`, 10, '#22d3ee');
+        drawText(svg, x+sz/2, y+35, `(${c-1},${r-1})`, 9, '#8b8fa3');
+        // Memory bar
+        drawRect(svg, x+10, y+48, sz-20, 8, '#1a1d28', '#2a2e3a', 3);
+        drawRect(svg, x+10, y+48, (sz-20)*0.6, 8, '#22d3ee40', null, 3);
+        drawText(svg, x+sz/2, y+62, '48KB', 7, '#555');
+      } else {
+        drawText(svg, x+sz/2, y+sz/2, '·', 16, '#333');
+      }
+    }
+  }
+
+  // Arrows between neighboring PEs
+  for (let r = 1; r <= 2; r++) {
+    for (let c = 1; c <= 3; c++) {
+      const x1 = ox + c*(sz+gap) + sz;
+      const y1 = oy + r*(sz+gap) + sz/2;
+      const x2 = ox + (c+1)*(sz+gap);
+      drawLine(svg, x1+2, y1, x2-2, y1, '#22d3ee30', 1);
+    }
+  }
+  for (let r = 1; r <= 1; r++) {
+    for (let c = 1; c <= 4; c++) {
+      const x1 = ox + c*(sz+gap) + sz/2;
+      const y1 = oy + r*(sz+gap) + sz;
+      const y2 = oy + (r+1)*(sz+gap);
+      drawLine(svg, x1, y1+2, x1, y2-2, '#22d3ee30', 1);
+    }
+  }
+
+  // Program rectangle label
+  drawRect(svg, ox + (sz+gap) - 5, oy + (sz+gap) - 5, 4*(sz+gap)+sz-gap+10, 2*(sz+gap)+sz-gap+10, 'none', '#22d3ee', 8);
+  drawText(svg, ox + (sz+gap) + 2*(sz+gap), oy + (sz+gap) - 18, '@set_rectangle(4, 2)', 10, '#22d3ee');
+
+  // PE detail on the right
+  const dx = 600, dy = 60;
+  drawRect(svg, dx, dy, 270, 340, '#1a1d28', '#2a2e3a', 10);
+  drawText(svg, dx+135, dy+20, 'Inside One PE', 14, '#22d3ee', 'middle', '600');
+
+  // CE box
+  drawRect(svg, dx+30, dy+50, 210, 80, '#22d3ee10', '#22d3ee50', 8);
+  drawText(svg, dx+135, dy+70, 'Compute Element (CE)', 11, '#22d3ee');
+  drawText(svg, dx+135, dy+90, 'local_offsets[], local_adj[]', 9, '#8b8fa3');
+  drawText(svg, dx+135, dy+108, 'vertex_colors[], color_lists[]', 9, '#8b8fa3');
+
+  // RAMP arrow
+  drawArrowLine(svg, dx+135, dy+130, dx+135, dy+155, '#a78bfa', 2);
+  drawText(svg, dx+170, dy+143, 'RAMP', 9, '#a78bfa');
+
+  // Router box
+  drawRect(svg, dx+30, dy+155, 210, 70, '#a78bfa10', '#a78bfa50', 8);
+  drawText(svg, dx+135, dy+178, 'Router', 12, '#a78bfa', 'middle', '600');
+  drawText(svg, dx+135, dy+198, 'N / S / E / W + RAMP', 9, '#8b8fa3');
+
+  // Direction arrows from router
+  const ry = dy+190;
+  drawArrowLine(svg, dx+30, ry, dx+5, ry, '#fbbf24'); // WEST
+  drawText(svg, dx-5, ry, 'W', 9, '#fbbf24', 'end');
+  drawArrowLine(svg, dx+240, ry, dx+265, ry, '#fbbf24'); // EAST
+  drawText(svg, dx+275, ry, 'E', 9, '#fbbf24', 'start');
+  drawArrowLine(svg, dx+135, dy+225, dx+135, dy+250, '#fbbf24'); // SOUTH
+  drawText(svg, dx+150, dy+242, 'S', 9, '#fbbf24');
+
+  // Memory detail
+  drawRect(svg, dx+30, dy+265, 210, 55, '#34d39910', '#34d39950', 8);
+  drawText(svg, dx+135, dy+283, '48 KB SRAM', 11, '#34d399', 'middle', '600');
+  drawText(svg, dx+135, dy+302, '~6000 int32 values', 9, '#8b8fa3');
+
+  // Host at bottom
+  drawRect(svg, 100, 400, 380, 35, '#fbbf2410', '#fbbf2450', 8);
+  drawText(svg, 290, 418, 'Host (Python + SdkRuntime) — memcpy_h2d / memcpy_d2h / launch()', 10, '#fbbf24');
+  drawArrowLine(svg, 290, 395, 290, 400, '#fbbf24');
+})();
+
+// ========== PHASE 1: Graph Partitioning ==========
+let partStepIdx = 0;
+const partSteps = [
+  { annot: 'We have an 8-vertex graph. The host needs to partition it across 4 PEs — 2 vertices each.' },
+  { annot: 'Vertices {v0,v1} → PE0, {v2,v3} → PE1, {v4,v5} → PE2, {v6,v7} → PE3. Each PE gets a <b>local CSR slice</b>.' },
+  { annot: 'Edges <em>within</em> a PE (e.g., v0–v1) are <b>local</b> — resolved without communication. Edges <em>across</em> PEs (e.g., v1–v2) are <b>boundary</b> — require wavelet exchange.' },
+  { annot: 'Host uses <code>memcpy_h2d</code> to copy each PE\'s local_offsets[], local_adj[], and color_lists[]. The global CSR is sliced on the host before transfer.' },
+];
+
+function drawPartScene() {
+  const svg = document.getElementById('svg-partition');
+  svg.innerHTML = '';
+  const step = partStepIdx;
+
+  // Graph vertices in a line
+  const vx = i => 100 + i * 90;
+  const vy = 80;
+
+  // Edges (example graph)
+  const edges = [[0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[6,7],[0,3],[2,5],[4,7]];
+
+  // Draw PE boxes if step >= 1
+  if (step >= 1) {
+    const peColors = ['#6c8cff','#34d399','#fbbf24','#f472b6'];
+    for (let p = 0; p < 4; p++) {
+      const x1 = vx(p*2) - 30;
+      drawRect(svg, x1, 40, 170, 90, peColors[p]+'08', peColors[p]+'50', 10);
+      drawText(svg, x1+85, 52, `PE ${p}`, 10, peColors[p], 'middle', '600');
+    }
+  }
+
+  // Draw edges
+  for (const [a,b] of edges) {
+    const isBoundary = step >= 2 && Math.floor(a/2) !== Math.floor(b/2);
+    const color = isBoundary ? '#f87171' : (step >= 2 ? '#34d39960' : '#3a3f55');
+    const dash = isBoundary ? '4,3' : '';
+    drawLine(svg, vx(a), vy, vx(b), vy, color, isBoundary ? 2 : 1.5, dash);
+  }
+
+  // Draw vertices
+  const peColors = ['#6c8cff','#34d399','#fbbf24','#f472b6'];
+  for (let i = 0; i < 8; i++) {
+    const fill = step >= 1 ? peColors[Math.floor(i/2)]+'25' : '#1e2233';
+    const stroke = step >= 1 ? peColors[Math.floor(i/2)] : '#3a3f55';
+    drawCircle(svg, vx(i), vy, 22, fill, stroke);
+    drawText(svg, vx(i), vy, `v${i}`, 10, '#e0e0e6');
+  }
+
+  // CSR slices below
+  if (step >= 3) {
+    drawText(svg, 450, 170, 'Local CSR Slices (memcpy_h2d to each PE)', 12, '#8b8fa3');
+    for (let p = 0; p < 4; p++) {
+      const bx = 50 + p * 215;
+      const by = 195;
+      drawRect(svg, bx, by, 195, 140, '#1a1d28', peColors[p]+'40', 8);
+      drawText(svg, bx + 97, by + 18, `PE ${p}`, 10, peColors[p], 'middle', '600');
+
+      // Show offsets and adj arrays
+      const slices = [
+        { off: [0,1,3], adj: [1,1,0], label: 'v0,v1' },
+        { off: [0,2,4], adj: [1,0,2,0], label: 'v2,v3' },
+        { off: [0,2,4], adj: [3,5,4,7], label: 'v4,v5' },
+        { off: [0,1,2], adj: [5,6], label: 'v6,v7' },
+      ];
+      const s = slices[p];
+      drawText(svg, bx+10, by+38, 'off:', 9, '#8b8fa3', 'start');
+      for (let i = 0; i < s.off.length; i++) {
+        drawRect(svg, bx+40+i*28, by+28, 24, 20, '#1e2233', '#2a2e3a', 3);
+        drawText(svg, bx+52+i*28, by+38, s.off[i], 9, '#6c8cff');
+      }
+      drawText(svg, bx+10, by+64, 'adj:', 9, '#8b8fa3', 'start');
+      for (let i = 0; i < s.adj.length; i++) {
+        drawRect(svg, bx+40+i*28, by+54, 24, 20, '#1e2233', '#2a2e3a', 3);
+        drawText(svg, bx+52+i*28, by+64, s.adj[i], 9, '#34d399');
+      }
+      drawText(svg, bx+10, by+88, 'verts: ' + s.label, 9, '#555', 'start');
+      // Memory usage
+      drawRect(svg, bx+10, by+105, 175, 10, '#1e2233', '#2a2e3a', 3);
+      const usage = (s.off.length + s.adj.length + 4) * 4; // bytes
+      const pct = Math.min(1, usage / (48*1024));
+      drawRect(svg, bx+10, by+105, 175*pct*200, 10, peColors[p]+'60', null, 3);
+      drawText(svg, bx+97, by+125, `${usage} bytes / 48KB`, 8, '#555');
+    }
+  }
+
+  // Legend
+  if (step >= 2) {
+    drawLine(svg, 80, 145, 110, 145, '#34d39960', 2);
+    drawText(svg, 115, 145, 'local edge', 9, '#8b8fa3', 'start');
+    drawLine(svg, 250, 145, 280, 145, '#f87171', 2, '4,3');
+    drawText(svg, 285, 145, 'boundary edge (needs communication)', 9, '#f87171', 'start');
+  }
+
+  document.getElementById('part-info').textContent = `Step ${partStepIdx+1} / ${partSteps.length}`;
+  document.getElementById('part-annot').innerHTML = partSteps[partStepIdx].annot;
+  document.getElementById('part-prev').disabled = partStepIdx === 0;
+  document.getElementById('part-next').disabled = partStepIdx === partSteps.length - 1;
+}
+
+function partStep(d) {
+  partStepIdx = Math.max(0, Math.min(partSteps.length-1, partStepIdx + d));
+  drawPartScene();
+}
+
+// ========== PHASE 2: Speculative Coloring ==========
+let specStepIdx = 0;
+const specSteps = [
+  { annot: 'Round 1 begins. Each PE will <b>independently</b> pick a tentative color for every uncolored vertex — all PEs run simultaneously.' },
+  { annot: '<b>Speculate:</b> All PEs pick colors in parallel from their vertices\' color lists. PE0: v0→<span style="color:#6c8cff">blue</span>, v1→<span style="color:#34d399">green</span>. PE1: v2→<span style="color:#6c8cff">blue</span>, v3→<span style="color:#fbbf24">yellow</span>. No coordination yet.' },
+  { annot: '<b>Local conflict check:</b> Each PE checks edges <em>within</em> its partition. If both endpoints have the same color, the higher-ID vertex yields. (No local conflicts in this example.)' },
+  { annot: '<b>Boundary exchange:</b> PEs send boundary vertex colors to neighbors via wavelets. PE0 sends v1=<span style="color:#34d399">green</span> to PE1. PE1 sends v2=<span style="color:#6c8cff">blue</span> to PE0. (See Phase ④ for details.)' },
+  { annot: '<b>Resolve:</b> v1(PE0)=green vs v2(PE1)=blue → different colors → no conflict! All vertices keep their colors. If there were a conflict, the higher-ID vertex would reset to uncolored and retry in Round 2.' },
+];
+
+function drawSpecScene() {
+  const svg = document.getElementById('svg-speculative');
+  svg.innerHTML = '';
+  const step = specStepIdx;
+
+  // 4 PEs in a row
+  const peW = 180, peH = 200, gap = 25;
+  const peColors = ['#6c8cff','#34d399','#fbbf24','#f472b6'];
+  const vertColors = [
+    step >= 1 ? '#6c8cff' : null, step >= 1 ? '#34d399' : null,
+    step >= 1 ? '#6c8cff' : null, step >= 1 ? '#fbbf24' : null,
+    step >= 1 ? '#f87171' : null, step >= 1 ? '#a78bfa' : null,
+    step >= 1 ? '#22d3ee' : null, step >= 1 ? '#f87171' : null,
+  ];
+  const vertColorNames = ['blue','green','blue','yellow','red','purple','cyan','red'];
+
+  for (let p = 0; p < 4; p++) {
+    const px = 50 + p*(peW+gap);
+    const py = 50;
+
+    // PE box
+    drawRect(svg, px, py, peW, peH, peColors[p]+'06', peColors[p]+'40', 10);
+    drawText(svg, px+peW/2, py+18, `PE ${p}`, 12, peColors[p], 'middle', '600');
+
+    // Two vertices
+    for (let v = 0; v < 2; v++) {
+      const vi = p*2 + v;
+      const cx = px + 50 + v*80;
+      const cy = py + 80;
+
+      const col = vertColors[vi];
+      const fill = col ? col+'25' : '#1e2233';
+      const stroke = col || '#3a3f55';
+      drawCircle(svg, cx, cy, 24, fill, stroke);
+      drawText(svg, cx, cy-6, `v${vi}`, 9, '#e0e0e6');
+
+      if (col && step >= 1) {
+        drawText(svg, cx, cy+10, vertColorNames[vi], 8, col, 'middle', '600');
+      } else {
+        drawText(svg, cx, cy+10, '?', 10, '#555');
+      }
+    }
+
+    // Status label
+    if (step === 0) {
+      drawText(svg, px+peW/2, py+130, 'waiting...', 9, '#555');
+    } else if (step === 1) {
+      drawText(svg, px+peW/2, py+130, '✨ picking colors', 9, '#22d3ee');
+    } else if (step === 2) {
+      drawText(svg, px+peW/2, py+130, '🔍 local check', 9, '#34d399');
+      drawText(svg, px+peW/2, py+148, 'no local conflicts', 8, '#555');
+    } else if (step === 3) {
+      drawText(svg, px+peW/2, py+130, '📡 sending wavelets', 9, '#fbbf24');
+    } else if (step === 4) {
+      drawText(svg, px+peW/2, py+130, '✅ all confirmed', 9, '#34d399');
+    }
+
+    // "SIMULTANEOUS" label
+    if (step === 1) {
+      drawText(svg, px+peW/2, py+170, '⚡ PARALLEL', 8, '#22d3ee80');
+    }
+  }
+
+  // Boundary arrows for step 3
+  if (step >= 3) {
+    for (let p = 0; p < 3; p++) {
+      const x1 = 50 + p*(peW+gap) + peW;
+      const x2 = 50 + (p+1)*(peW+gap);
+      const y = 120;
+      drawArrowLine(svg, x1+3, y-8, x2-3, y-8, '#fbbf24', 2);
+      drawArrowLine(svg, x2-3, y+8, x1+3, y+8, '#fbbf24', 2);
+    }
+    drawText(svg, 450, 85, 'boundary color exchange (wavelets)', 9, '#fbbf24');
+  }
+
+  // Round indicator
+  drawRect(svg, 350, 300, 200, 35, '#22d3ee10', '#22d3ee30', 8);
+  drawText(svg, 450, 318, step <= 1 ? 'Round 1 — Speculate' : step === 2 ? 'Round 1 — Local Check' : step === 3 ? 'Round 1 — Exchange' : 'Round 1 — Complete ✓', 11, '#22d3ee', 'middle', '600');
+
+  // Algorithm comparison
+  drawText(svg, 450, 370, 'CPU: color one vertex at a time (sequential)', 9, '#555');
+  drawText(svg, 450, 388, 'WSE: color ALL vertices simultaneously, then resolve conflicts', 9, '#22d3ee');
+
+  document.getElementById('spec-info').textContent = `Step ${specStepIdx+1} / ${specSteps.length}`;
+  document.getElementById('spec-annot').innerHTML = specSteps[specStepIdx].annot;
+  document.getElementById('spec-prev').disabled = specStepIdx === 0;
+  document.getElementById('spec-next').disabled = specStepIdx === specSteps.length - 1;
+}
+function specStep(d) { specStepIdx = Math.max(0, Math.min(specSteps.length-1, specStepIdx+d)); drawSpecScene(); }
+
+// ========== PHASE 3: Wavelet Communication ==========
+let waveStepIdx = 0;
+const waveSteps = [
+  { annot: 'Each PE has a <b>router</b> with 5 ports: RAMP (to local compute), NORTH, SOUTH, EAST, WEST. Communication channels are called <b>fabric colors</b>.' },
+  { annot: '<code>@set_color_config(pe, 0, sync_color, .{.routes = .{.rx = .{RAMP}, .tx = .{EAST}}})</code> — PE0\'s CE sends data up the RAMP, router transmits it EAST to PE1.' },
+  { annot: '<code>@set_color_config(pe, 0, sync_color, .{.routes = .{.rx = .{WEST}, .tx = .{RAMP}}})</code> — PE1 receives from WEST, passes down RAMP to its CE.' },
+  { annot: 'Data is sent as <b>wavelets</b> (32-bit words). Using <code>fabout_dsd</code> and <code>fabin_dsd</code>, a PE sends boundary vertex colors: (vertex_id, chosen_color) pairs. Operations run <b>asynchronously</b> to avoid deadlocks.' },
+];
+
+function drawWaveScene() {
+  const svg = document.getElementById('svg-wavelet');
+  svg.innerHTML = '';
+
+  // Two PE detailed view
+  const pe0x = 120, pe1x = 520, py = 50;
+  const peW = 250, peH = 280;
+
+  for (let p = 0; p < 2; p++) {
+    const px = p === 0 ? pe0x : pe1x;
+    drawRect(svg, px, py, peW, peH, '#1a1d28', p===0?'#6c8cff40':'#34d39940', 10);
+    drawText(svg, px+peW/2, py+18, `PE ${p}`, 13, p===0?'#6c8cff':'#34d399', 'middle', '600');
+
+    // CE
+    drawRect(svg, px+25, py+45, peW-50, 70, p===0?'#6c8cff10':'#34d39910', p===0?'#6c8cff30':'#34d39930', 6);
+    drawText(svg, px+peW/2, py+65, 'Compute Element', 10, '#8b8fa3');
+    drawText(svg, px+peW/2, py+82, p===0 ? 'v0=blue, v1=green' : 'v2=blue, v3=yellow', 9, p===0?'#6c8cff':'#34d399');
+    drawText(svg, px+peW/2, py+98, p===0 ? 'boundary: v1' : 'boundary: v2', 8, '#fbbf24');
+
+    // RAMP
+    const rampActive = waveStepIdx >= 1;
+    if (rampActive) {
+      if (p === 0) {
+        drawArrowLine(svg, px+peW/2, py+115, px+peW/2, py+145, '#a78bfa', 2);
+      } else {
+        drawArrowLine(svg, px+peW/2, py+145, px+peW/2, py+115, '#a78bfa', 2);
+      }
+    } else {
+      drawLine(svg, px+peW/2, py+115, px+peW/2, py+145, '#333', 1, '3,3');
+    }
+    drawText(svg, px+peW/2+35, py+130, 'RAMP', 8, '#a78bfa');
+
+    // Router
+    drawRect(svg, px+25, py+145, peW-50, 60, '#a78bfa10', '#a78bfa30', 6);
+    drawText(svg, px+peW/2, py+168, 'Router', 11, '#a78bfa', 'middle', '600');
+
+    // N/S ports
+    drawLine(svg, px+peW/2, py+145, px+peW/2, py+140, '#33333350', 1);
+    drawLine(svg, px+peW/2, py+205, px+peW/2, py+215, '#33333350', 1);
+    drawText(svg, px+peW/2, py+225, 'S', 8, '#555');
+
+    // Direction labels
+    if (p === 0) {
+      drawText(svg, px-10, py+175, 'W', 8, '#555');
+    }
+    if (p === 1) {
+      drawText(svg, px+peW+15, py+175, 'E', 8, '#555');
+    }
+  }
+
+  // East-West wavelet arrows between routers
+  const routerY = py + 175;
+  if (waveStepIdx >= 1) {
+    // PE0 → PE1 (EAST)
+    drawArrowLine(svg, pe0x+peW+5, routerY-8, pe1x-5, routerY-8, '#fbbf24', 2.5);
+    drawText(svg, (pe0x+peW+pe1x)/2, routerY-22, 'v1=green → EAST', 9, '#fbbf24');
+  }
+  if (waveStepIdx >= 2) {
+    // PE1 → PE0 (WEST)
+    drawArrowLine(svg, pe1x-5, routerY+8, pe0x+peW+5, routerY+8, '#22d3ee', 2.5);
+    drawText(svg, (pe0x+peW+pe1x)/2, routerY+22, 'v2=blue ← WEST', 9, '#22d3ee');
+  }
+
+  // Wavelet detail
+  if (waveStepIdx >= 3) {
+    drawRect(svg, 250, 290, 400, 70, '#fbbf2408', '#fbbf2430', 8);
+    drawText(svg, 450, 310, 'Wavelet payload: 32-bit words', 10, '#fbbf24');
+    // Show wavelet structure
+    drawRect(svg, 290, 320, 80, 25, '#1e2233', '#fbbf24', 4);
+    drawText(svg, 330, 332, 'vertex_id', 8, '#fbbf24');
+    drawRect(svg, 380, 320, 80, 25, '#1e2233', '#22d3ee', 4);
+    drawText(svg, 420, 332, 'color', 8, '#22d3ee');
+    drawText(svg, 530, 332, '× boundary_count', 9, '#8b8fa3', 'start');
+  }
+
+  // Route config labels
+  if (waveStepIdx >= 1) {
+    drawRect(svg, 30, 350, 370, 28, '#1e2233', '#2a2e3a', 4);
+    drawText(svg, 40, 364, 'PE0: .rx = RAMP, .tx = EAST  (CE → fabric → right)', 9, '#6c8cff', 'start');
+  }
+  if (waveStepIdx >= 2) {
+    drawRect(svg, 430, 350, 420, 28, '#1e2233', '#2a2e3a', 4);
+    drawText(svg, 440, 364, 'PE1: .rx = WEST, .tx = RAMP  (fabric → left → CE)', 9, '#34d399', 'start');
+  }
+
+  document.getElementById('wave-info').textContent = `Step ${waveStepIdx+1} / ${waveSteps.length}`;
+  document.getElementById('wave-annot').innerHTML = waveSteps[waveStepIdx].annot;
+  document.getElementById('wave-prev').disabled = waveStepIdx === 0;
+  document.getElementById('wave-next').disabled = waveStepIdx === waveSteps.length - 1;
+}
+function waveStep(d) { waveStepIdx = Math.max(0, Math.min(waveSteps.length-1, waveStepIdx+d)); drawWaveScene(); }
+
+// ========== PHASE 4: Conflict Resolution ==========
+let resStepIdx = 0;
+const resSteps = [
+  { annot: 'After exchange, each PE has its neighbors\' boundary colors. Now check for conflicts on boundary edges.' },
+  { annot: '<b>Example conflict:</b> v4(PE2)=<span style="color:#f87171">red</span> and v7(PE3)=<span style="color:#f87171">red</span>. They share a conflict edge! Both PEs detect this independently.' },
+  { annot: '<b>Priority rule:</b> vertex with <b>lower ID wins</b>. v4 < v7, so v4 keeps red. v7 resets to <b>uncolored</b> and will retry next round.' },
+  { annot: '<b>Round 2:</b> Only uncolored vertices participate. v7 picks a new color from its remaining list. After O(log n) rounds, all vertices are colored. For sparse graphs this converges very fast.' },
+];
+
+function drawResScene() {
+  const svg = document.getElementById('svg-resolve');
+  svg.innerHTML = '';
+  const step = resStepIdx;
+
+  // Two PEs: PE2 and PE3
+  const pe2x = 150, pe3x = 500, py = 50, peW = 220, peH = 180;
+
+  // PE2
+  drawRect(svg, pe2x, py, peW, peH, '#fbbf2408', '#fbbf2440', 10);
+  drawText(svg, pe2x+peW/2, py+18, 'PE 2', 12, '#fbbf24', 'middle', '600');
+
+  // v4 and v5
+  const v4col = '#f87171'; // red
+  const v5col = '#a78bfa'; // purple
+  drawCircle(svg, pe2x+60, py+90, 28, v4col+'25', v4col);
+  drawText(svg, pe2x+60, py+82, 'v4', 9, '#e0e0e6');
+  drawText(svg, pe2x+60, py+100, 'red', 8, v4col, 'middle', '600');
+
+  drawCircle(svg, pe2x+160, py+90, 28, v5col+'25', v5col);
+  drawText(svg, pe2x+160, py+82, 'v5', 9, '#e0e0e6');
+  drawText(svg, pe2x+160, py+100, 'purple', 8, v5col, 'middle', '600');
+
+  // PE3
+  drawRect(svg, pe3x, py, peW, peH, '#f472b608', '#f472b640', 10);
+  drawText(svg, pe3x+peW/2, py+18, 'PE 3', 12, '#f472b6', 'middle', '600');
+
+  const v6col = '#22d3ee'; // cyan
+  const v7col = step <= 2 ? '#f87171' : '#555'; // red → uncolored
+  const v7label = step <= 2 ? 'red' : (step === 3 ? '→ cyan' : '?');
+  const v7stroke = step <= 2 ? '#f87171' : (step === 3 ? '#22d3ee' : '#555');
+  const v7fill = step <= 2 ? '#f8717125' : (step === 3 ? '#22d3ee25' : '#1e2233');
+
+  drawCircle(svg, pe3x+60, py+90, 28, '#22d3ee25', '#22d3ee');
+  drawText(svg, pe3x+60, py+82, 'v6', 9, '#e0e0e6');
+  drawText(svg, pe3x+60, py+100, 'cyan', 8, '#22d3ee', 'middle', '600');
+
+  drawCircle(svg, pe3x+160, py+90, 28, v7fill, v7stroke);
+  drawText(svg, pe3x+160, py+82, 'v7', 9, '#e0e0e6');
+  drawText(svg, pe3x+160, py+100, v7label, 8, v7stroke, 'middle', '600');
+
+  // Boundary edge v4–v7
+  if (step >= 1) {
+    const edgeColor = step >= 2 ? '#f87171' : '#fbbf24';
+    drawLine(svg, pe2x+60+28, py+90, pe3x+160-28, py+90, edgeColor, 2.5, '5,3');
+    const mx = (pe2x+60+pe3x+160)/2;
+    if (step === 1) {
+      drawText(svg, mx, py+72, '⚡ CONFLICT: both red!', 10, '#f87171', 'middle', '600');
+    } else if (step === 2) {
+      drawText(svg, mx, py+72, 'v4 < v7 → v4 wins, v7 yields', 10, '#fbbf24', 'middle', '600');
+    } else if (step === 3) {
+      drawText(svg, mx, py+72, 'v7 retries → picks cyan', 10, '#22d3ee', 'middle', '600');
+    }
+  }
+
+  // Round indicator
+  if (step <= 2) {
+    drawRect(svg, 330, 260, 200, 30, '#f8717115', '#f8717140', 8);
+    drawText(svg, 430, 275, step === 0 ? 'Checking boundaries...' : step === 1 ? '⚡ Conflict detected!' : '🏆 v4 wins (lower ID)', 10, '#f87171', 'middle', '600');
+  } else {
+    drawRect(svg, 330, 260, 200, 30, '#34d39915', '#34d39940', 8);
+    drawText(svg, 430, 275, '✅ Round 2 → resolved!', 10, '#34d399', 'middle', '600');
+  }
+
+  // Algorithm note
+  drawText(svg, 450, 320, 'Convergence: O(log n / log log n) rounds for sparse graphs', 10, '#8b8fa3');
+  drawText(svg, 450, 340, 'Each round: at least one endpoint per conflict keeps its color', 9, '#555');
+
+  document.getElementById('res-info').textContent = `Step ${resStepIdx+1} / ${resSteps.length}`;
+  document.getElementById('res-annot').innerHTML = resSteps[resStepIdx].annot;
+  document.getElementById('res-prev').disabled = resStepIdx === 0;
+  document.getElementById('res-next').disabled = resStepIdx === resSteps.length - 1;
+}
+function resStep(d) { resStepIdx = Math.max(0, Math.min(resSteps.length-1, resStepIdx+d)); drawResScene(); }
+
+// ========== PHASE 5: CSL Architecture ==========
+(function drawArch() {
+  const svg = document.getElementById('svg-arch');
+
+  // Three file boxes
+  const files = [
+    { name: 'layout.csl', badge: 'CSL', color: '#6c8cff', x: 50, y: 30, w: 250, items: [
+      '@set_rectangle(num_pes, 1)',
+      'for each PE:',
+      '  @set_tile_code(pe, 0, ...)',
+      '  @set_color_config(sync_color)',
+      '@export_name("offsets",...)',
+      '@export_name("colors",...)',
+      '@export_name("color_step",...)',
+    ]},
+    { name: 'pe_program.csl', badge: 'CSL', color: '#34d399', x: 330, y: 30, w: 250, items: [
+      'var offsets: [local_n+1]i32;',
+      'var adj: [max_nnz]i32;',
+      'var colors: [local_n]i32;',
+      '',
+      'fn color_step() void {',
+      '  // 1. tentative color',
+      '  // 2. local conflict check',
+      '  // 3. boundary send/recv',
+      '  // 4. resolve conflicts',
+      '}',
+    ]},
+    { name: 'run.py', badge: 'Python', color: '#fbbf24', x: 610, y: 30, w: 250, items: [
+      'runner = SdkRuntime("out")',
+      'runner.load()',
+      'runner.run()',
+      '',
+      '# Copy graph slices',
+      'runner.memcpy_h2d(offsets,...)',
+      'runner.memcpy_h2d(adj,...)',
+      '',
+      '# Iterative coloring',
+      'for round in range(max_r):',
+      '  runner.launch("color_step")',
+      '  # check convergence',
+      'runner.memcpy_d2h(colors,...)',
+      'runner.stop()',
+    ]},
+  ];
+
+  for (const f of files) {
+    const h = 40 + f.items.length * 18;
+    drawRect(svg, f.x, f.y, f.w, h, '#1a1d28', f.color+'50', 8);
+    // Title bar
+    drawRect(svg, f.x, f.y, f.w, 30, f.color+'15', null, 8);
+    drawText(svg, f.x+12, f.y+15, f.name, 11, f.color, 'start', '600');
+
+    // Badge
+    drawRect(svg, f.x+f.w-55, f.y+5, 45, 20, f.color+'20', null, 10);
+    drawText(svg, f.x+f.w-32, f.y+15, f.badge, 8, f.color);
+
+    // Code lines
+    for (let i = 0; i < f.items.length; i++) {
+      drawText(svg, f.x+12, f.y+45+i*18, f.items[i], 9, f.items[i]==='' ? 'transparent' : (f.items[i].startsWith('//') || f.items[i].startsWith('  //') || f.items[i].startsWith('#') ? '#555' : '#8b8fa3'), 'start');
+    }
+  }
+
+  // Arrows between files
+  drawArrowLine(svg, 300, 120, 330, 120, '#8b8fa3', 1.5);
+  drawText(svg, 315, 108, 'compiles\ntogether', 7, '#555');
+
+  drawArrowLine(svg, 610, 180, 580, 180, '#fbbf24', 1.5);
+  drawText(svg, 595, 168, 'uses', 7, '#fbbf24');
+
+  // Build/run flow
+  const flowY = 400;
+  drawRect(svg, 50, flowY, 860, 100, '#22d3ee08', '#22d3ee20', 10);
+  drawText(svg, 480, flowY+15, 'Build & Run Flow', 12, '#22d3ee', 'middle', '600');
+
+  const flowSteps = [
+    { label: 'cslc compile', desc: 'layout.csl → ELF', x: 80 },
+    { label: 'Host partitions', desc: 'CSR → PE slices', x: 260 },
+    { label: 'memcpy_h2d', desc: 'data → PEs', x: 430 },
+    { label: 'launch(rounds)', desc: 'speculative color', x: 600 },
+    { label: 'memcpy_d2h', desc: 'colors ← PEs', x: 760 },
+  ];
+
+  for (let i = 0; i < flowSteps.length; i++) {
+    const s = flowSteps[i];
+    drawRect(svg, s.x, flowY+35, 140, 45, '#1e2233', '#2a2e3a', 6);
+    drawText(svg, s.x+70, flowY+50, s.label, 10, '#22d3ee', 'middle', '600');
+    drawText(svg, s.x+70, flowY+66, s.desc, 8, '#8b8fa3');
+    if (i < flowSteps.length - 1) {
+      drawArrowLine(svg, s.x+144, flowY+57, flowSteps[i+1].x-4, flowY+57, '#555');
+    }
+  }
+})();
+
+// ========== Init ==========
+drawPartScene();
+drawSpecScene();
+drawWaveScene();
+drawResScene();
+</script>
+</body>
+</html>
