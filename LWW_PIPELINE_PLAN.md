@@ -773,6 +773,51 @@ exposed the regression. Has no kernel impact — host-only change.
 - **On-device recursion** — keep host-driven (pattern from
   `spikes/experiments/pipeline_static_root_2d/`) until transport is proven.
 
+## CP3.epoch — Cross-Launch Fabric Residual Fix (2026-04-26)
+
+**Why:** Real WSE-3 runs share one wsjob across all BSP levels in
+a test. The fabric IQs retain wavelets from level N's last rounds
+when level N+1's `runner.load()` flashes new ELFs. Stale wavelets
+fire IQ tasks on the new kernel; parity-only classification
+(`current_round & 0x1`) cannot distinguish them from the new
+level → counters corrupt → barriers deadlock.
+
+**Phase A — `--launcher-per-level` workaround (DONE 2026-04-25).**
+`picasso/run_csl_tests.py` flag that opens a fresh `SdkLauncher`
+per BSP level (and thus a fresh wsjob, fresh wafer state). Adds
+~90s/level overhead but is a known-correct fallback. Plumbed
+through `neocortex/run_cs3_lww.sh` (`--launcher-per-level` flag)
+and validated on test1 4×4 (Level 0 + Level 1 PASS).
+
+**Phase B — kernel-side epoch tagging (ACTIVE 2026-04-26).**
+Wavelet bit[7] = level epoch (0/1, toggled per BSP level by host
+via `runtime_config[2]`). Receivers drop on epoch mismatch BEFORE
+any forwarder side-effect. See `AGENTS.md` for the full bit
+layout and code-touchpoint list.
+
+Validated on real WSE-3 in single shared wsjob:
+- test1 4×4: Level 0 + Level 1 PASS (was Level-1 hang).
+- test12 4×4: 5 levels PASS (was Level-0 hang even with Phase A).
+- test1 1×8 (row chain only) and test1 8×1 (col chain only):
+  PASS at chain length 8.
+- test1 8×8 dual-axis after CP3.blocked-rx
+  (`runs/hardware/20260426-cp3-blockrx-8x8-test1-hw/`): 2 levels
+  PASS, 86,263 cycles, no `--launcher-per-level`.
+
+**8×8 dual-axis init race fix.** The race was between
+`runner.run()` and `start_coloring`'s first instruction: fresh
+upstream wavelets (epoch=N) could arrive at downstream PEs whose
+`current_level_epoch` was still the sentinel default (2), so the
+epoch gate falsely discarded them. The shipped follow-up uses the
+existing CSL `@block/@unblock` task primitive: all 2d_seg2 fabric
+receive tasks are bound blocked at comptime, then `start_coloring`
+latches `runtime_config[2]`, resets per-level state, and unblocks
+the receive tasks immediately before activating speculation.
+
+The 8×8 test1 validation target now passes on real WSE-3 in one
+shared wsjob. Dense 8×8+ scaling still needs the post-fix matrix
+before the per-level launcher workaround can be retired everywhere.
+
 ## Tracking
 
 - Per-step results in the spike's `RESULTS.md`.

@@ -1,0 +1,129 @@
+// WSE-2 color-swap layout for multi-source inject+flow broadcast.
+// Paired with pe_program_colorswap.csl.
+//
+// Pattern: inject+flow with color_swap_x on BOTH paired colors.
+//   Wavelets alternate between paired colors at each PE hop.
+//   Colors 0,1 (east pair): inject on 0, flow alternates 0↔1
+//   Colors 2,3 (west pair): inject on 2, flow alternates 2↔3
+//
+// Inject colors (c0, c2): RAMP in tx at interior PEs for even-hop delivery.
+//   Self-delivery on injection filtered by handle_wavelet (spe == pe_id).
+//   Edge inject PEs: no RAMP in tx (sender doesn't need own wavelet).
+// Flow colors (c1, c3): RAMP in tx at all PEs for odd-hop delivery.
+//
+// Known hazard: inject color has rx={RAMP, direction} on interior PEs,
+// allowing dual-input. Sim serializes; real HW behavior TBD.
+//
+// Requires WSE-2 (color_swap_x not supported on WSE-3).
+
+param num_pes: i16;
+param max_local_verts: i16;
+param max_nbr_entries: i16;
+
+// Inject+flow color pairs (lowest-bit flip for color swap)
+const east_color_0: color = @get_color(0);  // inject east + even-hop flow
+const east_color_1: color = @get_color(1);  // odd-hop flow (paired with 0)
+const west_color_0: color = @get_color(2);  // inject west + even-hop flow
+const west_color_1: color = @get_color(3);  // odd-hop flow (paired with 2)
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width = num_pes,
+  .height = @as(i16, 1),
+});
+
+layout {
+  @set_rectangle(num_pes, 1);
+
+  for (@range(i16, num_pes)) |col| {
+    const is_west_edge = (col == 0);
+    const is_east_edge = (col == num_pes - 1);
+
+    @set_tile_code(col, 0, "pe_program_colorswap.csl", .{
+      .memcpy_params   = memcpy.get_params(col),
+      .pe_id           = col,
+      .num_pes         = num_pes,
+      .max_local_verts = max_local_verts,
+      .max_nbr_entries = max_nbr_entries,
+      .east_color_0    = east_color_0,
+      .east_color_1    = east_color_1,
+      .west_color_0    = west_color_0,
+      .west_color_1    = west_color_1,
+    });
+
+    // ── Eastward colors (pair 0↔1, both have color_swap_x) ──
+    // Both colors need RAMP in tx for local delivery at every hop.
+    // Color_swap_x alternates c0/c1 at each PE boundary. Without RAMP
+    // in tx on c0, even-hop PEs never deliver.
+    //
+    // Self-delivery: interior PEs inject on c0, RAMP in tx loops back
+    // to CE → data task fires → spe == pe_id → filtered immediately.
+    // Task chain (1 send per bcast_task) ensures queue drains between sends.
+    //
+    // Edge inject PEs (west edge for eastward): tx={EAST} only, no
+    // self-delivery needed (sender knows own value, no WEST input).
+    if (is_east_edge) {
+      // East edge: terminate chain — deliver + stop
+      @set_color_config(col, 0, east_color_0, .{
+        .routes = .{ .rx = .{ RAMP, WEST }, .tx = .{ RAMP }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, east_color_1, .{
+        .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP }, .color_swap_x = true },
+      });
+    } else if (is_west_edge) {
+      // West edge: inject only (no WEST to receive from)
+      // No RAMP in tx → no self-delivery (sender doesn't need own wavelet)
+      @set_color_config(col, 0, east_color_0, .{
+        .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, east_color_1, .{
+        .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP, EAST }, .color_swap_x = true },
+      });
+    } else {
+      // DIAG v2: no multi-rx AND no self-delivery (tx=EAST only on c0).
+      // Even-hop PEs still miss origin wavelets — may mis-color but
+      // should not deadlock.
+      @set_color_config(col, 0, east_color_0, .{
+        .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, east_color_1, .{
+        .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP, EAST }, .color_swap_x = true },
+      });
+    }
+
+    // ── Westward colors (pair 2↔3, both have color_swap_x) ──
+    // Mirror of eastward. RAMP in tx on both colors at interior PEs.
+    if (is_west_edge) {
+      // West edge: terminate chain — deliver + stop
+      @set_color_config(col, 0, west_color_0, .{
+        .routes = .{ .rx = .{ RAMP, EAST }, .tx = .{ RAMP }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, west_color_1, .{
+        .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP }, .color_swap_x = true },
+      });
+    } else if (is_east_edge) {
+      // East edge: inject only — no self-delivery needed
+      @set_color_config(col, 0, west_color_0, .{
+        .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, west_color_1, .{
+        .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP, WEST }, .color_swap_x = true },
+      });
+    } else {
+      // DIAG v2: mirror. No self-delivery on inject color either.
+      @set_color_config(col, 0, west_color_0, .{
+        .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, west_color_1, .{
+        .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP, WEST }, .color_swap_x = true },
+      });
+    }
+  }
+
+  @export_name("graph_data",    [*]i32, true);
+  @export_name("nbr_data",      [*]i32, true);
+  @export_name("nbr_offsets",   [*]i32, true);
+  @export_name("result_colors", [*]i32, true);
+  @export_name("coloring_timer", [*]f32, true);
+  @export_name("status",        [*]i32, true);
+  @export_name("start_coloring", fn()void);
+}

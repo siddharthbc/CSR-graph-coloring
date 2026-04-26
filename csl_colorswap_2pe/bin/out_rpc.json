@@ -1,0 +1,51 @@
+{
+  "rpc_symbols": [
+    {
+      "id": 4,
+      "immutable": 0,
+      "kind": "Var",
+      "name": "result_colors",
+      "sym_name": "result_colors_ptr",
+      "type": "[*]i32"
+    },
+    {
+      "id": 5,
+      "immutable": 0,
+      "kind": "Var",
+      "name": "status",
+      "sym_name": "status_ptr",
+      "type": "[*]i32"
+    },
+    {
+      "id": 6,
+      "kind": "Func",
+      "name": "start_coloring",
+      "sym_name": "start_coloring",
+      "type": "void"
+    },
+    {
+      "id": 1,
+      "immutable": 0,
+      "kind": "Var",
+      "name": "graph_data",
+      "sym_name": "graph_data_ptr",
+      "type": "[*]i32"
+    },
+    {
+      "id": 2,
+      "immutable": 0,
+      "kind": "Var",
+      "name": "nbr_data",
+      "sym_name": "nbr_data_ptr",
+      "type": "[*]i32"
+    },
+    {
+      "id": 3,
+      "immutable": 0,
+      "kind": "Var",
+      "name": "nbr_offsets",
+      "sym_name": "nbr_offsets_ptr",
+      "type": "[*]i32"
+    }
+  ]
+}

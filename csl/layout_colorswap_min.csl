@@ -1,0 +1,81 @@
+// Minimal layout — same color-swap routing as layout_colorswap.csl
+// but pointing at pe_program_colorswap_min.csl. Multi-source inject+forward.
+
+param num_pes: i16;
+
+const east_color_0: color = @get_color(0);
+const east_color_1: color = @get_color(1);
+const west_color_0: color = @get_color(2);
+const west_color_1: color = @get_color(3);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width = num_pes, .height = @as(i16, 1),
+});
+
+layout {
+  @set_rectangle(num_pes, 1);
+
+  for (@range(i16, num_pes)) |col| {
+    const is_west_edge = (col == 0);
+    const is_east_edge = (col == num_pes - 1);
+
+    @set_tile_code(col, 0, "pe_program_colorswap_min.csl", .{
+      .memcpy_params = memcpy.get_params(col),
+      .pe_id = col,
+      .num_pes = num_pes,
+      .east_color_0 = east_color_0,
+      .east_color_1 = east_color_1,
+      .west_color_0 = west_color_0,
+      .west_color_1 = west_color_1,
+    });
+
+    if (is_east_edge) {
+      @set_color_config(col, 0, east_color_0, .{
+        .routes = .{ .rx = .{ RAMP, WEST }, .tx = .{ RAMP }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, east_color_1, .{
+        .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP }, .color_swap_x = true },
+      });
+    } else if (is_west_edge) {
+      @set_color_config(col, 0, east_color_0, .{
+        .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, east_color_1, .{
+        .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP, EAST }, .color_swap_x = true },
+      });
+    } else {
+      @set_color_config(col, 0, east_color_0, .{
+        .routes = .{ .rx = .{ RAMP, WEST }, .tx = .{ RAMP, EAST }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, east_color_1, .{
+        .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP, EAST }, .color_swap_x = true },
+      });
+    }
+
+    if (is_west_edge) {
+      @set_color_config(col, 0, west_color_0, .{
+        .routes = .{ .rx = .{ RAMP, EAST }, .tx = .{ RAMP }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, west_color_1, .{
+        .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP }, .color_swap_x = true },
+      });
+    } else if (is_east_edge) {
+      @set_color_config(col, 0, west_color_0, .{
+        .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, west_color_1, .{
+        .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP, WEST }, .color_swap_x = true },
+      });
+    } else {
+      @set_color_config(col, 0, west_color_0, .{
+        .routes = .{ .rx = .{ RAMP, EAST }, .tx = .{ RAMP, WEST }, .color_swap_x = true },
+      });
+      @set_color_config(col, 0, west_color_1, .{
+        .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP, WEST }, .color_swap_x = true },
+      });
+    }
+  }
+
+  @export_name("status", [*]i32, true);
+  @export_name("start", fn()void);
+}

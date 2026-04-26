@@ -1,0 +1,354 @@
+// 1D HW-routed LWW broadcast coloring — PE kernel.
+// Paired with layout_hw_broadcast.csl.
+//
+// Algorithm: priority-driven convergent coloring with LWW broadcast.
+//   Priority order: (pe_id, gid) — lower = higher priority.
+//   Each vertex picks smallest available color, broadcasts to all PEs.
+//   On conflict with higher-priority neighbor, repick + re-broadcast.
+//   Commit when all higher-priority neighbors have committed.
+//   Terminate when all local vertices committed.
+//
+// Wavelet format (32-bit):
+//   [31:24] sender_pe (u8)   [23:12] gid (u12)
+//   [11:5]  color (u7)       [4] commit_bit   [3:0] reserved
+
+param memcpy_params: comptime_struct;
+param pe_id: i16;
+param num_pes: i16;
+param max_local_verts: i16;
+param max_nbr_entries: i16;
+param send_east_color: color;
+param send_west_color: color;
+param recv_east_color: color;
+param recv_west_color: color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tsc = @import_module("<time>");
+
+// ========== Hardware timestamp counter ==========
+var tsc_start_buf = @zeros([tsc.tsc_size_words]u16);
+var tsc_end_buf = @zeros([tsc.tsc_size_words]u16);
+var coloring_timer = @zeros([3]f32);
+var coloring_timer_ptr: [*]f32 = &coloring_timer;
+
+inline fn start_timing() void {
+  tsc.enable_tsc();
+  tsc.get_timestamp(&tsc_start_buf);
+}
+
+inline fn stop_timing() void {
+  tsc.get_timestamp(&tsc_end_buf);
+  tsc.disable_tsc();
+  var lo_: u16 = 0;
+  var hi_: u16 = 0;
+  lo_ = tsc_start_buf[0];
+  hi_ = tsc_start_buf[1];
+  coloring_timer[0] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+  lo_ = tsc_start_buf[2];
+  hi_ = tsc_end_buf[0];
+  coloring_timer[1] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+  lo_ = tsc_end_buf[1];
+  hi_ = tsc_end_buf[2];
+  coloring_timer[2] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+}
+
+// ========== Queues (each queue is one physical resource — no sharing) ==========
+const send_east_oq: output_queue = @get_output_queue(2);
+const recv_east_iq: input_queue  = @get_input_queue(3);
+const send_west_oq: output_queue = @get_output_queue(4);
+const recv_west_iq: input_queue  = @get_input_queue(5);
+
+// ========== Task IDs ==========
+const done_task_id: local_task_id = @get_local_task_id(15);
+
+const recv_east_task_id: data_task_id =
+  if (@is_arch("wse3")) @get_data_task_id(recv_east_iq)
+  else                   @get_data_task_id(recv_east_color);
+const recv_west_task_id: data_task_id =
+  if (@is_arch("wse3")) @get_data_task_id(recv_west_iq)
+  else                   @get_data_task_id(recv_west_color);
+
+// ========== Host-visible arrays ==========
+// graph_data[0] = num_local_verts
+// graph_data[1..N] = global vertex IDs for each local vertex
+var graph_data = @zeros([max_local_verts + 1]i32);
+var graph_data_ptr: [*]i32 = &graph_data;
+
+// nbr_data[i] = packed neighbor entry: (remote_pe << 16) | remote_gid
+var nbr_data = @zeros([max_nbr_entries]i32);
+var nbr_data_ptr: [*]i32 = &nbr_data;
+
+// nbr_offsets[v]..nbr_offsets[v+1] = range into nbr_data for vertex v
+var nbr_offsets = @zeros([max_local_verts + 1]i32);
+var nbr_offsets_ptr: [*]i32 = &nbr_offsets;
+
+// result_colors[v] = final assigned color for vertex v
+var result_colors = @zeros([max_local_verts]i32);
+var result_colors_ptr: [*]i32 = &result_colors;
+
+// status[0] = committed count, status[1] = wavelets processed
+var status = @zeros([2]i32);
+var status_ptr: [*]i32 = &status;
+
+// ========== Internal state ==========
+var my_color: [max_local_verts]i32;
+var my_committed: [max_local_verts]i32;       // 0=tentative, 1=committed
+var higher_pri_open: [max_local_verts]i32;    // # higher-pri nbrs not committed
+
+var shadow_color: [max_nbr_entries]i32;       // last known remote color
+var shadow_committed: [max_nbr_entries]i32;
+var shadow_seen: [max_nbr_entries]i32;
+
+const MAX_COLORS: i16 = 128;
+var forbidden: [MAX_COLORS]i32;
+
+var committed_count: i32 = 0;
+var send_tmp = @zeros([1]u32);
+
+// ========== Wavelet pack/unpack ==========
+fn pack_wavelet(sender: i32, gid: i32, col: i32, commit: i32) u32 {
+  const pe_part = @as(u32, @as(u16, @as(i16, sender))) << 24;
+  const gid_part = (@as(u32, @as(u16, @as(i16, gid))) & 0xFFF) << 12;
+  const col_part = (@as(u32, @as(u16, @as(i16, col))) & 0x7F) << 5;
+  const cmt_part = (@as(u32, @as(u16, @as(i16, commit))) & 1) << 4;
+  return pe_part | gid_part | col_part | cmt_part;
+}
+
+fn unpack_pe(w: u32) i32  { return @as(i32, (w >> 24) & 0xFF); }
+fn unpack_gid(w: u32) i32 { return @as(i32, (w >> 12) & 0xFFF); }
+fn unpack_col(w: u32) i32 { return @as(i32, (w >> 5) & 0x7F); }
+fn unpack_cmt(w: u32) i32 { return @as(i32, (w >> 4) & 1); }
+
+// ========== Fabric send ==========
+fn send_east(wval: u32) void {
+  send_tmp[0] = wval;
+  var out_dsd = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = send_east_color,
+    .output_queue = send_east_oq,
+  });
+  var src_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{1} -> send_tmp[i],
+  });
+  @mov32(out_dsd, src_dsd);
+}
+
+fn send_west(wval: u32) void {
+  send_tmp[0] = wval;
+  var out_dsd = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = send_west_color,
+    .output_queue = send_west_oq,
+  });
+  var src_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{1} -> send_tmp[i],
+  });
+  @mov32(out_dsd, src_dsd);
+}
+
+fn broadcast_wvl(wval: u32) void {
+  // Only send in directions where a neighbor PE exists.
+  // Wavelets sent off the program rectangle stall (no drain route).
+  if (pe_id < num_pes - 1) {
+    send_east(wval);
+  }
+  if (pe_id > 0) {
+    send_west(wval);
+  }
+}
+
+// ========== Algorithm helpers ==========
+fn is_higher_pri(rpe: i32, rgid: i32, lgid: i32) bool {
+  if (rpe < @as(i32, pe_id)) return true;
+  if (rpe > @as(i32, pe_id)) return false;
+  return rgid < lgid;
+}
+
+fn pick_smallest(v: i16) i32 {
+  var f: i16 = 0;
+  while (f < MAX_COLORS) : (f += 1) {
+    forbidden[@as(u16, f)] = 0;
+  }
+  // Mark remote neighbor colors as forbidden
+  const vi = @as(u16, v);
+  var i: i16 = @as(i16, nbr_offsets[vi]);
+  const end_i: i16 = @as(i16, nbr_offsets[vi + 1]);
+  while (i < end_i) : (i += 1) {
+    if (shadow_seen[@as(u16, i)] != 0) {
+      const c = shadow_color[@as(u16, i)];
+      if (c >= 0 and c < @as(i32, MAX_COLORS)) {
+        forbidden[@as(u16, @as(i16, c))] = 1;
+      }
+    }
+  }
+  // Find smallest unforbidden color
+  var c: i16 = 0;
+  while (c < MAX_COLORS) : (c += 1) {
+    if (forbidden[@as(u16, c)] == 0) return @as(i32, c);
+  }
+  return 0;
+}
+
+fn do_bcast(v: i16, col: i32, commit: i32) void {
+  const gid = graph_data[@as(u16, v) + 1];
+  const wval = pack_wavelet(@as(i32, pe_id), gid, col, commit);
+  broadcast_wvl(wval);
+}
+
+fn try_commit(v: i16) void {
+  const vi = @as(u16, v);
+  my_committed[vi] = 1;
+  committed_count += 1;
+  result_colors[vi] = my_color[vi];
+  do_bcast(v, my_color[vi], 1);
+  status[0] = committed_count;
+  if (committed_count >= graph_data[0]) {
+    @activate(done_task_id);
+  }
+}
+
+fn repick_if_conflict(v: i16, rcolor: i32) void {
+  const vi = @as(u16, v);
+  if (my_committed[vi] != 0) return;
+  if (rcolor != my_color[vi]) return;
+  const new_c = pick_smallest(v);
+  if (new_c != my_color[vi]) {
+    my_color[vi] = new_c;
+    do_bcast(v, new_c, 0);
+  }
+}
+
+fn handle_wavelet(w: u32) void {
+  const spe = unpack_pe(w);
+  if (spe == @as(i32, pe_id)) return;
+
+  const sgid = unpack_gid(w);
+  const scol = unpack_col(w);
+  const scmt = unpack_cmt(w);
+
+  status[1] += 1;
+  const nlv = graph_data[0];
+  var v: i16 = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= nlv) break;
+    const vi = @as(u16, v);
+    var i: i16 = @as(i16, nbr_offsets[vi]);
+    const end_i: i16 = @as(i16, nbr_offsets[vi + 1]);
+    while (i < end_i) : (i += 1) {
+      const idx = @as(u16, i);
+      const entry = nbr_data[idx];
+      const nb_pe = (entry >> 16) & 0xFF;
+      const nb_gid = entry & 0xFFF;
+      if (nb_pe == spe and nb_gid == sgid) {
+        const was_cmt = shadow_seen[idx] != 0 and shadow_committed[idx] != 0;
+        shadow_color[idx] = scol;
+        shadow_committed[idx] = scmt;
+        shadow_seen[idx] = 1;
+
+        const lgid = graph_data[vi + 1];
+        if (is_higher_pri(spe, sgid, lgid)) {
+          repick_if_conflict(v, scol);
+          if (scmt != 0 and !was_cmt) {
+            higher_pri_open[vi] -= 1;
+            if (higher_pri_open[vi] <= 0 and my_committed[vi] == 0 and my_color[vi] >= 0) {
+              try_commit(v);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ========== Tasks ==========
+task recv_east(wval: u32) void {
+  handle_wavelet(wval);
+}
+
+task recv_west(wval: u32) void {
+  handle_wavelet(wval);
+}
+
+task done_task() void {
+  // Do NOT block recv tasks — must keep draining incoming wavelets
+  // to prevent backpressure deadlock on upstream PEs.
+  stop_timing();
+  sys_mod.unblock_cmd_stream();
+}
+
+// ========== Entry point (called by host) ==========
+fn start_coloring() void {
+  start_timing();
+  const nlv = graph_data[0];
+
+  // Init shadow state
+  var j: i16 = 0;
+  while (j < max_nbr_entries) : (j += 1) {
+    shadow_color[@as(u16, j)] = -1;
+    shadow_committed[@as(u16, j)] = 0;
+    shadow_seen[@as(u16, j)] = 0;
+  }
+  committed_count = 0;
+  status[0] = 0;
+  status[1] = 0;
+
+  // Init vertices + initial broadcast
+  var v: i16 = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= nlv) break;
+    const vi = @as(u16, v);
+    my_color[vi] = -1;
+    my_committed[vi] = 0;
+
+    // Count higher-priority remote neighbors
+    var cnt: i32 = 0;
+    var i: i16 = @as(i16, nbr_offsets[vi]);
+    const end_i: i16 = @as(i16, nbr_offsets[vi + 1]);
+    while (i < end_i) : (i += 1) {
+      const entry = nbr_data[@as(u16, i)];
+      const nb_pe = (entry >> 16) & 0xFF;
+      const nb_gid = entry & 0xFFF;
+      const lgid = graph_data[vi + 1];
+      if (is_higher_pri(nb_pe, nb_gid, lgid)) {
+        cnt += 1;
+      }
+    }
+    higher_pri_open[vi] = cnt;
+
+    if (cnt == 0) {
+      my_color[vi] = pick_smallest(v);
+      try_commit(v);
+    } else {
+      my_color[vi] = pick_smallest(v);
+      do_bcast(v, my_color[vi], 0);
+    }
+  }
+
+  // Unblock recv tasks now that state is initialized
+  @unblock(recv_east_task_id);
+  @unblock(recv_west_task_id);
+}
+
+// ========== Comptime ==========
+comptime {
+  @bind_local_task(done_task, done_task_id);
+  @bind_data_task(recv_east, recv_east_task_id);
+  @bind_data_task(recv_west, recv_west_task_id);
+  @block(recv_east_task_id);
+  @block(recv_west_task_id);
+
+  if (@is_arch("wse3")) {
+    @initialize_queue(send_east_oq, .{ .color = send_east_color });
+    @initialize_queue(send_west_oq, .{ .color = send_west_color });
+    @initialize_queue(recv_east_iq, .{ .color = recv_east_color });
+    @initialize_queue(recv_west_iq, .{ .color = recv_west_color });
+  }
+
+  @export_symbol(graph_data_ptr, "graph_data");
+  @export_symbol(nbr_data_ptr, "nbr_data");
+  @export_symbol(nbr_offsets_ptr, "nbr_offsets");
+  @export_symbol(result_colors_ptr, "result_colors");
+  @export_symbol(coloring_timer_ptr, "coloring_timer");
+  @export_symbol(status_ptr, "status");
+  @export_symbol(start_coloring);
+}

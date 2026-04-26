@@ -1,16 +1,11 @@
 // Picasso Graph Coloring — Pipelined LWW kernel, 2D segmented DUAL-AXIS
-// SEG2 fork (Step 4 CP2d).
+// (Step 4 CP2c).
 //
-// Forked 2026-04-23 from pe_program_lww_2d_dual.csl. Identical kernel
-// logic at fork time; the differentiator vs the parent is that this
-// kernel is dispatched by layout_lww_2d_seg2.csl with S=2 (not S=4),
-// which changes the per-PE queue map and unlocks 4x4 / 8x8 / 16x16
-// dual-axis grids that the S=4 parent could not fit in 6 IQs/PE.
-//
-// Logic deltas vs the parent will land here as CP2d progresses
-// (sequenced east/south sends, queue rebinding for bridge PEs, etc.).
-// At scaffold time this file is byte-identical to the parent except
-// for this header.
+// Forked 2026-04-22 from pe_program_lww_2d_seg.csl. This kernel is
+// dispatched by layout_lww_2d_seg.csl when num_rows>1 AND num_cols>1
+// (the `is_dual_axis` case). The single-axis cases (num_rows==1 or
+// num_cols==1) continue to use pe_program_lww_2d_seg.csl unchanged
+// — that path is validated PASS at 4×1, 8×1, 16×1, 1×4, 1×8, 1×16.
 //
 // CP2c.i Turn 2 status: SCAFFOLD ONLY. This kernel currently has the
 // SAME data plane and barrier as the single-axis kernel — i.e. only
@@ -58,8 +53,7 @@ param expected_data_done_param: i16;
 // Dedicated barrier colors.
 param sync_reduce_recv_color: color;
 param sync_reduce_send_color: color;
-// CP2d.d.1: sync_bcast_color removed — row_bcast rides in-band on
-// my_east_color via tx_east_oq (bit[29] opcode).
+param sync_bcast_color:       color;
 
 // CP2c.i Stage B dual-axis params (set by layout when is_dual_axis;
 // fixed defaults preserve single-axis behaviour for the legacy file
@@ -77,20 +71,17 @@ param south_slot_count:  i16;
 param expected_south_data_done_param: i16;
 param sync_col_reduce_recv_color: color;
 param sync_col_reduce_send_color: color;
-// CP2d.c (option 1a): col_bcast moved in-band on south data stream
-// (bit[29] opcode on my_south_color). Dedicated sync_col_bcast color
-// is gone. sync_col_reduce_* stays dedicated (alternating-direction
-// reduce chain doesn't match the N->S data flow).
+param sync_col_bcast_color:       color;
 
 // CP2c.i Turn 3 anti-diagonal relay params.
 param is_e2s_relay:  bool;   // PE(0, c>0): re-emit east arrivals on south
 param is_back_relay: bool;   // PE(R>0, last col): forward south arrivals west
 param is_back_sink:  bool;   // PE(R>0, 0): receives back-channel
-param is_back_recv:  bool;   // CP2d.c: PE(R>0, 0<col<num_cols-1) interior back-channel receiver (IQ on Q6)
 param c_W_back_color: color; // per-row back-channel color (re/ro by parity)
 param south_slot1_q:  u16;   // CP2c.ii: per-PE Q index for south_rx_iq_1
 param south_slot2_q:  u16;   // CP2c.ii: per-PE Q index for south_rx_iq_2
 param col_reduce_recv_q: u16; // CP2c.ii: per-PE Q index for col_reduce_recv_iq
+param col_bcast_recv_q:  u16; // CP2c.ii: per-PE Q index for col_bcast_recv_iq
 
 // ========== Queues ==========
 // Same physical layout as the east-only kernel:
@@ -99,23 +90,9 @@ param col_reduce_recv_q: u16; // CP2c.ii: per-PE Q index for col_reduce_recv_iq
 
 const tx_east_oq:     output_queue = @get_output_queue(2);
 const tx_reduce_oq:   output_queue = @get_output_queue(3);
-// CP2d.e (2026-04-26): restore a dedicated back-channel path. CP2d.d.2
-// folded back-channel data onto tx_reduce_oq (Q3), which works at low
-// load but causes head-of-line blocking under dense traffic
-// (test14 8x8 dual-axis hangs). Restoring Q4 OQ + Q3 IQ for the
-// per-row c_W_back chain. Q4 OQ and Q3 IQ have been free since
-// CP2d.d.1 removed bcast_send_oq / bcast_recv_iq (row_bcast rides
-// in-band on my_east_color). reduce_recv_task simplifies to row
-// reduce only; back-channel data goes through back_recv_task on Q3.
-const tx_back_oq:     output_queue = @get_output_queue(4);
+const bcast_send_oq:  output_queue = @get_output_queue(4);
 const reduce_recv_iq: input_queue  = @get_input_queue(2);
-// CP2d.e: dedicated back-channel on Q3 IQ. Q3 is conflict-prone
-// because south_slot1_q is also Q3 at col=0 and at interior bridge
-// PEs under S=2 dual-axis. The fix is S_col=1 (single-segment col
-// chain): south_slot_count drops to 1 globally so south_slot1 never
-// binds, freeing Q3 for back-channel. See validator output before
-// any layout / S param change.
-const back_recv_iq:   input_queue  = @get_input_queue(3);
+const bcast_recv_iq:  input_queue  = @get_input_queue(3);
 const rx_iq_0:        input_queue  = @get_input_queue(4);
 const rx_iq_1:        input_queue  = @get_input_queue(5);
 const rx_iq_2:        input_queue  = @get_input_queue(6);
@@ -128,12 +105,9 @@ const rx_iq_3:        input_queue  = @get_input_queue(7);
 // re-budgeted, likely via in-band barriers).
 const tx_south_oq:        output_queue = @get_output_queue(5);
 const tx_col_reduce_oq:   output_queue = @get_output_queue(6);
-// CP2d.c: col_bcast now rides in-band on my_south_color via tx_south_oq;
-// col_bcast_send_oq is gone.
+const col_bcast_send_oq:  output_queue = @get_output_queue(7);
 const col_reduce_recv_iq: input_queue  = @get_input_queue(col_reduce_recv_q);
-// CP2d.d.2: back_recv_iq (Q6) removed. Back-channel reception folded
-// into reduce_recv_iq (Q2) via opcode dispatch on the same alternating
-// east->west chain. Frees Q6 IQ for col_reduce at interior-bridge PEs.
+const col_bcast_recv_iq:  input_queue  = @get_input_queue(col_bcast_recv_q);
 const south_rx_iq_0:      input_queue  = @get_input_queue(7);
 const south_rx_iq_1:      input_queue  = @get_input_queue(south_slot1_q);
 const south_rx_iq_2:      input_queue  = @get_input_queue(south_slot2_q);
@@ -151,16 +125,14 @@ const rx_task_1_id:     data_task_id = @get_data_task_id(rx_iq_1);
 const rx_task_2_id:     data_task_id = @get_data_task_id(rx_iq_2);
 const rx_task_3_id:     data_task_id = @get_data_task_id(rx_iq_3);
 const reduce_recv_id:   data_task_id = @get_data_task_id(reduce_recv_iq);
-// CP2d.e: dedicated back-channel data task on Q3 IQ (separate from
-// the Q3 OQ used by tx_reduce; CSL OQs and IQs are independent slots).
-const back_recv_id:     data_task_id = @get_data_task_id(back_recv_iq);
-// CP2d.d.1: bcast_recv_id removed with bcast_recv_iq.
+const bcast_recv_id:    data_task_id = @get_data_task_id(bcast_recv_iq);
 
 // CP2c.i Stage B: col-axis data + barrier task IDs.
 const south_rx_task_0_id: data_task_id = @get_data_task_id(south_rx_iq_0);
 const south_rx_task_1_id: data_task_id = @get_data_task_id(south_rx_iq_1);
 const south_rx_task_2_id: data_task_id = @get_data_task_id(south_rx_iq_2);
 const col_reduce_recv_id: data_task_id = @get_data_task_id(col_reduce_recv_iq);
+const col_bcast_recv_id:  data_task_id = @get_data_task_id(col_bcast_recv_iq);
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tsc     = @import_module("<time>");
@@ -193,21 +165,6 @@ inline fn stop_timing() void {
 var perf_counters = @zeros([8]i32);
 var perf_counters_ptr: [*]i32 = &perf_counters;
 
-// CP2d.c diagnostics. Indices:
-//   0: row data wavelets received (non-done) total across all rounds
-//   1: south data wavelets received (non-done) total
-//   2: row data_done sentinels received (current-parity) total
-//   3: south data_done sentinels received (current-parity) total
-//   4: process_incoming_wavelet calls where sender_gid did NOT match
-//      any boundary entry (signals routing bug / unexpected wavelet).
-//   5: residual data_done_recv_next at LAST round-reset (wavelets that
-//      arrived for the next round before the current round's barrier
-//      closed). Snapshotted in reset_round_state before zeroing.
-//   6: residual south_data_done_recv_next at last round-reset.
-//   7: rounds completed (= current_round at exit).
-var diag_counters = @zeros([8]i32);
-var diag_counters_ptr: [*]i32 = &diag_counters;
-
 // ===== Host-loaded graph =====
 var csr_offsets:       [max_local_verts + 1]i32;
 var csr_adj:           [max_local_edges]i32;
@@ -222,31 +179,8 @@ var num_boundary:          [1]i32;
 
 var tentative: [max_local_verts]i32;
 var forbidden: [max_palette_size]i32;
-// CP2d.e dedupe (2026-04-26): one wavelet per (local_vertex, direction)
-// per round, not one per boundary edge. The wavelet payload is
-// (sender_gid, sender_color); duplicates are pure overhead because the
-// receiver scans every boundary entry with that gid anyway. Reduces
-// per-round east+south traffic from O(num_boundary_edges) to
-// O(num_local_vertices), which for test14 is 200x less. 0=not sent
-// this round, 1=already sent. Reset in reset_round_state.
-var sent_east_for_v:  [max_local_verts]i16;
-var sent_south_for_v: [max_local_verts]i16;
 
-// runtime_config = [pe_mask, palette_size, level_epoch].
-// level_epoch: 0 or 1, toggled by the host between BSP levels. Used to
-// distinguish wavelets emitted by the previous kernel invocation
-// (which may still be in fabric IQs when the next launch starts) from
-// wavelets emitted by the current kernel. Receivers discard wavelets
-// whose epoch != current_level_epoch, eliminating the cross-launch
-// fabric residual leak that hung the col-axis at >=4 rows.
-var runtime_config:     [3]i32;
-// Default sentinel (=2) deliberately does not match any valid 0/1 epoch.
-// runner.load() resets this to the default; between runner.run() and
-// start_coloring's first instruction there is a race window where IQ
-// tasks can fire on stale wavelets. With a sentinel default, those
-// stale wavelets are unconditionally discarded; once start_coloring
-// runs it overwrites this with the per-level epoch from runtime_config.
-var current_level_epoch: u32 = 2;
+var runtime_config:     [2]i32;
 var remote_recv_color:  [max_boundary]i32;
 var remote_recv_color_next: [max_boundary]i32;
 
@@ -310,7 +244,6 @@ var col_bcast_tmp  = @zeros([1]u32);
 // uses tx_east_oq, which serializes against send_wavelet's own use of
 // the same OQ. The hardware queue absorbs concurrency.
 var bridge_tmp = @zeros([1]u32);
-var col_bridge_tmp = @zeros([1]u32);
 
 // ===== Host symbol pointers =====
 var csr_offsets_ptr:            [*]i32 = &csr_offsets;
@@ -425,90 +358,31 @@ fn shrink_color_lists() void {
 fn process_incoming_wavelet(sender_gid: i32, sender_color: i32) void {
   perf_counters[4] += 1;
   const nbnd = num_boundary[0];
-  var matched: bool = false;
   var b: i16 = 0;
   while (b < max_boundary) : (b += 1) {
     if (@as(i32, b) >= nbnd) break;
     if (boundary_neighbor_gid[b] == sender_gid) {
       remote_recv_color[b] = sender_color;
-      matched = true;
     }
   }
-  if (!matched) diag_counters[4] += 1;
 }
 
-// ===== Wavelet encoding =====
-// Data:       [31]=0, [30]=parity, [29:8]=gid, [7:0]=color
-// Data-done:  [31]=1, [30]=parity, [29]=0, [28]=0
-// Bcast:      [31]=1, [30]=parity, [29]=1, [0]=value
-//              - on my_east_color   = row_bcast  (CP2d.d.1, in-band)
-//              - on my_south_color  = col_bcast  (CP2d.c)
-// Row-reduce: [31]=1, [30]=parity, [29]=0, [28]=1, [0]=value
-//              - on c_W_back_row    (CP2d.d.2, fan-in)
-// Wavelet bit layout (CP3.epoch fix, 2026-04-25):
-//   bit[31] = data marker (0=data, 1=special)
-//   bit[30] = round parity (current_round & 0x1)
-//   bit[29] = bcast opcode (special only)
-//   bit[28] = row_reduce opcode (special only)
-//   bit[27:8] = gid (20 bits, max 2^20 = 1M, was 22 bits)
-//                Note: gid is now 20 bits because bit[7] became the
-//                level epoch and bit[28] is reserved for the reduce
-//                opcode in special wavelets. For data wavelets bit[28]
-//                is the top bit of the gid field; we never set bit[28]
-//                in pack_data (gid masked to 0xFFFFF below).
-//   bit[7]  = level epoch (NEW; toggles per level, same bit position
-//             across data and special so a single helper extracts it)
-//   bit[6:0] = color (7 bits, max 128)
+// ===== Wavelet encoding (verbatim) =====
 fn pack_data(gid: i32, col: i32, parity: u32) u32 {
-  const g = @as(u32, @as(u16, @as(i16, gid))) & 0xFFFFF;
-  const c = @as(u32, @as(u16, @as(i16, col))) & 0x7F;
+  const g = @as(u32, @as(u16, @as(i16, gid))) & 0x3FFFFF;
+  const c = @as(u32, @as(u16, @as(i16, col))) & 0xFF;
   const p = (parity & 0x1) << 30;
-  const e = (current_level_epoch & 0x1) << 7;
-  return p | (g << 8) | e | c;
+  return p | (g << 8) | c;
 }
 
 fn pack_data_done(parity: u32) u32 {
-  const e = (current_level_epoch & 0x1) << 7;
-  return 0x80000000 | ((parity & 0x1) << 30) | e;
+  return 0x80000000 | ((parity & 0x1) << 30);
 }
 
-fn pack_bcast(parity: u32, value: u32) u32 {
-  const e = (current_level_epoch & 0x1) << 7;
-  return 0x80000000 | ((parity & 0x1) << 30) | (1 << 29) | e | (value & 0x1);
-}
-
-fn pack_row_reduce(parity: u32, value: u32) u32 {
-  const e = (current_level_epoch & 0x1) << 7;
-  return 0x80000000 | ((parity & 0x1) << 30) | (1 << 28) | e | (value & 0x1);
-}
-
-fn is_bcast_wavelet(w: u32) bool {
-  return ((w >> 31) != 0) and (((w >> 29) & 0x1) != 0);
-}
-fn is_row_reduce_wavelet(w: u32) bool {
-  return ((w >> 31) != 0) and (((w >> 29) & 0x1) == 0) and (((w >> 28) & 0x1) != 0);
-}
-// Legacy aliases kept for call-site clarity.
-fn pack_col_bcast(parity: u32, value: u32) u32 { return pack_bcast(parity, value); }
-fn is_col_bcast_wavelet(w: u32) bool { return is_bcast_wavelet(w); }
-fn is_row_bcast_wavelet(w: u32) bool { return is_bcast_wavelet(w); }
-// CP2d.d.2: is_data_done now requires bit[28]=0 to avoid collision
-// with row_reduce opcode on shared carriers.
-fn is_data_done(w: u32) bool {
-  return ((w >> 31) != 0) and (((w >> 29) & 0x1) == 0) and (((w >> 28) & 0x1) == 0);
-}
-fn unpack_gid(w: u32) i32 { return @as(i32, (w >> 8) & 0xFFFFF); }
-fn unpack_color(w: u32) i32 { return @as(i32, w & 0x7F); }
+fn is_data_done(w: u32) bool { return (w >> 31) != 0; }
+fn unpack_gid(w: u32) i32 { return @as(i32, (w >> 8) & 0x3FFFFF); }
+fn unpack_color(w: u32) i32 { return @as(i32, w & 0xFF); }
 fn unpack_parity(w: u32) u32 { return (w >> 30) & 0x1; }
-// CP3.epoch: extract the 1-bit level epoch (bit[7]) — same position
-// across data and special wavelets.
-fn unpack_epoch(w: u32) u32 { return (w >> 7) & 0x1; }
-// True when the wavelet was emitted by the kernel running at the
-// current level_epoch. Wavelets that fail this check are leftovers
-// from a previous level still in fabric IQs and must be discarded.
-fn epoch_matches(w: u32) bool {
-  return unpack_epoch(w) == current_level_epoch;
-}
 
 // =====================================================================
 // Speculate (verbatim from east-only kernel)
@@ -609,19 +483,10 @@ task send_boundary() void {
     const dir = boundary_direction[b];
     const w = pack_data(global_vertex_ids[li], c, par);
     if (is_dual_axis) {
-      // CP2d.e dedupe: skip duplicate (vertex, dir) emissions.
-      // The wavelet only carries (gid, color), so emitting the same
-      // pair multiple times per round wastes fabric capacity. The
-      // receiver's process_incoming_wavelet scans EVERY boundary
-      // entry with that gid, so one wavelet per (li, dir) suffices.
       if (dir == 0) {
-        if (sent_east_for_v[li] != 0) continue;
-        sent_east_for_v[li] = 1;
         east_send_buf[east_count] = w;
         east_count += 1;
       } else if (dir == 2) {
-        if (sent_south_for_v[li] != 0) continue;
-        sent_south_for_v[li] = 1;
         south_send_buf[south_count] = w;
         south_count += 1;
       }
@@ -629,9 +494,6 @@ task send_boundary() void {
       // partition's anti-diagonal patch + Turn 3 back-channel).
     } else {
       if (dir != @as(i32, axis_dir_filter)) continue;
-      // Single-axis: only one direction matters; dedupe by sent_east.
-      if (sent_east_for_v[li] != 0) continue;
-      sent_east_for_v[li] = 1;
       east_send_buf[east_count] = w;
       east_count += 1;
     }
@@ -668,29 +530,22 @@ fn send_south(w: u32) void {
   @mov32(out, src);
 }
 
-// CP2d.e (2026-04-26): back-channel uses its OWN OQ + color
-// (tx_back_oq on Q4 + c_W_back_color). CP2d.d.2's chain merge with
-// tx_reduce_oq caused head-of-line blocking under dense traffic
-// (test14 8x8 hung). Restoring the dedicated route is functionally
-// equivalent to CP2d.c's design but keeps CP2d.d.1's in-band row_bcast.
+// Turn 3: back-channel send (PE(R>0, last col) only). Reuses Q2 OQ
+// (tx_east_oq) which is uninitialized on east_edge PEs.
 var back_send_tmp = @zeros([1]u32);
 fn send_west_back(w: u32) void {
   back_send_tmp[0] = w;
   var out = @get_dsd(fabout_dsd, .{
     .extent = 1,
     .fabric_color = c_W_back_color,
-    .output_queue = tx_back_oq,
+    .output_queue = tx_east_oq,
   });
   var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> back_send_tmp[i] });
   @mov32(out, src);
 }
 
-// CP2d.d.2 (final): send_reduce emits a chain wavelet carrying the
-// OR'd has_uncolored bit. Opcode-tagged so the same sync_reduce
-// alternating chain can also ferry back-channel data wavelets.
 fn send_reduce(val: u32) void {
-  const par = @as(u32, current_round) & 0x1;
-  reduce_tmp[0] = pack_row_reduce(par, val & 0x1);
+  reduce_tmp[0] = val;
   var out = @get_dsd(fabout_dsd, .{
     .extent = 1,
     .fabric_color = sync_reduce_send_color,
@@ -700,16 +555,12 @@ fn send_reduce(val: u32) void {
   @mov32(out, src);
 }
 
-// CP2d.d.1: row_bcast rides in-band on my_east_color via tx_east_oq.
-// West-edge PE injects; all downstream PEs decode via is_row_bcast_wavelet.
-// Frees Q3 IQ (bcast_recv_iq) and Q4 OQ (bcast_send_oq).
 fn send_bcast(val: u32) void {
-  const par = @as(u32, current_round) & 0x1;
-  bcast_tmp[0] = pack_bcast(par, val & 0x1);
+  bcast_tmp[0] = val;
   var out = @get_dsd(fabout_dsd, .{
     .extent = 1,
-    .fabric_color = my_east_color,
-    .output_queue = tx_east_oq,
+    .fabric_color = sync_bcast_color,
+    .output_queue = bcast_send_oq,
   });
   var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> bcast_tmp[i] });
   @mov32(out, src);
@@ -717,10 +568,7 @@ fn send_bcast(val: u32) void {
 
 // CP2c.i Stage B: col barrier sends (mirror of row barrier).
 fn send_col_reduce(val: u32) void {
-  // CP3.epoch.v5: pack with epoch at bit[7] for uniform receiver
-  // check (epoch_matches reads bit[7] across all wavelet types).
-  const e = (current_level_epoch & 0x1) << 7;
-  col_reduce_tmp[0] = e | (val & 0x1);
+  col_reduce_tmp[0] = val;
   var out = @get_dsd(fabout_dsd, .{
     .extent = 1,
     .fabric_color = sync_col_reduce_send_color,
@@ -730,27 +578,17 @@ fn send_col_reduce(val: u32) void {
   @mov32(out, src);
 }
 
-// CP2d.c (option 1a): col_bcast now rides in-band on my_south_color
-// via tx_south_oq, with bit[29]=1 opcode distinguishing it from data /
-// data-done wavelets. Frees Q6 for back_recv_iq at interior PEs.
 fn send_col_bcast(val: u32) void {
-  const par = @as(u32, current_round) & 0x1;
-  col_bcast_tmp[0] = pack_col_bcast(par, val & 0x1);
+  col_bcast_tmp[0] = val;
   var out = @get_dsd(fabout_dsd, .{
     .extent = 1,
-    .fabric_color = my_south_color,
-    .output_queue = tx_south_oq,
+    .fabric_color = sync_col_bcast_color,
+    .output_queue = col_bcast_send_oq,
   });
   var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> col_bcast_tmp[i] });
   @mov32(out, src);
 }
 
-// CP2d.d.2 (final): classic alternating reduce chain on
-// sync_reduce_c0/c1. Back-channel data rides the same chain via
-// opcode dispatch on reduce_recv_iq (see reduce_recv_task). The
-// chain protocol for row_reduce wavelets is unchanged: east-edge
-// initiates, each interior PE OR's with pending + local, west-edge
-// consumes and broadcasts.
 fn try_step_barrier() void {
   if (num_cols == 1) return;
   if (reduce_sent_for_round) return;
@@ -912,51 +750,17 @@ fn bridge_reinject(w: u32) void {
   @mov32(out, src);
 }
 
-// CP2d: col-axis analogue of bridge_reinject. At a col bridge PE
-// (cy_local_x = S-1, cy_seg_idx < cy_num_segs - 1), every south
-// arrival on the upstream segment's source / cross-bridge color is
-// re-emitted onto this PE's bridge color (= my_south_color), keeping
-// FIFO ordering between data and the trailing data-done across the
-// col segment boundary. Without this, downstream rows in the next
-// col segment never see upstream rows' south traffic and the south
-// barrier never lifts at 4x4+.
-fn col_bridge_reinject(w: u32) void {
-  col_bridge_tmp[0] = w;
-  var out = @get_dsd(fabout_dsd, .{
-    .extent = 1,
-    .fabric_color = my_south_color,
-    .output_queue = tx_south_oq,
-  });
-  var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> col_bridge_tmp[i] });
-  @mov32(out, src);
-}
-
 // =====================================================================
 // Recv tasks — data slots.
 // =====================================================================
 
 fn on_recv(wval: u32) void {
-  // CP3.epoch: discard wavelets from a previous level still in fabric
-  // IQs (cross-launch residual leak). Without this, a stale wavelet's
-  // parity may match the new level's parity by chance, corrupting
-  // data_done_recv_count and deadlocking the BSP barrier.
-  if (!epoch_matches(wval)) {
-    return;  // CP3.epoch: drop wavelet from previous level
-  }
   perf_counters[2] += 1;
   const cur_par = @as(u32, current_round) & 0x1;
   const dpar = unpack_parity(wval);
-  // CP2d.d.1: row_bcast wavelet rides in-band on my_east_color with
-  // bit[29]=1. Deliver the sync bit and fire row-barrier-done.
-  if (is_row_bcast_wavelet(wval)) {
-    sync_buf[0] = wval & 0x1;
-    on_row_barrier_done();
-    return;
-  }
   if (is_data_done(wval)) {
     if (dpar == cur_par) {
       data_done_recv_count += 1;
-      diag_counters[2] += 1;
       if (!data_done_present and data_done_recv_count >= expected_data_done) {
         data_done_present = true;
         try_step_barrier();
@@ -966,7 +770,6 @@ fn on_recv(wval: u32) void {
     }
     return;
   }
-  diag_counters[0] += 1;
   const gid  = unpack_gid(wval);
   const col  = unpack_color(wval);
   if (dpar == cur_par) {
@@ -992,82 +795,47 @@ fn on_recv(wval: u32) void {
 // source's single data-done is forwarded once by each bridge it
 // crosses.
 task rx_task_0(w: u32) void {
-  // CP3.epoch: drop stale wavelet BEFORE any forwarder side-effect.
-  // Without this, on_recv discards but send_south/bridge_reinject
-  // still re-emit the stale wavelet, flooding downstream IQs.
-  if (!epoch_matches(w)) return;
-  // CP2d.d.2 (final): rx_task_0 no longer handles back-channel at
-  // back_sink. Back-channel data now rides the sync_reduce chain and
-  // arrives on reduce_recv_iq (Q2).
+  // Turn 3: on back-channel sink (PE(R>0, 0) at 2x2), Q4 IQ is
+  // re-bound to c_W_back_color and arrivals are south-stream
+  // forwards from the SE relay -> count toward south_data_done.
+  if (is_back_sink) {
+    on_recv_south(w);
+    return;
+  }
   on_recv(w);
   // Turn 3 / CP2c.ii: any non-west PE re-emits east arrivals south
   // so col-c originator's color reaches south rows. Gate on
   // !is_south_edge (no south neighbour to send to).
-  // CP2d.d.1: row_bcast wavelets ride in-band on the east data
-  // stream; they must NOT leak onto the south data stream or
-  // terminate south-axis barrier decoding at e2s_relay PEs.
-  if (is_e2s_relay and !is_south_edge and !is_row_bcast_wavelet(w)) send_south(w);
-  // Bridge re-inject preserves row_bcast wavelets verbatim onto the
-  // bridge color so downstream segments decode them in on_recv too.
+  if (is_e2s_relay and !is_south_edge) send_south(w);
   if (is_bridge) bridge_reinject(w);
 }
 task rx_task_1(w: u32) void {
-  if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
   on_recv(w);
   // CP2c.ii: e2s_relay forwards every east arrival south, regardless
   // of which input slot it landed on.
-  // CP2d.d.1: row_bcast wavelets ride in-band on the east data
-  // stream; they must NOT leak onto the south data stream or
-  // terminate south-axis barrier decoding at e2s_relay PEs.
-  if (is_e2s_relay and !is_south_edge and !is_row_bcast_wavelet(w)) send_south(w);
-  // Bridge re-inject preserves row_bcast wavelets verbatim onto the
-  // bridge color so downstream segments decode them in on_recv too.
+  if (is_e2s_relay and !is_south_edge) send_south(w);
   if (is_bridge) bridge_reinject(w);
 }
 task rx_task_2(w: u32) void {
-  if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
   on_recv(w);
-  // CP2d.d.1: row_bcast wavelets ride in-band on the east data
-  // stream; they must NOT leak onto the south data stream or
-  // terminate south-axis barrier decoding at e2s_relay PEs.
-  if (is_e2s_relay and !is_south_edge and !is_row_bcast_wavelet(w)) send_south(w);
-  // Bridge re-inject preserves row_bcast wavelets verbatim onto the
-  // bridge color so downstream segments decode them in on_recv too.
+  if (is_e2s_relay and !is_south_edge) send_south(w);
   if (is_bridge) bridge_reinject(w);
 }
 task rx_task_3(w: u32) void {
-  if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
   on_recv(w);
-  // CP2d.d.1: row_bcast wavelets ride in-band on the east data
-  // stream; they must NOT leak onto the south data stream or
-  // terminate south-axis barrier decoding at e2s_relay PEs.
-  if (is_e2s_relay and !is_south_edge and !is_row_bcast_wavelet(w)) send_south(w);
-  // Bridge re-inject preserves row_bcast wavelets verbatim onto the
-  // bridge color so downstream segments decode them in on_recv too.
+  if (is_e2s_relay and !is_south_edge) send_south(w);
   if (is_bridge) bridge_reinject(w);
 }
 
 // CP2c.i Stage B: south-axis on_recv (mirror of on_recv with per-axis
 // data-done counters and try_step_col_barrier hook).
 fn on_recv_south(wval: u32) void {
-  if (!epoch_matches(wval)) {
-    return;  // CP3.epoch: drop wavelet from previous level
-  }
   perf_counters[2] += 1;
   const cur_par = @as(u32, current_round) & 0x1;
   const dpar = unpack_parity(wval);
-  // CP2d.c (option 1a): col_bcast wavelet rides in-band on my_south_color
-  // with bit[29]=1. Deliver the sync bit and step the col barrier.
-  if (is_col_bcast_wavelet(wval)) {
-    col_sync_buf[0] = wval & 0x1;
-    col_barrier_done = true;
-    check_completion();
-    return;
-  }
   if (is_data_done(wval)) {
     if (dpar == cur_par) {
       south_data_done_recv_count += 1;
-      diag_counters[3] += 1;
       if (!south_data_done_present and
           south_data_done_recv_count >= expected_south_data_done) {
         south_data_done_present = true;
@@ -1078,7 +846,6 @@ fn on_recv_south(wval: u32) void {
     }
     return;
   }
-  diag_counters[1] += 1;
   const gid = unpack_gid(wval);
   const col = unpack_color(wval);
   if (dpar == cur_par) {
@@ -1097,76 +864,48 @@ fn on_recv_south(wval: u32) void {
 }
 
 task south_rx_task_0(w: u32) void {
-  if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
   on_recv_south(w);
   // Turn 3: back-channel relay (PE(R>0, last col) at 2x2) forwards
   // every south arrival west so PE(R, 0) sees NE originator's color
   // (NE->SW anti-diagonal class).
-  // CP2d.c: col_bcast wavelets ride in-band on south stream; don't
-  // forward them west or they pollute other cols' barriers.
-  if (is_back_relay and !is_col_bcast_wavelet(w)) send_west_back(w);
-  // CP2d: col bridge re-injects every south arrival onto its
-  // bridge color so the next col segment sees the merged stream.
-  if (is_col_bridge) col_bridge_reinject(w);
+  if (is_back_relay) send_west_back(w);
 }
 task south_rx_task_1(w: u32) void {
-  if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
   on_recv_south(w);
-  // CP2d.c: col_bcast wavelets ride in-band on south stream; don't
-  // forward them west or they pollute other cols' barriers.
-  if (is_back_relay and !is_col_bcast_wavelet(w)) send_west_back(w);
-  if (is_col_bridge) col_bridge_reinject(w);
+  if (is_back_relay) send_west_back(w);
 }
 task south_rx_task_2(w: u32) void {
-  if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
   on_recv_south(w);
-  // CP2d.c: col_bcast wavelets ride in-band on south stream; don't
-  // forward them west or they pollute other cols' barriers.
-  if (is_back_relay and !is_col_bcast_wavelet(w)) send_west_back(w);
-  if (is_col_bridge) col_bridge_reinject(w);
+  if (is_back_relay) send_west_back(w);
 }
 
 // =====================================================================
 // Barrier rx tasks.
 // =====================================================================
 
-// CP2d.e: row reduce ONLY. Back-channel was decoupled to its own
-// dedicated route (c_W_back_color + Q3 IQ + Q4 OQ) to eliminate
-// head-of-line blocking observed at dense 8x8 dual-axis (test14).
-// Bound at every non-east-edge PE (is_west_edge or !is_east_edge).
 task reduce_recv_task(w: u32) void {
-  if (!epoch_matches(w)) {
-    return;  // CP3.epoch: drop wavelet from previous level
-  }
-  pending_reduce_value = w & 0x1;
+  pending_reduce_value = w;
   pending_reduce_present = true;
   try_step_barrier();
 }
 
-// CP2d.e: back-channel data + data-done arrive on Q3 IQ via
-// c_W_back_color. The fabric route at interior PEs is
-// rx=EAST tx={WEST, RAMP}, so the wavelet is auto-forwarded west by
-// hardware AND delivered to RAMP for this task. The task only needs
-// to feed on_recv_south for boundary-color tracking + south
-// data-done count — DO NOT call send_west_back here, that would
-// double-send.
-task back_recv_task(w: u32) void {
-  if (!epoch_matches(w)) return;  // CP3.epoch: drop previous-level
-  on_recv_south(w);
+task bcast_recv_task(w: u32) void {
+  sync_buf[0] = w;
+  on_row_barrier_done();
 }
 
 // CP2c.i Stage B: col barrier rx tasks (mirror row equivalents).
-// CP3.epoch.v5: send_col_reduce packs `(epoch<<7) | (val&0x1)`.
-// Receiver checks epoch via bit[7] then extracts value bit.
 task col_reduce_recv_task(w: u32) void {
-  if (!epoch_matches(w)) return;  // CP3.epoch: drop previous-level
-  col_pending_reduce_value = w & 0x1;
+  col_pending_reduce_value = w;
   col_pending_reduce_present = true;
   try_step_col_barrier();
 }
 
-// CP2d.d.1: bcast_recv_task removed — row_bcast is now decoded in
-// on_recv() via is_row_bcast_wavelet on the east data IQs.
+task col_bcast_recv_task(w: u32) void {
+  col_sync_buf[0] = w;
+  col_barrier_done = true;
+  check_completion();
+}
 
 // =====================================================================
 // Detect / resolve / loop
@@ -1222,13 +961,6 @@ fn reset_round_state() void {
   east_count = 0;
   send_phase = 0;
   send_idx = 0;
-  // CP2d.e dedupe: clear the per-vertex-per-direction "already sent"
-  // markers so the next round can emit fresh (gid, color) wavelets.
-  var dv: i16 = 0;
-  while (dv < max_local_verts) : (dv += 1) {
-    sent_east_for_v[dv] = 0;
-    sent_south_for_v[dv] = 0;
-  }
   const nbnd = num_boundary[0];
   var b: i16 = 0;
   while (b < max_boundary) : (b += 1) {
@@ -1238,13 +970,6 @@ fn reset_round_state() void {
       remote_recv_color_next[b] = -1;
     }
   }
-  // CP2d.c diag: snapshot residual _next BEFORE we zero it. This is
-  // the count of wavelets that arrived for the upcoming round before
-  // the previous round's barrier had closed. Updated every round so
-  // the final value reflects the LAST completed round.
-  diag_counters[5] = data_done_recv_next;
-  diag_counters[6] = south_data_done_recv_next;
-  diag_counters[7] = current_round;
   data_done_recv_count = data_done_recv_next;
   data_done_recv_next = 0;
   data_done_present = (data_done_recv_count >= expected_data_done);
@@ -1286,52 +1011,11 @@ fn reset_round_state() void {
   }
 }
 
-fn unblock_fabric_recv_tasks() void {
-  if (slot_count > 0) {
-    @unblock(rx_task_0_id);
-  }
-  if (slot_count > 1) {
-    @unblock(rx_task_1_id);
-  }
-  if (slot_count > 2) {
-    @unblock(rx_task_2_id);
-  }
-  if (slot_count > 3) {
-    @unblock(rx_task_3_id);
-  }
-
-  if (south_slot_count > 0) {
-    @unblock(south_rx_task_0_id);
-  }
-  if (south_slot_count > 1) {
-    @unblock(south_rx_task_1_id);
-  }
-  if (south_slot_count > 2) {
-    @unblock(south_rx_task_2_id);
-  }
-
-  if (num_cols > 1 and (is_west_edge or !is_east_edge)) {
-    @unblock(reduce_recv_id);
-  }
-  if (is_back_recv or is_back_sink) {
-    @unblock(back_recv_id);
-  }
-  if (is_dual_axis and num_rows > 1) {
-    if (is_north_edge or !is_south_edge) {
-      @unblock(col_reduce_recv_id);
-    }
-  }
-}
-
 // =====================================================================
 // Entry / exit
 // =====================================================================
 
 fn start_coloring() void {
-  // CP3.epoch: latch the level epoch for this kernel invocation. Host
-  // toggles runtime_config[2] per BSP level so we can distinguish our
-  // own emissions from previous-level residuals still in fabric IQs.
-  current_level_epoch = @as(u32, runtime_config[2]) & 0x1;
   start_timing();
   var b: i16 = 0;
   while (b < max_boundary) : (b += 1) {
@@ -1351,11 +1035,6 @@ fn start_coloring() void {
   south_data_done_present = (expected_south_data_done == 0);
   reset_round_state();
   local_done_for_round = true;
-  // CP3.epoch race fix: fabric receive tasks are bound blocked at
-  // comptime. Open the receive window only after epoch and per-level
-  // state are initialized, so queued stale wavelets get dropped and
-  // queued fresh wavelets cannot be falsely rejected by the sentinel.
-  unblock_fabric_recv_tasks();
   @activate(speculate_task_id);
 }
 
@@ -1375,56 +1054,37 @@ comptime {
   @bind_local_task(detect_resolve,  detect_resolve_task_id);
   @bind_local_task(exit_task,       exit_task_id);
 
-  if (slot_count > 0) {
+  if (slot_count > 0) @bind_data_task(rx_task_0, rx_task_0_id);
+  if (slot_count > 1) @bind_data_task(rx_task_1, rx_task_1_id);
+  if (slot_count > 2) @bind_data_task(rx_task_2, rx_task_2_id);
+  if (slot_count > 3) @bind_data_task(rx_task_3, rx_task_3_id);
+  // Turn 3: bind rx_task_0 on back-sink PEs even when slot_count==0
+  // (Q4 IQ is re-purposed for back-channel arrivals).
+  if (slot_count == 0 and is_back_sink)
     @bind_data_task(rx_task_0, rx_task_0_id);
-    @block(rx_task_0_id);
-  }
-  if (slot_count > 1) {
-    @bind_data_task(rx_task_1, rx_task_1_id);
-    @block(rx_task_1_id);
-  }
-  if (slot_count > 2) {
-    @bind_data_task(rx_task_2, rx_task_2_id);
-    @block(rx_task_2_id);
-  }
-  if (slot_count > 3) {
-    @bind_data_task(rx_task_3, rx_task_3_id);
-    @block(rx_task_3_id);
-  }
 
-  // CP2c.i Stage B: south data rx.
-  if (south_slot_count > 0) {
-    @bind_data_task(south_rx_task_0, south_rx_task_0_id);
-    @block(south_rx_task_0_id);
-  }
-  if (south_slot_count > 1) {
-    @bind_data_task(south_rx_task_1, south_rx_task_1_id);
-    @block(south_rx_task_1_id);
-  }
-  if (south_slot_count > 2) {
-    @bind_data_task(south_rx_task_2, south_rx_task_2_id);
-    @block(south_rx_task_2_id);
-  }
+  // CP2c.i Stage B: south data rx (only south_rx_task_0 bound at 2x2;
+  // south_slot_count <= 1 in a no-bridge col axis).
+  if (south_slot_count > 0) @bind_data_task(south_rx_task_0, south_rx_task_0_id);
+  if (south_slot_count > 1) @bind_data_task(south_rx_task_1, south_rx_task_1_id);
+  if (south_slot_count > 2) @bind_data_task(south_rx_task_2, south_rx_task_2_id);
 
-  // CP2d.e: row reduce ONLY on Q2 IQ. Bound at chain recv positions.
-  if (num_cols > 1 and (is_west_edge or !is_east_edge)) {
-    @bind_data_task(reduce_recv_task, reduce_recv_id);
-    @block(reduce_recv_id);
-  }
-
-  // CP2d.e: dedicated back-channel rx on Q3 IQ. Bound at row R>0 PEs
-  // that act as receiver (interior or sink). The back_relay PE
-  // (R>0, last col) is the originator; it does not bind back_recv.
-  if (is_back_recv or is_back_sink) {
-    @bind_data_task(back_recv_task, back_recv_id);
-    @block(back_recv_id);
+  if (num_cols > 1) {
+    if (is_west_edge or !is_east_edge) {
+      @bind_data_task(reduce_recv_task, reduce_recv_id);
+    }
+    if (!is_west_edge) {
+      @bind_data_task(bcast_recv_task, bcast_recv_id);
+    }
   }
 
   // CP2c.i Stage B: col barrier rx bindings.
   if (is_dual_axis and num_rows > 1) {
     if (is_north_edge or !is_south_edge) {
       @bind_data_task(col_reduce_recv_task, col_reduce_recv_id);
-      @block(col_reduce_recv_id);
+    }
+    if (!is_north_edge) {
+      @bind_data_task(col_bcast_recv_task, col_bcast_recv_id);
     }
   }
 
@@ -1435,31 +1095,15 @@ comptime {
     if (slot_count > 2) @initialize_queue(rx_iq_2, .{ .color = slot2_color });
     if (slot_count > 3) @initialize_queue(rx_iq_3, .{ .color = slot3_color });
 
-    // CP2d.d.2 (final): classic alternating reduce chain OQ/IQ.
-    //   Q2 IQ reduce_recv_iq @ sync_reduce_recv_color — both row_reduce
-    //     and back-channel data arrive here (opcode dispatched).
-    //   Q3 OQ tx_reduce_oq   @ sync_reduce_send_color — both reduce
-    //     wavelets and forwarded back-channel data exit here.
-    //   Back-channel data was previously on dedicated c_W_back_row
-    //     (Q6 IQ / Q2 OQ at back_relay). Those bindings are GONE.
     if (num_cols > 1) {
       if (!is_west_edge) @initialize_queue(tx_reduce_oq,
         .{ .color = sync_reduce_send_color });
       if (is_west_edge or !is_east_edge) @initialize_queue(reduce_recv_iq,
         .{ .color = sync_reduce_recv_color });
-    }
-
-    // CP2d.e: dedicated back-channel queues.
-    //   Q4 OQ at back_relay only — that PE originates the chain via
-    //     send_west_back; interior + sink PEs let hardware forward.
-    //   Q3 IQ at back_recv + back_sink — interior + col-0 receive
-    //     locally (interior also gets auto-forwarded via tx=WEST in
-    //     the route).
-    if (is_back_relay) {
-      @initialize_queue(tx_back_oq, .{ .color = c_W_back_color });
-    }
-    if (is_back_recv or is_back_sink) {
-      @initialize_queue(back_recv_iq, .{ .color = c_W_back_color });
+      if (is_west_edge) @initialize_queue(bcast_send_oq,
+        .{ .color = sync_bcast_color });
+      if (!is_west_edge) @initialize_queue(bcast_recv_iq,
+        .{ .color = sync_bcast_color });
     }
 
     // CP2c.i Stage B: south data + col barrier OQ/IQ.
@@ -1477,7 +1121,20 @@ comptime {
           .{ .color = sync_col_reduce_send_color });
         if (is_north_edge or !is_south_edge) @initialize_queue(col_reduce_recv_iq,
           .{ .color = sync_col_reduce_recv_color });
+        if (is_north_edge) @initialize_queue(col_bcast_send_oq,
+          .{ .color = sync_col_bcast_color });
+        if (!is_north_edge) @initialize_queue(col_bcast_recv_iq,
+          .{ .color = sync_col_bcast_color });
       }
+      // Turn 3: back-channel OQ/IQ.
+      // Back-relay PEs (PE(R>0, last col)) reuse Q2 OQ (east_edge
+      // skipped tx_east_oq above) for back-channel send.
+      if (is_back_relay) @initialize_queue(tx_east_oq,
+        .{ .color = c_W_back_color });
+      // Back-sink PEs (PE(R>0, 0)) reuse Q4 IQ (slot_count==0 so
+      // rx_iq_0 was skipped above) for back-channel recv.
+      if (is_back_sink) @initialize_queue(rx_iq_0,
+        .{ .color = c_W_back_color });
     }
   }
 
@@ -1494,7 +1151,6 @@ comptime {
   @export_symbol(expected_recv_ptr,         "expected_recv");
   @export_symbol(coloring_timer_ptr,        "coloring_timer");
   @export_symbol(perf_counters_ptr,         "perf_counters");
-  @export_symbol(diag_counters_ptr,         "diag_counters");
   @export_symbol(color_list_ptr,            "color_list");
   @export_symbol(list_len_ptr,              "list_len");
   @export_symbol(start_coloring);

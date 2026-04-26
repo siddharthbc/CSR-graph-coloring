@@ -1,0 +1,626 @@
+// WSE-2 color-swap LWW broadcast coloring — PE kernel.
+// Paired with layout_colorswap.csl.
+//
+// Identical algorithm to pe_program_hw_broadcast.csl, but uses WSE-2
+// color_swap_x for multi-source wire-speed broadcast.
+//
+// Color scheme: 4 colors in 2 swap-pairs.
+//   east_color_0/east_color_1: eastward (inject on 0, flow alternates 0↔1)
+//   west_color_0/west_color_1: westward (inject on 0, flow alternates 0↔1)
+//
+// Every PE has data tasks on ALL 4 colors (wavelets alternate between
+// paired colors at each hop due to color_swap_x).
+//
+// Wavelet format (32-bit):
+//   [31:24] sender_pe (u8)   [23:12] gid (u12)
+//   [11:5]  color (u7)       [4] commit_bit   [3:0] reserved
+
+param memcpy_params: comptime_struct;
+param pe_id: i16;
+param num_pes: i16;
+param max_local_verts: i16;
+param max_nbr_entries: i16;
+param east_color_0: color;  // inject east + even-hop recv
+param east_color_1: color;  // odd-hop recv (swap pair of east_color_0)
+param west_color_0: color;  // inject west + even-hop recv
+param west_color_1: color;  // odd-hop recv (swap pair of west_color_0)
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tsc = @import_module("<time>");
+
+// ========== Hardware timestamp counter ==========
+var tsc_start_buf = @zeros([tsc.tsc_size_words]u16);
+var tsc_end_buf = @zeros([tsc.tsc_size_words]u16);
+var coloring_timer = @zeros([3]f32);
+var coloring_timer_ptr: [*]f32 = &coloring_timer;
+
+inline fn start_timing() void {
+  tsc.enable_tsc();
+  tsc.get_timestamp(&tsc_start_buf);
+}
+
+inline fn stop_timing() void {
+  tsc.get_timestamp(&tsc_end_buf);
+  tsc.disable_tsc();
+  var lo_: u16 = 0;
+  var hi_: u16 = 0;
+  lo_ = tsc_start_buf[0];
+  hi_ = tsc_start_buf[1];
+  coloring_timer[0] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+  lo_ = tsc_start_buf[2];
+  hi_ = tsc_end_buf[0];
+  coloring_timer[1] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+  lo_ = tsc_end_buf[1];
+  hi_ = tsc_end_buf[2];
+  coloring_timer[2] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+}
+
+// ========== Queues (output only — WSE-2 data tasks bind to colors) ==========
+const send_east_oq: output_queue = @get_output_queue(2);
+const send_west_oq: output_queue = @get_output_queue(3);
+
+// ========== Task IDs ==========
+const done_task_id: local_task_id = @get_local_task_id(15);
+const bcast_task_id: local_task_id = @get_local_task_id(14);
+const east_send_task_id: local_task_id = @get_local_task_id(13);
+const east_done_task_id: local_task_id = @get_local_task_id(12);
+const west_send_task_id: local_task_id = @get_local_task_id(11);
+const west_done_task_id: local_task_id = @get_local_task_id(10);
+
+const east_0_task_id: data_task_id = @get_data_task_id(east_color_0);
+const east_1_task_id: data_task_id = @get_data_task_id(east_color_1);
+const west_0_task_id: data_task_id = @get_data_task_id(west_color_0);
+const west_1_task_id: data_task_id = @get_data_task_id(west_color_1);
+
+// ========== Host-visible arrays ==========
+var graph_data = @zeros([max_local_verts + 1]i32);
+var graph_data_ptr: [*]i32 = &graph_data;
+
+var nbr_data = @zeros([max_nbr_entries]i32);
+var nbr_data_ptr: [*]i32 = &nbr_data;
+
+var nbr_offsets = @zeros([max_local_verts + 1]i32);
+var nbr_offsets_ptr: [*]i32 = &nbr_offsets;
+
+var result_colors = @zeros([max_local_verts]i32);
+var result_colors_ptr: [*]i32 = &result_colors;
+
+// status[0] = committed count, status[1] = wavelets processed
+var status = @zeros([2]i32);
+var status_ptr: [*]i32 = &status;
+
+// ========== Internal state ==========
+var my_color: [max_local_verts]i32;
+var my_committed: [max_local_verts]i32;
+var higher_pri_open: [max_local_verts]i32;
+
+var shadow_color: [max_nbr_entries]i32;
+var shadow_committed: [max_nbr_entries]i32;
+var shadow_seen: [max_nbr_entries]i32;
+
+const MAX_COLORS: i16 = 128;
+var forbidden: [MAX_COLORS]i32;
+
+var committed_count: i32 = 0;
+
+// ========== Token serialization ==========
+// Multi-rx hazard on east_color_0 / west_color_0 (rx={RAMP, direction})
+// means only one PE may inject at a time. We enforce this by a token
+// wavelet that rotates east: PE(i) broadcasts only while it holds the
+// token. Token bit [3] in the wavelet; bits [31:24] hold the target PE.
+// Priority is strict by pe_id (lower = higher), matching the (pe_id, gid)
+// tuple for cross-PE comparisons.
+const TOKEN_BIT: u32 = 1 << 3;
+var has_token: u8 = 0;
+var turn_finished: u8 = 0;
+
+// ========== Async send ring buffers ==========
+// Separate rings per direction so east/west sends don't contend.
+// Ring depth chosen to comfortably hold 2 wavelets (tentative + commit)
+// per local vertex without ever overflowing in the test configs.
+const SEND_RING_SIZE: u16 = 64;
+const SEND_RING_MASK: u16 = SEND_RING_SIZE - 1;  // SEND_RING_SIZE must be power of 2
+
+var east_ring = @zeros([SEND_RING_SIZE]u32);
+var west_ring = @zeros([SEND_RING_SIZE]u32);
+var east_head: u16 = 0;
+var east_tail: u16 = 0;
+var west_head: u16 = 0;
+var west_tail: u16 = 0;
+var east_busy: u8 = 0;
+var west_busy: u8 = 0;
+
+var east_send_buf = @zeros([1]u32);
+var west_send_buf = @zeros([1]u32);
+
+// ========== Wavelet pack/unpack ==========
+fn pack_wavelet(sender: i32, gid: i32, col: i32, commit: i32) u32 {
+  const pe_part = @as(u32, @as(u16, @as(i16, sender))) << 24;
+  const gid_part = (@as(u32, @as(u16, @as(i16, gid))) & 0xFFF) << 12;
+  const col_part = (@as(u32, @as(u16, @as(i16, col))) & 0x7F) << 5;
+  const cmt_part = (@as(u32, @as(u16, @as(i16, commit))) & 1) << 4;
+  return pe_part | gid_part | col_part | cmt_part;
+}
+
+fn unpack_pe(w: u32) i32  { return @as(i32, (w >> 24) & 0xFF); }
+fn unpack_gid(w: u32) i32 { return @as(i32, (w >> 12) & 0xFFF); }
+fn unpack_col(w: u32) i32 { return @as(i32, (w >> 5) & 0x7F); }
+fn unpack_cmt(w: u32) i32 { return @as(i32, (w >> 4) & 1); }
+
+// ========== Fabric send (async, ring-buffered) ==========
+// Sync @mov32 would block the CE on fabric backpressure, preventing
+// data tasks from draining input queues — producing ring deadlock at
+// scale. Async @mov32 returns immediately; a completion task pops the
+// next queued wavelet. Between activations, data tasks fire freely.
+
+fn send_east(wval: u32) void {
+  east_ring[east_tail] = wval;
+  east_tail = (east_tail + 1) & SEND_RING_MASK;
+  if (east_busy == 0) {
+    east_busy = 1;
+    @activate(east_send_task_id);
+  }
+}
+
+fn send_west(wval: u32) void {
+  west_ring[west_tail] = wval;
+  west_tail = (west_tail + 1) & SEND_RING_MASK;
+  if (west_busy == 0) {
+    west_busy = 1;
+    @activate(west_send_task_id);
+  }
+}
+
+task east_send_task() void {
+  east_send_buf[0] = east_ring[east_head];
+  east_head = (east_head + 1) & SEND_RING_MASK;
+  var out_dsd = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = east_color_0,
+    .output_queue = send_east_oq,
+  });
+  var src_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{1} -> east_send_buf[i],
+  });
+  @mov32(out_dsd, src_dsd, .{ .async = true, .activate = east_done_task_id });
+}
+
+task east_done_task() void {
+  if (east_head != east_tail) {
+    @activate(east_send_task_id);
+  } else {
+    east_busy = 0;
+  }
+}
+
+task west_send_task() void {
+  west_send_buf[0] = west_ring[west_head];
+  west_head = (west_head + 1) & SEND_RING_MASK;
+  var out_dsd = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = west_color_0,
+    .output_queue = send_west_oq,
+  });
+  var src_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{1} -> west_send_buf[i],
+  });
+  @mov32(out_dsd, src_dsd, .{ .async = true, .activate = west_done_task_id });
+}
+
+task west_done_task() void {
+  if (west_head != west_tail) {
+    @activate(west_send_task_id);
+  } else {
+    west_busy = 0;
+  }
+}
+
+fn broadcast_wvl(wval: u32) void {
+  if (pe_id < num_pes - 1) {
+    send_east(wval);
+  }
+  if (pe_id > 0) {
+    send_west(wval);
+  }
+}
+
+// Send a token wavelet east to PE(pe_id + 1). The wavelet rides the same
+// east_color_0 ring as data, so it follows PE's prior data sends in FIFO
+// order — by the time it lands, the receiver has processed everything.
+fn send_token_east() void {
+  const target: u32 = @as(u32, @as(u16, pe_id + 1));
+  const wval: u32 = (target << 24) | TOKEN_BIT;
+  send_east(wval);
+}
+
+fn finish_my_turn() void {
+  if (turn_finished != 0) return;
+  turn_finished = 1;
+  stop_timing();
+  if (pe_id < num_pes - 1) {
+    send_token_east();
+  }
+  @activate(done_task_id);
+}
+
+// ========== Algorithm helpers ==========
+fn is_higher_pri(rpe: i32, rgid: i32, lgid: i32) bool {
+  if (rpe < @as(i32, pe_id)) return true;
+  if (rpe > @as(i32, pe_id)) return false;
+  return rgid < lgid;
+}
+
+fn pick_smallest(v: i16) i32 {
+  var f: i16 = 0;
+  while (f < MAX_COLORS) : (f += 1) {
+    forbidden[@as(u16, f)] = 0;
+  }
+  const vi = @as(u16, v);
+  var i: i16 = @as(i16, nbr_offsets[vi]);
+  const end_i: i16 = @as(i16, nbr_offsets[vi + 1]);
+  while (i < end_i) : (i += 1) {
+    if (shadow_seen[@as(u16, i)] != 0) {
+      const c = shadow_color[@as(u16, i)];
+      if (c >= 0 and c < @as(i32, MAX_COLORS)) {
+        forbidden[@as(u16, @as(i16, c))] = 1;
+      }
+    }
+  }
+  var c: i16 = 0;
+  while (c < MAX_COLORS) : (c += 1) {
+    if (forbidden[@as(u16, c)] == 0) return @as(i32, c);
+  }
+  return 0;
+}
+
+fn do_bcast(v: i16, col: i32, commit: i32) void {
+  const gid = graph_data[@as(u16, v) + 1];
+  const wval = pack_wavelet(@as(i32, pe_id), gid, col, commit);
+  broadcast_wvl(wval);
+}
+
+// ========== Deferred same-PE propagation (breaks mutual recursion) ==========
+// When a local vertex changes color or commits, we record affected
+// neighbors into a work-list. drain_local_work() processes the list
+// iteratively, avoiding the try_commit → update_local_shadows → try_commit
+// recursive chain that could blow the stack and overflow the input queue.
+
+const MAX_LOCAL_WORK: i16 = 256;
+var local_work_v: [MAX_LOCAL_WORK]i16;      // vertex index to process
+var local_work_col: [MAX_LOCAL_WORK]i32;     // color that triggered
+var local_work_cmt: [MAX_LOCAL_WORK]i32;     // commit flag
+var local_work_was_cmt: [MAX_LOCAL_WORK]i32; // was already committed?
+var local_work_head: i16 = 0;
+var local_work_tail: i16 = 0;
+var draining: i32 = 0;  // re-entrancy guard
+
+// Update shadow arrays for same-PE neighbors of vertex v.
+// Enqueues affected vertices into the work-list (no recursive calls).
+fn update_local_shadows(v: i16, col: i32, commit: i32) void {
+  const vi = @as(u16, v);
+  const my_gid = graph_data[vi + 1];
+  const nlv = graph_data[0];
+
+  var u: i16 = 0;
+  while (u < max_local_verts) : (u += 1) {
+    if (@as(i32, u) >= nlv) break;
+    if (u == v) continue;
+    const ui = @as(u16, u);
+    var i: i16 = @as(i16, nbr_offsets[ui]);
+    const end_i: i16 = @as(i16, nbr_offsets[ui + 1]);
+    while (i < end_i) : (i += 1) {
+      const idx = @as(u16, i);
+      const entry = nbr_data[idx];
+      const nb_pe = (entry >> 16) & 0xFF;
+      const nb_gid = entry & 0xFFF;
+      if (nb_pe == @as(i32, pe_id) and nb_gid == my_gid) {
+        const was_cmt = shadow_seen[idx] != 0 and shadow_committed[idx] != 0;
+        shadow_color[idx] = col;
+        shadow_committed[idx] = commit;
+        shadow_seen[idx] = 1;
+
+        const u_gid = graph_data[ui + 1];
+        if (is_higher_pri(@as(i32, pe_id), my_gid, u_gid)) {
+          // Enqueue for deferred processing
+          if (local_work_tail < MAX_LOCAL_WORK) {
+            const t = @as(u16, local_work_tail);
+            local_work_v[t] = u;
+            local_work_col[t] = col;
+            local_work_cmt[t] = commit;
+            local_work_was_cmt[t] = if (was_cmt) @as(i32, 1) else @as(i32, 0);
+            local_work_tail += 1;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Process deferred same-PE work iteratively (no recursion).
+fn drain_local_work() void {
+  if (draining != 0) return;  // prevent re-entrant calls
+  draining = 1;
+
+  while (local_work_head < local_work_tail) {
+    const h = @as(u16, local_work_head);
+    const u = local_work_v[h];
+    const col = local_work_col[h];
+    const cmt = local_work_cmt[h];
+    const was_cmt = local_work_was_cmt[h];
+    local_work_head += 1;
+
+    const ui = @as(u16, u);
+    // repick if conflict
+    if (my_committed[ui] == 0 and col == my_color[ui]) {
+      const new_c = pick_smallest(u);
+      if (new_c != my_color[ui]) {
+        my_color[ui] = new_c;
+        do_bcast(u, new_c, 0);
+        update_local_shadows(u, new_c, 0);  // enqueues, no recursion
+      }
+    }
+    // handle commit decrement
+    if (cmt != 0 and was_cmt == 0) {
+      higher_pri_open[ui] -= 1;
+      if (higher_pri_open[ui] <= 0 and my_committed[ui] == 0) {
+        // Under token serialization we never called pick_smallest for `u`
+        // during its own bcast_task turn — this is a cascade commit from a
+        // same-PE higher-pri vertex. Re-pick now with the current shadow
+        // state (includes all cross-PE commits and this just-set entry).
+        my_color[ui] = pick_smallest(u);
+        my_committed[ui] = 1;
+        committed_count += 1;
+        result_colors[ui] = my_color[ui];
+        do_bcast(u, my_color[ui], 1);
+        update_local_shadows(u, my_color[ui], 1);  // enqueues, no recursion
+        status[0] = committed_count;
+        if (committed_count >= graph_data[0]) {
+          finish_my_turn();
+        }
+      }
+    }
+  }
+
+  // Reset work-list for next batch
+  local_work_head = 0;
+  local_work_tail = 0;
+  draining = 0;
+}
+
+fn try_commit(v: i16) void {
+  const vi = @as(u16, v);
+  my_committed[vi] = 1;
+  committed_count += 1;
+  result_colors[vi] = my_color[vi];
+  do_bcast(v, my_color[vi], 1);
+  update_local_shadows(v, my_color[vi], 1);
+  drain_local_work();
+  status[0] = committed_count;
+  if (committed_count >= graph_data[0]) {
+    finish_my_turn();
+  }
+}
+
+fn repick_if_conflict(v: i16, rcolor: i32) void {
+  const vi = @as(u16, v);
+  if (my_committed[vi] != 0) return;
+  if (rcolor != my_color[vi]) return;
+  const new_c = pick_smallest(v);
+  if (new_c != my_color[vi]) {
+    my_color[vi] = new_c;
+    do_bcast(v, new_c, 0);
+    update_local_shadows(v, new_c, 0);
+    drain_local_work();
+  }
+}
+
+fn handle_wavelet(w: u32) void {
+  // Token wavelet: bit [3] set, bits [31:24] hold target pe_id.
+  if ((w & TOKEN_BIT) != 0) {
+    const target = @as(i32, (w >> 24) & 0xFF);
+    if (target == @as(i32, pe_id) and has_token == 0) {
+      has_token = 1;
+      @activate(bcast_task_id);
+    }
+    return;
+  }
+
+  const spe = unpack_pe(w);
+  if (spe == @as(i32, pe_id)) return;  // ignore same-PE (handled locally)
+
+  const sgid = unpack_gid(w);
+  const scol = unpack_col(w);
+  const scmt = unpack_cmt(w);
+
+  status[1] += 1;
+  const nlv = graph_data[0];
+  var v: i16 = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= nlv) break;
+    const vi = @as(u16, v);
+    var i: i16 = @as(i16, nbr_offsets[vi]);
+    const end_i: i16 = @as(i16, nbr_offsets[vi + 1]);
+    while (i < end_i) : (i += 1) {
+      const idx = @as(u16, i);
+      const entry = nbr_data[idx];
+      const nb_pe = (entry >> 16) & 0xFF;
+      const nb_gid = entry & 0xFFF;
+      if (nb_pe == spe and nb_gid == sgid) {
+        const was_cmt = shadow_seen[idx] != 0 and shadow_committed[idx] != 0;
+        shadow_color[idx] = scol;
+        shadow_committed[idx] = scmt;
+        shadow_seen[idx] = 1;
+
+        const lgid = graph_data[vi + 1];
+        if (is_higher_pri(spe, sgid, lgid)) {
+          // Under token serialization, commits are driven from bcast_task
+          // only (when this PE holds the token). handle_wavelet just tracks
+          // shadows; it must NOT broadcast (we don't hold the token).
+          if (scmt != 0 and !was_cmt) {
+            higher_pri_open[vi] -= 1;
+          }
+        }
+      }
+    }
+  }
+}
+
+// ========== Tasks (all 4 colors trigger same handler) ==========
+task recv_east_0(wval: u32) void { handle_wavelet(wval); }
+task recv_east_1(wval: u32) void { handle_wavelet(wval); }
+task recv_west_0(wval: u32) void { handle_wavelet(wval); }
+task recv_west_1(wval: u32) void { handle_wavelet(wval); }
+
+task done_task() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+// ========== Broadcast task chain ==========
+// Sends one vertex's broadcast per activation. Between activations,
+// data tasks fire — prevents backpressure deadlock from multi-hop flow.
+var bcast_v: i16 = 0;
+
+task bcast_task() void {
+  if (has_token == 0) return;  // gated: must hold token to broadcast
+
+  const nlv = graph_data[0];
+  if (@as(i32, bcast_v) >= nlv) {
+    finish_my_turn();
+    return;
+  }
+
+  const v = bcast_v;
+  const vi = @as(u16, v);
+  bcast_v += 1;
+
+  // Under strict pe_id priority + token serialization: by the time we hold
+  // the token, all cross-PE higher-pri commits (PEs 0..pe_id-1) have already
+  // landed in our shadow state. Intra-PE higher-pri verts are handled via
+  // drain_local_work propagating earlier-gid commits to later-gid entries.
+  // So pick_smallest gives a conflict-free color. Commit directly.
+  if (my_committed[vi] == 0) {
+    my_color[vi] = pick_smallest(v);
+    try_commit(v);
+  }
+
+  // Re-activate for next vertex (or fall through to finish on next tick)
+  @activate(bcast_task_id);
+}
+
+// ========== Entry point ==========
+fn start_coloring() void {
+  start_timing();
+  const nlv = graph_data[0];
+
+  // Token init: PE0 starts with the token, others wait for it.
+  has_token = 0;
+  turn_finished = 0;
+  if (pe_id == 0) {
+    has_token = 1;
+  }
+
+  // Fast path: empty PE (e.g. 3 verts on 4 PEs) — still need to pass the
+  // token along if we happen to hold it, so we don't stall the chain.
+  if (nlv <= 0) {
+    if (pe_id == 0) {
+      // PE0 with no verts: unblock recv tasks so our pass-through path works,
+      // then directly finish (which sends token east and unblocks cmd_stream).
+      @unblock(east_0_task_id);
+      @unblock(east_1_task_id);
+      @unblock(west_0_task_id);
+      @unblock(west_1_task_id);
+      finish_my_turn();
+    } else {
+      // Non-PE0 empty: unblock recvs and wait for token. bcast_task will
+      // fire on token arrival; with nlv==0 it calls finish_my_turn immediately.
+      @unblock(east_0_task_id);
+      @unblock(east_1_task_id);
+      @unblock(west_0_task_id);
+      @unblock(west_1_task_id);
+    }
+    return;
+  }
+
+  // Phase 1: Initialize ALL state (no sends)
+  var j: i16 = 0;
+  while (j < max_nbr_entries) : (j += 1) {
+    shadow_color[@as(u16, j)] = -1;
+    shadow_committed[@as(u16, j)] = 0;
+    shadow_seen[@as(u16, j)] = 0;
+  }
+  committed_count = 0;
+  status[0] = 0;
+  status[1] = 0;
+
+  var v: i16 = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= nlv) break;
+    const vi = @as(u16, v);
+    my_committed[vi] = 0;
+
+    var cnt: i32 = 0;
+    var i: i16 = @as(i16, nbr_offsets[vi]);
+    const end_i: i16 = @as(i16, nbr_offsets[vi + 1]);
+    while (i < end_i) : (i += 1) {
+      const entry = nbr_data[@as(u16, i)];
+      const nb_pe = (entry >> 16) & 0xFF;
+      const nb_gid = entry & 0xFFF;
+      const lgid = graph_data[vi + 1];
+      if (is_higher_pri(nb_pe, nb_gid, lgid)) {
+        cnt += 1;
+      }
+    }
+    higher_pri_open[vi] = cnt;
+  }
+
+  // Phase 2: Initialize my_color to 0 for ALL local vertices.
+  // With empty shadows, pick_smallest would return 0 anyway.
+  // The real purpose is ensuring my_color[v] >= 0 before any tasks run,
+  // so handle_wavelet's guard (my_color >= 0) passes if a commit arrives
+  // before bcast_task processes the vertex.
+  v = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= nlv) break;
+    my_color[@as(u16, v)] = 0;
+  }
+
+  // Phase 3: Unblock recv tasks (all state initialized + colors set)
+  @unblock(east_0_task_id);
+  @unblock(east_1_task_id);
+  @unblock(west_0_task_id);
+  @unblock(west_1_task_id);
+
+  // Phase 4: Only PE0 kicks off bcast_task immediately. The rest wait
+  // for the token wavelet to arrive, which fires bcast_task from
+  // handle_wavelet's token branch.
+  bcast_v = 0;
+  if (pe_id == 0) {
+    @activate(bcast_task_id);
+  }
+}
+
+// ========== Comptime ==========
+comptime {
+  @bind_local_task(done_task, done_task_id);
+  @bind_local_task(bcast_task, bcast_task_id);
+  @bind_local_task(east_send_task, east_send_task_id);
+  @bind_local_task(east_done_task, east_done_task_id);
+  @bind_local_task(west_send_task, west_send_task_id);
+  @bind_local_task(west_done_task, west_done_task_id);
+  @bind_data_task(recv_east_0, east_0_task_id);
+  @bind_data_task(recv_east_1, east_1_task_id);
+  @bind_data_task(recv_west_0, west_0_task_id);
+  @bind_data_task(recv_west_1, west_1_task_id);
+  @block(east_0_task_id);
+  @block(east_1_task_id);
+  @block(west_0_task_id);
+  @block(west_1_task_id);
+
+  @export_symbol(graph_data_ptr, "graph_data");
+  @export_symbol(nbr_data_ptr, "nbr_data");
+  @export_symbol(nbr_offsets_ptr, "nbr_offsets");
+  @export_symbol(result_colors_ptr, "result_colors");
+  @export_symbol(coloring_timer_ptr, "coloring_timer");
+  @export_symbol(status_ptr, "status");
+  @export_symbol(start_coloring);
+}

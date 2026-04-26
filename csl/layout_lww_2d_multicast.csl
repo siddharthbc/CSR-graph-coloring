@@ -1,3 +1,20 @@
+// Picasso Graph Coloring — Pipelined LWW transport, 2D MULTICAST variant.
+// Topology-aware producer-side gating layered on the 2D iter-2 kernel.
+//
+// Identical fabric topology / colors / queues to layout_lww_2d.csl.
+// Only difference: @set_tile_code points at pe_program_lww_2d_multicast.csl,
+// which iterates LOCAL VERTICES (not boundary entries) when packing
+// east/south send buffers and consults two host-uploaded bitmaps —
+// should_send_east[v] / should_send_south[v] — to skip wavelets whose
+// downstream consumer set is empty along that axis. This deduplicates
+// per-(vertex, axis) sends (the baseline kernel sends one wavelet per
+// boundary entry, generating duplicates when a vertex has multiple
+// neighbours on the same downstream PE class).
+//
+// 2x2 only at this checkpoint (same shape constraint as `2d`).
+//
+// Original 2D iter-2 + checkpoint-1 header follows.
+// -------------------------------------------------------------------
 // Picasso Graph Coloring — Pipelined LWW transport, 2D EAST+SOUTH+W (back-channel)
 // (Step 4a iter 2 + checkpoint 1: multi-PE alternating barrier chains).
 //
@@ -118,7 +135,7 @@ layout {
       const my_col_red_recv: color = col_red_recv_color_of(row);
       const my_col_red_send: color = col_red_send_color_of(row);
 
-      @set_tile_code(col, row, "pe_program_lww_2d.csl", .{
+      @set_tile_code(col, row, "pe_program_lww_2d_multicast.csl", .{
         .memcpy_params    = mp,
         .pe_id            = pe_idx,
         .my_row           = row,

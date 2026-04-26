@@ -1,3 +1,34 @@
+// Picasso Graph Coloring — Pipelined LWW kernel, 2D MULTICAST variant.
+//
+// Topology-aware producer-side gating layered on the 2D iter-2 kernel.
+// Identical fabric topology, colors, queues, barrier, and rx tasks
+// as pe_program_lww_2d.csl. The ONLY changes are:
+//
+//   1. Two new host-uploaded device buffers, one bit per local vertex
+//      packed as i32 (0 or 1):
+//        should_send_east [max_local_verts]
+//        should_send_south[max_local_verts]
+//      The host computes them from the partitioner's boundary entries:
+//      should_send_east[v]  = 1 iff v has >=1 boundary entry with dir=0
+//      should_send_south[v] = 1 iff v has >=1 boundary entry with dir=2
+//
+//   2. send_boundary now iterates LOCAL VERTICES instead of boundary
+//      entries. For each local vertex with a colored value in palette,
+//      it pushes ONE wavelet east (if should_send_east[v] && !east_edge)
+//      and ONE wavelet south (if should_send_south[v] && !south_edge).
+//      This deduplicates per-(vertex, axis) sends: a vertex with N east
+//      neighbours used to generate N identical wavelets; now generates 1.
+//      The receiver's boundary-scan logic is unchanged — it still updates
+//      every boundary entry whose neighbor_gid matches the wavelet's gid,
+//      so the receive-side semantics are bit-equivalent.
+//
+// Receivers, forwarders (e2s relay, back-channel relay), barrier, and
+// data-done sentinel accounting are UNCHANGED. expected_data_done_*
+// counts still match the original kernel's emission pattern (one
+// data-done per axis per upstream PE).
+//
+// Original 2D iter-2 header follows.
+// =======================================================================
 // Picasso Graph Coloring — Pipelined LWW kernel, 2D EAST+SOUTH+W back-channel
 // (Step 4a iteration 2).
 //
@@ -186,6 +217,11 @@ var boundary_neighbor_gid: [max_boundary]i32;
 var boundary_direction:    [max_boundary]i32;
 var num_boundary:          [1]i32;
 
+// Multicast variant: per-local-vertex producer-side gates uploaded
+// from host. 0 = skip this axis for this vertex, nonzero = send.
+var should_send_east:  [max_local_verts]i32;
+var should_send_south: [max_local_verts]i32;
+
 var tentative: [max_local_verts]i32;
 var forbidden: [max_palette_size]i32;
 
@@ -267,6 +303,8 @@ var boundary_local_idx_ptr:     [*]i32 = &boundary_local_idx;
 var boundary_neighbor_gid_ptr:  [*]i32 = &boundary_neighbor_gid;
 var boundary_direction_ptr:     [*]i32 = &boundary_direction;
 var num_boundary_ptr:           [*]i32 = &num_boundary;
+var should_send_east_ptr:       [*]i32 = &should_send_east;
+var should_send_south_ptr:      [*]i32 = &should_send_south;
 var color_list_ptr:             [*]i32 = &color_list;
 var list_len_ptr:               [*]i32 = &list_len;
 var runtime_config_ptr:         [*]i32 = &runtime_config;
@@ -568,34 +606,36 @@ task speculate() void {
 }
 
 // =====================================================================
-// Send boundary — both axes.
+// Send boundary — both axes (MULTICAST variant).
+//
+// Iterates LOCAL VERTICES (not boundary entries). For each colored
+// local vertex v, packs at most ONE wavelet east and at most ONE
+// wavelet south, gated by the host-uploaded should_send_east /
+// should_send_south bitmaps. This deduplicates per-(vertex, axis)
+// sends that the baseline kernel would emit once per boundary entry.
 // =====================================================================
 
 task send_boundary() void {
-  const nbnd = num_boundary[0];
+  const n = local_num_verts[0];
   const pal_threshold = runtime_config[1];
   const par = @as(u32, current_round) & 0x1;
   east_count = 0;
   south_count = 0;
 
-  var b: i16 = 0;
-  while (b < max_boundary) : (b += 1) {
-    if (@as(i32, b) >= nbnd) break;
-    const li = @as(u16, @as(i16, boundary_local_idx[b]));
-    const c = colors[li];
+  var v: i16 = 0;
+  while (v < max_local_verts) : (v += 1) {
+    if (@as(i32, v) >= n) break;
+    const c = colors[v];
     if (c >= pal_threshold or c < 0) continue;
-    const dir = boundary_direction[b];
-    const pkt = pack_data(global_vertex_ids[li], c, par);
-    if (dir == 0) {
+    const pkt = pack_data(global_vertex_ids[v], c, par);
+    if ((!is_east_edge) and should_send_east[v] != 0) {
       east_send_buf[east_count] = pkt;
       east_count += 1;
-    } else if (dir == 2) {
+    }
+    if ((!is_south_edge) and should_send_south[v] != 0) {
       south_send_buf[south_count] = pkt;
       south_count += 1;
     }
-    // dir 1 (west) and dir 3 (north) are dropped — Path C invariant
-    // makes them redundant. If they are NOT redundant (diagonal
-    // adjacency), the test will fail and falsify the strategy.
   }
 
   send_phase = 0;
