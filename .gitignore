@@ -3,6 +3,27 @@ Picasso_golden/
 csl_compiled_out/
 __pycache__/
 *.pyc
+simfab_traces/
+sim.log
+simconfig.json
+sim_stats.json
+wio_flows_tmpdir.*/
+
+# Generated output directories
+*_out/
+tests/cerebras-runs-*/
+runs/local/*/
+runs/hardware/*/
+runs/archive/*/
+runs/undecided/*/
+
+!runs/README.md
+
+# Spike-generated artifacts
+spikes/**/out/
+spikes/**/sim.log
+spikes/**/sim_stats.json
+spikes/**/simconfig.json
 
 # Virtual environment
 .venv/
@@ -15,6 +36,9 @@ __pycache__/
 *.synctex.gz
 *.fls
 *.fdb_latexmk
+
+# Generated visualizations and reports are kept in-repo selectively.
+# Do not ignore PDFs/HTML globally.
 
 # OS
 .DS_Store

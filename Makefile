@@ -49,6 +49,11 @@ PICASSO_CMD := $(PYTHON) -m picasso
 CSL_NUM_PES    := 8
 CSL_GRID_ROWS  := 1
 CSL_TEST_CMD   := $(PYTHON) $(ROOT_DIR)/picasso/run_csl_tests.py
+CSL_RUN_SCOPE  ?= local
+CSL_RUN_ID     ?= make-test-csl
+CSL_RUN_DIR    := $(ROOT_DIR)/runs/$(CSL_RUN_SCOPE)/$(CSL_RUN_ID)
+CSL_NORMAL_RUN_ID ?= make-test-csl-normal
+CSL_NORMAL_RUN_DIR := $(ROOT_DIR)/runs/$(CSL_RUN_SCOPE)/$(CSL_NORMAL_RUN_ID)
 
 .PHONY: golden golden-clone golden-build golden-run golden-run-normal \
        golden-clean clean test test-normal test-csr test-csl test-csl-normal test-all help
@@ -303,15 +308,19 @@ test-csl:
 	@echo ""
 	@echo "Running Cerebras CSL speculative parallel coloring on simulator against golden..."
 	@echo ""
-	@$(CSL_TEST_CMD) --num-pes $(CSL_NUM_PES) --grid-rows $(CSL_GRID_ROWS)
+	@mkdir -p $(CSL_RUN_DIR)
+	@$(CSL_TEST_CMD) --num-pes $(CSL_NUM_PES) --grid-rows $(CSL_GRID_ROWS) \
+		--output-dir $(CSL_RUN_DIR)/results | tee $(CSL_RUN_DIR)/stdout.log
 
 test-csl-normal:
 	@echo ""
 	@echo "Running Cerebras CSL on simulator against golden_normal (P=12.5%%|V|, α=2, inv=P)..."
 	@echo ""
+	@mkdir -p $(CSL_NORMAL_RUN_DIR)
 	@$(CSL_TEST_CMD) --num-pes $(CSL_NUM_PES) --grid-rows $(CSL_GRID_ROWS) \
 		--golden-dir $(GOLDEN_NORMAL_DIR) \
-		--palette-frac $(PALETTE_NORMAL_FRAC) --alpha $(ALPHA_NORMAL)
+		--palette-frac $(PALETTE_NORMAL_FRAC) --alpha $(ALPHA_NORMAL) \
+		--output-dir $(CSL_NORMAL_RUN_DIR)/results | tee $(CSL_NORMAL_RUN_DIR)/stdout.log
 
 test-all: test test-csr test-normal test-csl test-csl-normal
 	@echo ""
@@ -348,3 +357,4 @@ help:
 	@echo ""
 	@echo "CSL options (override on command line):"
 	@echo "  CSL_NUM_PES=2      number of PEs for CSL simulation"
+	@echo "  CSL_RUN_ID=foo     run directory name under runs/local/"
