@@ -652,6 +652,24 @@ def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
                     boundary_direction.append(d)
             local_offsets.append(len(local_adj))
 
+        # CP3.recv-lookup (2026-04-26): co-sort the three boundary
+        # arrays by neighbor_gid so the 2d_seg2 kernel can do binary
+        # search instead of a linear O(max_boundary) scan in
+        # process_incoming_wavelet (and the 3 sibling next-round /
+        # speculate scans). Stable sort preserves order within ties
+        # so multiple boundary entries to the same neighbor stay
+        # contiguous and adjacent in the array. The kernel uses
+        # `boundary_lower_bound(gid)` then scans forward over equal
+        # gids — O(log N + K) per lookup where K is the typical 1-3
+        # boundary entries per neighbor.
+        if boundary_neighbor_gid:
+            order = sorted(
+                range(len(boundary_neighbor_gid)),
+                key=lambda i: boundary_neighbor_gid[i])
+            boundary_local_idx = [boundary_local_idx[i] for i in order]
+            boundary_neighbor_gid = [boundary_neighbor_gid[i] for i in order]
+            boundary_direction = [boundary_direction[i] for i in order]
+
         pe_data.append({
             'local_n': local_n,
             'local_offsets': local_offsets,

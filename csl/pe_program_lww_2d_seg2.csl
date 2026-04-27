@@ -422,17 +422,35 @@ fn shrink_color_lists() void {
   }
 }
 
+// CP3.recv-lookup (2026-04-26): boundary arrays are sorted by
+// neighbor_gid at H2D time. Binary search the first index b where
+// boundary_neighbor_gid[b] >= target_gid; callers then scan forward
+// over equal-gid entries. Reduces per-wavelet receive cost from
+// O(max_boundary) to O(log max_boundary + K) where K is the small
+// number of boundary edges to the same neighbor (typically 1-3).
+fn boundary_lower_bound(target_gid: i32, nbnd: i32) i16 {
+  var lo: i16 = 0;
+  var hi: i16 = @as(i16, nbnd);
+  while (lo < hi) {
+    const mid: i16 = lo + (hi - lo) / 2;
+    if (boundary_neighbor_gid[@as(u16, mid)] < target_gid) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
 fn process_incoming_wavelet(sender_gid: i32, sender_color: i32) void {
   perf_counters[4] += 1;
   const nbnd = num_boundary[0];
   var matched: bool = false;
-  var b: i16 = 0;
-  while (b < max_boundary) : (b += 1) {
-    if (@as(i32, b) >= nbnd) break;
-    if (boundary_neighbor_gid[b] == sender_gid) {
-      remote_recv_color[b] = sender_color;
-      matched = true;
-    }
+  var b: i16 = boundary_lower_bound(sender_gid, nbnd);
+  while (b < @as(i16, nbnd)) : (b += 1) {
+    if (boundary_neighbor_gid[@as(u16, b)] != sender_gid) break;
+    remote_recv_color[@as(u16, b)] = sender_color;
+    matched = true;
   }
   if (!matched) diag_counters[4] += 1;
 }
@@ -539,15 +557,15 @@ task speculate() void {
           forbidden[@as(u16, @as(i16, nc))] = 1;
         }
       } else {
+        // CP3.recv-lookup: binary search + forward scan over
+        // equal-gid entries (boundary sorted by neighbor_gid).
         const nbnd = num_boundary[0];
-        var b: i16 = 0;
-        while (b < max_boundary) : (b += 1) {
-          if (@as(i32, b) >= nbnd) break;
-          if (boundary_neighbor_gid[b] == neighbor_gid) {
-            const rc = remote_recv_color[b];
-            if (rc >= 0 and rc < runtime_config[1]) {
-              forbidden[@as(u16, @as(i16, rc))] = 1;
-            }
+        var b: i16 = boundary_lower_bound(neighbor_gid, nbnd);
+        while (b < @as(i16, nbnd)) : (b += 1) {
+          if (boundary_neighbor_gid[@as(u16, b)] != neighbor_gid) break;
+          const rc = remote_recv_color[@as(u16, b)];
+          if (rc >= 0 and rc < runtime_config[1]) {
+            forbidden[@as(u16, @as(i16, rc))] = 1;
           }
         }
       }
@@ -972,13 +990,13 @@ fn on_recv(wval: u32) void {
   if (dpar == cur_par) {
     process_incoming_wavelet(gid, col);
   } else {
+    // CP3.recv-lookup: binary search + forward scan over equal-gid
+    // entries (boundary sorted by neighbor_gid at H2D time).
     const nbnd = num_boundary[0];
-    var b: i16 = 0;
-    while (b < max_boundary) : (b += 1) {
-      if (@as(i32, b) >= nbnd) break;
-      if (boundary_neighbor_gid[b] == gid) {
-        remote_recv_color_next[b] = col;
-      }
+    var b: i16 = boundary_lower_bound(gid, nbnd);
+    while (b < @as(i16, nbnd)) : (b += 1) {
+      if (boundary_neighbor_gid[@as(u16, b)] != gid) break;
+      remote_recv_color_next[@as(u16, b)] = col;
     }
   }
   data_recv_count += 1;
@@ -1084,13 +1102,13 @@ fn on_recv_south(wval: u32) void {
   if (dpar == cur_par) {
     process_incoming_wavelet(gid, col);
   } else {
+    // CP3.recv-lookup: binary search + forward scan over equal-gid
+    // entries (boundary sorted by neighbor_gid at H2D time).
     const nbnd = num_boundary[0];
-    var b: i16 = 0;
-    while (b < max_boundary) : (b += 1) {
-      if (@as(i32, b) >= nbnd) break;
-      if (boundary_neighbor_gid[b] == gid) {
-        remote_recv_color_next[b] = col;
-      }
+    var b: i16 = boundary_lower_bound(gid, nbnd);
+    while (b < @as(i16, nbnd)) : (b += 1) {
+      if (boundary_neighbor_gid[@as(u16, b)] != gid) break;
+      remote_recv_color_next[@as(u16, b)] = col;
     }
   }
   data_recv_count += 1;
