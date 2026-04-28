@@ -918,7 +918,7 @@ chains (OR-reduce across PEs) cannot run on one color, they require
 If a PE's CPU emits on color X while the color's route has `rx` from a
 fabric direction (not RAMP), the injected wavelet is **silently
 dropped** on WSE-3, no compile error, no runtime fault, just missing
-data. This is documented in `AGENTS.md` as "CP3 prohibition."
+data. This CP3 restriction is treated as a design constraint throughout the current routing work.
 
 **Impact.** Forbids a clean fan-in pattern where every PE injects its
 own bit on the shared "back-channel" color. The chain protocol is the
@@ -1294,8 +1294,6 @@ Not blocking, the architecture is proven.
 - `csl/layout_lww_2d_multicast.csl`, multicast fabric, not the main path
 
 **Plan / state docs:**
-- `AGENTS.md`, repo guide, checkpoint history
-- `CURRENT_STATE.md`, latest status
 - `LWW_PIPELINE_PLAN.md`, detailed checkpoint plan / diffs
 - `LWW_PICASSO_RESULTS.md`, original 1D 4 PE benchmark
 - `cp2dd_plan.md` (in memory), CP2d.d implementation plan

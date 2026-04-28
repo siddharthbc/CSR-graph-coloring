@@ -15,5 +15,5 @@ Purpose: hold long-form references that are still relevant to the current implem
 ## Usage Rule
 
 - Treat these as deep references.
-- For current status and next actions, prefer `CURRENT_STATE.md`, `TESTING.md`, `AGENT_GUIDE.md`, and `LWW_PIPELINE_PLAN.md`.
+- For current status and next actions, prefer `TESTING.md`, `LWW_PIPELINE_PLAN.md`, and the active docs in this directory.
 - For background manuscripts and source documents, prefer `docs/reference/README.md`.

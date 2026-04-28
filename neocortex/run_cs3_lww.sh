@@ -92,7 +92,7 @@ mkdir -p "$RESULTS_DIR"
 
 # Mirror EVERYTHING this script prints into the managed per-run
 # stdout.log so callers (single-test, matrix wrapper, neocortex
-# automation) all get a consistent path layout per AGENTS.md
+# automation) all get a consistent managed run-directory layout
 # "managed runs/<scope>/<run_id>/stdout.log" rule. Matrix mode also
 # captures its own per-row log; both stay in sync.
 exec > >(tee -a "$STDOUT_LOG") 2>&1

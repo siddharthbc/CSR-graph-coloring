@@ -347,9 +347,9 @@ Impact:
   the H2D upload to corrupt adjacent device symbols.
 - `forbidden[]` can be under-allocated for test15, where runtime palette
   is 62 but the compiled array may be only 32.
-- This is exactly the failure signature already documented in
-  `AGENTS.md`: undersized `color_list[]` can wedge the kernel in
-  `start_coloring`.
+- This is exactly the failure signature already observed in the
+  max-list-size sizing failure mode: undersized `color_list[]` can
+  wedge the kernel in `start_coloring`.
 
 Mitigation:
 

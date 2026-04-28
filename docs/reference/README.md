@@ -13,4 +13,4 @@ Purpose: keep long-lived background manuscripts, explanatory writeups, and sourc
 ## Usage Rule
 
 - Use these as reference material, not as current status or execution guidance.
-- Prefer `CURRENT_STATE.md`, `TESTING.md`, `AGENT_GUIDE.md`, and `docs/active/README.md` for active work.
+- Prefer `TESTING.md`, `LWW_PIPELINE_PLAN.md`, and `docs/active/README.md` for active work.

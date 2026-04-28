@@ -20,7 +20,6 @@ Purpose: label experiment and backup directories so future sessions can avoid re
 | `runs/local/20260421-east-seg-w16-bridges3/` | recent run | Step 2c.2b.ii W=16, 3 bridges |
 | `runs/local/20260421-lww-2d-iter1-sweep/` | recent run | Step 4a iter 1, falsified as predicted (3/12 PASS) |
 | `runs/local/20260421-lww-2d-iter2-fixdir/` | recent run | Step 4a iter 2, 12/12 PASS at 2×2 |
-| `context.ai` | active scratchpad | short-form architecture context still referenced by active plans |
 
 Note: named spike directories now live under `spikes/experiments/` and follow the current spike contract: `README.md`, `RESULTS.md`, `commands.sh`, and `src/`, with runs written under `runs/`.
 
@@ -83,7 +82,6 @@ Note: named spike directories now live under `spikes/experiments/` and follow th
 
 - `wio_flows_tmpdir.*`
 - `.venv/`
-- `context.ai`
 - `simfab_traces/`
 - `archive/source-backups/`
 - `csl/variants/`
@@ -93,7 +91,5 @@ Note: named spike directories now live under `spikes/experiments/` and follow th
 
 ## Read First During Exploration
 
-1. `CURRENT_STATE.md`
-2. `TESTING.md`
-3. `AGENT_GUIDE.md`
-4. `LWW_PIPELINE_PLAN.md` for active LWW work
+1. `TESTING.md`
+2. `LWW_PIPELINE_PLAN.md` for active LWW work

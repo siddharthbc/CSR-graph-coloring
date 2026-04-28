@@ -13,4 +13,4 @@ Purpose: hold historical or superseded design notes that are still useful as bac
 ## How To Use This Folder
 
 - Read these files only when the current task explicitly needs historical rationale or prior failed directions.
-- Do not treat archive docs as authoritative over `CURRENT_STATE.md`, `TESTING.md`, `AGENT_GUIDE.md`, or `LWW_PIPELINE_PLAN.md`.
+- Do not treat archive docs as authoritative over `TESTING.md`, `LWW_PIPELINE_PLAN.md`, or the active docs index.

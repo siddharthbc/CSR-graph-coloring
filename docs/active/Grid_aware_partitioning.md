@@ -281,7 +281,6 @@ new `picasso/partitioner.py`):
 
 ## 11. Related docs
 
-- `context.ai` — session-level architectural context
 - `MOVING_TO_HWFILTER.md` — HW-filter migration plan
 - `IMPLEMENTATION_ROADMAP.md` — on-device recursion plan
 - `WHY_HW_ROUTING_BLOCKED.md` — WSE-3 routing constraints

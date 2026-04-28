@@ -2,7 +2,7 @@
 # Pipelined LWW Transport — Implementation Plan
 
 Plan of record for replacing SW-relay with the pipelined last-writer-wins
-transport described in `docs/active/PIPELINE_EXECUTION.md` and elaborated in `context.ai`.
+transport described in `docs/active/PIPELINE_EXECUTION.md`.
 
 ## Verified hardware constraints
 
@@ -323,7 +323,7 @@ both axes; do not attempt it.
   falsify the strategy.
 - **4b:** scale to 4×4 / 8×8 with per-axis segmentation, reusing the
   bridge mechanism from Step 2c.2b sub-steps.
-- **4c:** stretch to 16×16 / 32×32 (per `context.ai`).
+- **4c:** stretch to 16×16 / 32×32 as a later scaling step.
 
 **Pre-work that can happen in parallel:**
 - Read [csl/layout.csl](csl/layout.csl) sections wiring the 2D
@@ -479,7 +479,7 @@ covers that analysis.
 
   Test12 excluded locally (host runner OOMs pre-launch — same exclusion
   as the `east_seg` validation it mirrors). Test14/15 / H2_631g out of
-  scope per `AGENTS.md`. The 12/12 result matches the corresponding
+  scope in the managed run layout. The 12/12 result matches the corresponding
   `east_seg` validation
   (`runs/local/20260421-east-seg-w{4,8,16}`) test-for-test.
 
@@ -792,8 +792,8 @@ and validated on test1 4×4 (Level 0 + Level 1 PASS).
 **Phase B — kernel-side epoch tagging (ACTIVE 2026-04-26).**
 Wavelet bit[7] = level epoch (0/1, toggled per BSP level by host
 via `runtime_config[2]`). Receivers drop on epoch mismatch BEFORE
-any forwarder side-effect. See `AGENTS.md` for the full bit
-layout and code-touchpoint list.
+any forwarder side-effect. The epoch layout and code touchpoints
+are part of the CP3-era routing notes in this plan.
 
 Validated on real WSE-3 in single shared wsjob:
 - test1 4×4: Level 0 + Level 1 PASS (was Level-1 hang).
@@ -821,6 +821,6 @@ before the per-level launcher workaround can be retired everywhere.
 ## Tracking
 
 - Per-step results in the spike's `RESULTS.md`.
-- Design revisions land in `context.ai` (short) and this file (detailed).
+- Design revisions land in this file and active design notes.
 - `docs/active/PIPELINE_EXECUTION.md` is the theoretical design; this file is the
   phased execution plan.

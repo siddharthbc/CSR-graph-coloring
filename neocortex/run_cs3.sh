@@ -78,7 +78,7 @@ mkdir -p "$RESULTS_DIR"
 
 # Mirror EVERYTHING this script prints into the managed per-run
 # stdout.log so callers (single-test, matrix wrapper, neocortex
-# automation) all get a consistent path layout per AGENTS.md.
+# automation) all get a consistent managed run-directory layout.
 exec > >(tee -a "$STDOUT_LOG") 2>&1
 
 echo "=== CS-3 hardware run: ${TEST_NAME} on ${NUM_PES} PE(s) ==="

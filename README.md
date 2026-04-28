@@ -7,10 +7,7 @@ A speculative parallel graph coloring implementation targeting the Cerebras Wafe
 For current development work, do not start by scanning every root-level note.
 Use these files first:
 
-- `CURRENT_STATE.md` — current baseline, active experiment, latest known failures
 - `TESTING.md` — narrowest safe validation commands and local-vs-hardware rules
-- `AGENT_GUIDE.md` — fast orientation for AI-assisted work and repo hygiene rules
-- `AGENTS.md` — repo-local instructions for future coding agents
 - `EXPERIMENT_INDEX.md` — status index for spike, backup, and generated directories
 - `docs/active/README.md` — index of long-form active design references
 - `docs/reference/README.md` — index of long-lived background manuscripts and source docs
@@ -156,16 +153,12 @@ The end-to-end flow:
 
 ## Documentation
 
-- `CURRENT_STATE.md` — current working status and active implementation path
 - `TESTING.md` — preferred validation commands and simulator safety notes
-- `AGENT_GUIDE.md` — compact guide for future sessions and AI-assisted changes
-- `AGENTS.md` — repo-local instructions and ignore-first guidance
 - `EXPERIMENT_INDEX.md` — labels active, reference, and historical experiment paths
 - `RUNS.md` — where run artifacts should go and how to capture timing data
 - `GENERATED_ARTIFACTS.md` — ignore strategy for generated outputs and build products
 - `archive/source-backups/README.md` — where historical `.bak` files and backup trees now live
 - `csl/variants/README.md` — organized non-canonical CSL kernel variants
-- `context.ai` — active short-form architectural scratchpad referenced by current design docs
 - [Implementation Walkthrough (PDF)](docs/Picasso_Implementation_End_to_End.pdf) — detailed section-by-section explanation of the entire pipeline
 - [WSE-3 Scaling Analysis](docs/active/WSE3_Scaling_Analysis.md) — 16 identified scaling limitations with root cause analysis and proposed solutions
 
