@@ -489,7 +489,7 @@ possible without changing the algorithm.
 
 ### 10.4 What we deliberately don't do
 
-- **K-tree allreduce (WaferLLM).** Wins at P ≥ hundreds; overkill at P ≤ 64.
+- **K-tree allreduce.** Wins at P ≥ hundreds; overkill at P ≤ 64.
 - **Recursive doubling / butterfly.** `log(P)` stages × diameter is worse
   than `2 × diameter` at our scale.
 - **Control wavelets (`<control>`).** Elegant for targeted per-PE kicks;

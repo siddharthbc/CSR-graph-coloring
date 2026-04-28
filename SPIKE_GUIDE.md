@@ -100,9 +100,9 @@ Promote or integrate a spike only after:
 
 Do not leave successful spikes half-promoted with duplicate runners in repo root.
 
-## Agent Rules
+## Contributor Rules
 
-Agents creating a new spike must:
+Contributors creating a new spike must:
 
 - create it under `spikes/<slug>/` by default
 - add `README.md` and `RESULTS.md` immediately
@@ -113,7 +113,7 @@ Agents creating a new spike must:
 - add or update `EXPERIMENT_INDEX.md` with the spike status
 - avoid creating root-level one-off scripts
 
-Agents modifying an old spike should:
+Contributors modifying an old spike should:
 
 - preserve the spike-local entry point instead of creating a second one elsewhere
 - document any deviation from this layout in the spike `README.md`

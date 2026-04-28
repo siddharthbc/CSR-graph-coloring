@@ -1,6 +1,6 @@
 # Generated Artifacts
 
-Purpose: document which generated files and output directories should be ignored during normal development and AI-assisted exploration.
+Purpose: document which generated files and output directories should be ignored during normal development and exploratory work.
 
 ## Ignore By Default
 
