@@ -313,7 +313,7 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
 
     # CP2d.c diagnostics (only present in 2d_seg2 kernel).
     if sym_diag is not None:
-        NUM_DIAG = 8
+        NUM_DIAG = 10
         diag_data = np.zeros(num_rows * num_cols * NUM_DIAG, dtype=np.int32)
         runner.memcpy_d2h(diag_data, sym_diag, 0, 0, num_cols, num_rows,
                           NUM_DIAG, streaming=False,
@@ -323,7 +323,9 @@ def run_coloring(compiled_dir, graph_data, num_cols, num_rows, num_verts,
         diag_labels = ["row_data_recv", "south_data_recv",
                        "row_done_recv", "south_done_recv",
                        "unmatched_gid", "row_done_next_residual",
-                       "south_done_next_residual", "rounds_done"]
+                       "south_done_next_residual", "rounds_done",
+                       "row_done_bridge_suppressed",
+                       "row_done_aggregate_sent"]
         for pe_row in range(num_rows):
             for pe_col in range(num_cols):
                 d = diag_reshaped[pe_row, pe_col, :]

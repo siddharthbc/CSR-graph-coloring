@@ -39,6 +39,7 @@ param max_list_size:   i16;
 param is_west_edge: bool;
 param is_east_edge: bool;
 param is_bridge:    bool;
+param aggregate_row_done: bool;
 
 // Own east-going color. Either a per-segment source color or a bridge color.
 param my_east_color: color;
@@ -205,7 +206,9 @@ var perf_counters_ptr: [*]i32 = &perf_counters;
 //      closed). Snapshotted in reset_round_state before zeroing.
 //   6: residual south_data_done_recv_next at last round-reset.
 //   7: rounds completed (= current_round at exit).
-var diag_counters = @zeros([8]i32);
+//   8: row data_done bridge re-injections suppressed by aggregate mode.
+//   9: aggregate row data_done sent by bridge PEs.
+var diag_counters = @zeros([10]i32);
 var diag_counters_ptr: [*]i32 = &diag_counters;
 
 // ===== Host-loaded graph =====
@@ -260,6 +263,8 @@ var send_phase: u16 = 0;
 var send_idx:   u16 = 0;
 var send_tmp = @zeros([1]u32);
 var local_send_done: bool = false;
+var row_own_done_ready: bool = false;
+var row_aggregate_done_sent: bool = false;
 var phase_complete: bool = false;
 
 // CP2c.i Stage B: south-axis send buffer + state.
@@ -733,6 +738,21 @@ fn send_bcast(val: u32) void {
   @mov32(out, src);
 }
 
+fn try_send_row_aggregate_done() void {
+  if (!aggregate_row_done or !is_bridge) return;
+  if (row_aggregate_done_sent) return;
+  if (!row_own_done_ready) return;
+  if (!data_done_present) return;
+  if (!is_east_edge) {
+    const par = @as(u32, current_round) & 0x1;
+    send_east(pack_data_done(par));
+    diag_counters[9] += 1;
+  }
+  row_aggregate_done_sent = true;
+  local_send_done = true;
+  check_completion();
+}
+
 // CP2c.i Stage B: col barrier sends (mirror of row barrier).
 fn send_col_reduce(val: u32) void {
   // CP3.epoch.v5: pack with epoch at bit[7] for uniform receiver
@@ -842,10 +862,17 @@ task send_wavelet() void {
   if (send_phase == 1) {
     if (!is_east_edge) {
       const par = @as(u32, current_round) & 0x1;
-      send_east(pack_data_done(par));
+      if (aggregate_row_done and is_bridge) {
+        row_own_done_ready = true;
+        try_send_row_aggregate_done();
+      } else {
+        send_east(pack_data_done(par));
+        local_send_done = true;
+      }
+    } else {
+      local_send_done = true;
     }
     send_phase = 2;
-    local_send_done = true;
   }
 
   // South phase (Stage B: dual mode only).
@@ -930,6 +957,14 @@ fn bridge_reinject(w: u32) void {
   @mov32(out, src);
 }
 
+fn should_bridge_reinject_row(w: u32) bool {
+  if (aggregate_row_done and is_data_done(w)) {
+    diag_counters[8] += 1;
+    return false;
+  }
+  return true;
+}
+
 // CP2d: col-axis analogue of bridge_reinject. At a col bridge PE
 // (cy_local_x = S-1, cy_seg_idx < cy_num_segs - 1), every south
 // arrival on the upstream segment's source / cross-bridge color is
@@ -977,6 +1012,7 @@ fn on_recv(wval: u32) void {
       diag_counters[2] += 1;
       if (!data_done_present and data_done_recv_count >= expected_data_done) {
         data_done_present = true;
+        try_send_row_aggregate_done();
         try_step_barrier();
       }
     } else {
@@ -1027,7 +1063,7 @@ task rx_task_0(w: u32) void {
   if (is_e2s_relay and !is_south_edge and !is_row_bcast_wavelet(w)) send_south(w);
   // Bridge re-inject preserves row_bcast wavelets verbatim onto the
   // bridge color so downstream segments decode them in on_recv too.
-  if (is_bridge) bridge_reinject(w);
+  if (is_bridge and should_bridge_reinject_row(w)) bridge_reinject(w);
 }
 task rx_task_1(w: u32) void {
   if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
@@ -1040,7 +1076,7 @@ task rx_task_1(w: u32) void {
   if (is_e2s_relay and !is_south_edge and !is_row_bcast_wavelet(w)) send_south(w);
   // Bridge re-inject preserves row_bcast wavelets verbatim onto the
   // bridge color so downstream segments decode them in on_recv too.
-  if (is_bridge) bridge_reinject(w);
+  if (is_bridge and should_bridge_reinject_row(w)) bridge_reinject(w);
 }
 task rx_task_2(w: u32) void {
   if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
@@ -1051,7 +1087,7 @@ task rx_task_2(w: u32) void {
   if (is_e2s_relay and !is_south_edge and !is_row_bcast_wavelet(w)) send_south(w);
   // Bridge re-inject preserves row_bcast wavelets verbatim onto the
   // bridge color so downstream segments decode them in on_recv too.
-  if (is_bridge) bridge_reinject(w);
+  if (is_bridge and should_bridge_reinject_row(w)) bridge_reinject(w);
 }
 task rx_task_3(w: u32) void {
   if (!epoch_matches(w)) return;  // CP3.epoch: drop before forwarders
@@ -1062,7 +1098,7 @@ task rx_task_3(w: u32) void {
   if (is_e2s_relay and !is_south_edge and !is_row_bcast_wavelet(w)) send_south(w);
   // Bridge re-inject preserves row_bcast wavelets verbatim onto the
   // bridge color so downstream segments decode them in on_recv too.
-  if (is_bridge) bridge_reinject(w);
+  if (is_bridge and should_bridge_reinject_row(w)) bridge_reinject(w);
 }
 
 // CP2c.i Stage B: south-axis on_recv (mirror of on_recv with per-axis
@@ -1235,6 +1271,8 @@ task detect_resolve() void {
 
 fn reset_round_state() void {
   local_send_done = false;
+  row_own_done_ready = false;
+  row_aggregate_done_sent = false;
   phase_complete = false;
   data_recv_count = 0;
   east_count = 0;

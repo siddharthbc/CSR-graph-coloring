@@ -76,6 +76,11 @@ RESULTS_DIR="${RUN_DIR}/results"
 STDOUT_LOG="${RUN_DIR}/stdout.log"
 mkdir -p "$RESULTS_DIR"
 
+# Mirror EVERYTHING this script prints into the managed per-run
+# stdout.log so callers (single-test, matrix wrapper, neocortex
+# automation) all get a consistent path layout per AGENTS.md.
+exec > >(tee -a "$STDOUT_LOG") 2>&1
+
 echo "=== CS-3 hardware run: ${TEST_NAME} on ${NUM_PES} PE(s) ==="
 echo "    config: --palette-frac=${PALETTE_FRAC} --alpha=${ALPHA} --golden-dir=${GOLDEN_DIR}"
 echo
@@ -213,7 +218,7 @@ ssh -tt "$REMOTE" "bash -lc '
     --output-dir runs/hardware/${RUN_ID}/results \
     ${ROUTING_FLAG} \
     2>&1 | tee ${REMOTE_LOG}
-  '" 2>&1 | tee "${STDOUT_LOG}"
+  '"
 echo
 
 # ---- Step 5: fetch artifacts ----

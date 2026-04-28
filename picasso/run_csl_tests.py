@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from contextlib import nullcontext
 
@@ -549,7 +550,8 @@ def picasso_reference(num_verts, edges, palette_size, alpha=1.0, list_size=None,
 # ---------------------------------------------------------------------------
 
 def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
-                    mode='hash'):
+                    mode='hash', sw_via_east_backchannel=False,
+                    block_weight='none'):
     """Partition graph across a 2D PE grid.
 
     Modes:
@@ -561,7 +563,28 @@ def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
                 is the invariant the pipelined-LWW transport exploits to
                 drop westbound traffic (Path C).
 
+        block_weight:
+                Only meaningful with mode='block'. 'none' keeps the legacy
+                equal-vertex contiguous partition. 'degree' balances by local
+                graph degree, while 'hybrid' balances by 1+degree so isolated
+                vertices still carry nonzero weight. All options preserve the
+                monotone GID-to-PE invariant.
+
     Direction encoding: 0=east, 1=west, 2=south, 3=north.
+
+    sw_via_east_backchannel:
+        Only meaningful with mode='block' and the 2d_seg2 transport
+        (caller responsibility). When True, anti-diagonal SW boundary
+        entries (dr>0, dc<0) whose source sits at pe_col != num_cols-1
+        are re-encoded as dir=0 east instead of dir=2 south. This
+        routes the wavelet east to the back-channel ingress
+        (last-col PE), which then e2s_relays south and back_relays
+        west to the SW consumer. Without this flag, sources at
+        pe_col < num_cols-1 emit south on a column whose last-col PE
+        never sees the gid, so back_relay never fires and the SW
+        consumer is unreachable for the (dr>0, dc<0) class. See
+        tools/selective_relay_preflight.py for the model that
+        surfaced this gap.
     """
     total_pes = num_cols * num_rows
 
@@ -577,18 +600,53 @@ def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
             return gid & pe_mask
 
     elif mode == 'block':
-        # Balanced contiguous chunks: first `rem` PEs get base+1, rest get base.
-        base = num_verts // total_pes
-        rem = num_verts % total_pes
-
-        def _pe_start(p):
-            return p * base + min(p, rem)
-
         gid_to_pe_arr = [0] * num_verts
         pe_vertex_lists = [[] for _ in range(total_pes)]
-        for p in range(total_pes):
-            s = _pe_start(p)
-            e = _pe_start(p + 1) if p + 1 < total_pes else num_verts
+
+        if block_weight == 'none':
+            # Balanced contiguous chunks: first `rem` PEs get base+1,
+            # rest get base.
+            base = num_verts // total_pes
+            rem = num_verts % total_pes
+
+            def _pe_start(p):
+                return p * base + min(p, rem)
+
+            block_ranges = []
+            for p in range(total_pes):
+                s = _pe_start(p)
+                e = _pe_start(p + 1) if p + 1 < total_pes else num_verts
+                block_ranges.append((s, e))
+        else:
+            if block_weight == 'degree':
+                weights = [max(1, int(offsets[g + 1] - offsets[g]))
+                           for g in range(num_verts)]
+            elif block_weight == 'hybrid':
+                weights = [1 + int(offsets[g + 1] - offsets[g])
+                           for g in range(num_verts)]
+            else:
+                raise ValueError(f"unknown block_weight: {block_weight}")
+
+            total_weight = sum(weights)
+            block_ranges = []
+            start_gid = 0
+            prefix_weight = 0
+            for p in range(total_pes):
+                if p == total_pes - 1:
+                    end_gid = num_verts
+                else:
+                    target = (total_weight * (p + 1)) / total_pes
+                    end_gid = start_gid
+                    while end_gid < num_verts:
+                        next_weight = prefix_weight + weights[end_gid]
+                        if end_gid > start_gid and next_weight > target:
+                            break
+                        prefix_weight = next_weight
+                        end_gid += 1
+                block_ranges.append((start_gid, end_gid))
+                start_gid = end_gid
+
+        for p, (s, e) in enumerate(block_ranges):
             for g in range(s, e):
                 gid_to_pe_arr[g] = p
                 pe_vertex_lists[p].append(g)
@@ -640,7 +698,16 @@ def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
                     #     forwarder can relay west to the loser. Picking
                     #     dir=1 (west) drops the wavelet entirely.
                     if mode == 'block' and dr > 0 and dc < 0:
-                        d = 2   # south (back-channel via E-edge forwarder)
+                        if (sw_via_east_backchannel
+                                and pe_col != num_cols - 1):
+                            # 2d_seg2: hop east first to the back-
+                            # channel ingress; e2s_relay then carries
+                            # it south, back_relay then west.
+                            d = 0
+                        else:
+                            # last-col source already sits at the back-
+                            # channel ingress; south is fine.
+                            d = 2
                     elif dc > 0:
                         d = 0   # east
                     elif dc < 0:
@@ -707,6 +774,101 @@ def partition_graph(num_verts, offsets, adj, num_cols, num_rows=1,
         pe_data[pe_idx]['expected_done_recv'] = done_recv_counts[pe_idx]
 
     return pe_data
+
+
+def resolve_sw_via_east(num_verts, offsets, adj, num_cols, num_rows,
+                        routing, lww_layout, policy,
+                        block_weight='none', log_prefix=""):
+    """Resolve --sw-via-east-backchannel {auto,always,never} for ONE
+    test, returning (pe_data, sw_via_east_used: bool, log_msg: str).
+
+    Only meaningful when routing == 'pipelined-lww' AND
+    lww_layout == '2d_seg2'. For all other configs, returns the
+    baseline (False) partition unconditionally; the policy value is
+    ignored except to log it.
+
+    Auto policy:
+      1. Build pe_data with sw_via_east=False (the fast direct-south
+         encoding).
+      2. Run the pure-Python ungated reachability check
+         (picasso.sw_via_east_check.ungated_reaches_all_required).
+      3. If it reaches every required (cpe, spe, gid), keep False.
+      4. Otherwise, rebuild with sw_via_east=True and assert the
+         re-encoded partition passes the same check (it must, by
+         construction; if not, raise).
+    """
+    from picasso.sw_via_east_check import ungated_reaches_all_required
+
+    mode = 'block' if routing == 'pipelined-lww' else 'hash'
+    applies = (routing == 'pipelined-lww' and lww_layout == '2d_seg2')
+
+    if not applies:
+        pe_data = partition_graph(num_verts, offsets, adj,
+                                  num_cols, num_rows,
+                                  mode=mode,
+                                  sw_via_east_backchannel=False,
+                                  block_weight=block_weight)
+        return pe_data, False, ""
+
+    if policy == 'always':
+        pe_data = partition_graph(num_verts, offsets, adj,
+                                  num_cols, num_rows,
+                                  mode=mode,
+                                  sw_via_east_backchannel=True,
+                                  block_weight=block_weight)
+        msg = f"{log_prefix}sw_via_east_backchannel=always:true"
+        return pe_data, True, msg
+
+    if policy == 'never':
+        pe_data = partition_graph(num_verts, offsets, adj,
+                                  num_cols, num_rows,
+                                  mode=mode,
+                                  sw_via_east_backchannel=False,
+                                  block_weight=block_weight)
+        msg = f"{log_prefix}sw_via_east_backchannel=never:false " \
+              f"(reachability check skipped — may leave SW pairs " \
+              f"unreachable)"
+        return pe_data, False, msg
+
+    # auto: try baseline first.
+    pe_data_base = partition_graph(num_verts, offsets, adj,
+                                   num_cols, num_rows,
+                                   mode=mode,
+                                   sw_via_east_backchannel=False,
+                                   block_weight=block_weight)
+    ok, n_req, n_fail, samples = ungated_reaches_all_required(
+        pe_data_base, num_cols, num_rows)
+    if ok:
+        msg = f"{log_prefix}sw_via_east_backchannel=auto:false " \
+              f"(baseline reaches all {n_req} required triples)"
+        return pe_data_base, False, msg
+
+    # Baseline fails — rebuild with detour.
+    pe_data_patched = partition_graph(num_verts, offsets, adj,
+                                      num_cols, num_rows,
+                                      mode=mode,
+                                      sw_via_east_backchannel=True,
+                                      block_weight=block_weight)
+    ok2, n_req2, n_fail2, samples2 = ungated_reaches_all_required(
+        pe_data_patched, num_cols, num_rows)
+    if not ok2:
+        raise RuntimeError(
+            f"sw_via_east_backchannel=True still fails preflight "
+            f"({n_fail2} unreachable triples; sample: {samples2}). "
+            f"This is a model/partition consistency bug.")
+
+    # Count direction-changed boundary entries for logging.
+    changed = 0
+    for spe in range(num_rows * num_cols):
+        b = list(pe_data_base[spe]['boundary_direction'])
+        w = list(pe_data_patched[spe]['boundary_direction'])
+        for k in range(len(b)):
+            if b[k] != w[k]:
+                changed += 1
+    msg = (f"{log_prefix}sw_via_east_backchannel=auto:true "
+           f"(baseline failed {n_fail}/{n_req} triples; "
+           f"detour fixes; {changed} boundary entries re-encoded)")
+    return pe_data_patched, True, msg
 
 
 def compute_multicast_bitmaps(pe_data):
@@ -1090,7 +1252,8 @@ def find_tool(name):
 def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
                 max_boundary, max_relay, max_palette_size, max_list_size,
                 routing_mode, output_dir, lww_east_only=False,
-                lww_layout='bidir'):
+                lww_layout='bidir', seg_size=2, s_col=None,
+                aggregate_row_done=False):
     """Compile the CSL program with cslc.
 
     max_palette_size: compile-time upper bound (sizes the forbidden[] array).
@@ -1165,9 +1328,13 @@ def compile_csl(csl_dir, num_cols, num_rows, max_local_verts, max_local_edges,
             # checkpoint). Same params as east_seg.
             params = base_params + ',S:4'
         elif lww_layout == '2d_seg2':
-            # CP2d fork: same plumbing as 2d_seg but S=2 so interior
-            # bridge PEs fit in the 6-IQ WSE-3 cap at 4x4 / 8x8 / 16x16.
-            params = base_params + ',S:2'
+            # CP2d.e split segment size per axis. Match the hardware
+            # wrapper default: row S comes from --seg-size, col S defaults
+            # to 1 so Q3 stays free for the dedicated back-channel.
+            s_col_value = 1 if s_col is None else s_col
+            params = (base_params +
+                      f',S_row:{seg_size},S_col:{s_col_value}' +
+                      f',aggregate_row_done_flag:{1 if aggregate_row_done else 0}')
         elif lww_layout == 'east':
             params = base_params
         elif lww_layout == '2d':
@@ -1482,6 +1649,49 @@ def main():
                              'with hierarchical 2D barrier, NO back-channel; '
                              '2x2 only at iter 1, narrowest 2D falsifier). '
                              'Only meaningful with --routing pipelined-lww.')
+    parser.add_argument('--seg-size', type=int, default=2,
+                        help='Segment size for segmented LWW layouts. For '
+                             '2d_seg2 this sets S_row; S_col defaults to 1 '
+                             'unless --s-col is provided.')
+    parser.add_argument('--s-col', type=int, default=None,
+                        help='Column-axis segment size for --lww-layout '
+                             '2d_seg2. Default is 1 to preserve the CP2d.e '
+                             'Q3 back-channel queue-map invariant.')
+    parser.add_argument('--aggregate-row-done', action='store_true',
+                        help='Experimental 2d_seg2 optimization: row bridges '
+                             'aggregate upstream data_done tokens and emit one '
+                             'downstream row done after their own row data and '
+                             'all upstream row done tokens have arrived.')
+    parser.add_argument('--sw-via-east-backchannel',
+                        type=str, default='auto',
+                        choices=['auto', 'always', 'never'],
+                        help='Direction-encoding policy for anti-diagonal '
+                             'SW boundary entries under 2d_seg2 block '
+                             'partition. auto (default): per-test, run the '
+                             'pure-Python ungated reachability check on the '
+                             'baseline (sw_via_east=False) partition; if it '
+                             'reaches every required (cpe, spe, gid), keep '
+                             'the fast direct-south encoding; otherwise '
+                             're-encode SW-class entries (sc!=last_col) as '
+                             'dir=0 east so they ride the back-channel '
+                             'detour. always: force the detour everywhere '
+                             '(conservative; pays the detour even for '
+                             'graphs that do not need it; useful for paper '
+                             'validation). never: legacy/debug — skip the '
+                             'reachability check and keep direct-south '
+                             'even where it leaves SW pairs unreachable. '
+                             'Only meaningful with --routing pipelined-lww '
+                             '--lww-layout 2d_seg2.')
+    parser.add_argument('--block-weight',
+                        type=str, default='none',
+                        choices=['none', 'degree', 'hybrid'],
+                        help='Opt-in weighted monotone block partitioning '
+                             'for --routing pipelined-lww. none keeps the '
+                             'legacy equal-vertex contiguous chunks. degree '
+                             'balances contiguous chunks by graph degree; '
+                             'hybrid balances by 1+degree so isolated '
+                             'vertices still contribute weight. All choices '
+                             'preserve gid_a < gid_b => pe(gid_a) <= pe(gid_b).')
     parser.add_argument('--skip-h2', action='store_true',
                         help='Skip the H2_631g_89nodes test (too large for '
                              'simulator)')
@@ -1745,10 +1955,23 @@ def main():
     # "lower-GID wins" conflict rule maps onto east-only forwarding.
     partition_mode = 'block' if args.routing == 'pipelined-lww' else 'hash'
 
+    # Per-test sw_via_east_backchannel decision is made by
+    # resolve_sw_via_east(). Keep a per-test record so the level-loop
+    # below can reuse the same partition (and same sw_via_east bit)
+    # without re-running the auto reachability check.
+    sw_via_east_record = {}
+
     for td in test_data_list:
-        pe_data = partition_graph(td['num_verts'], td['offsets'],
-                                 td['adj'], num_cols, num_rows,
-                                 mode=partition_mode)
+        pe_data, sw_used, log_msg = resolve_sw_via_east(
+            td['num_verts'], td['offsets'], td['adj'],
+            num_cols, num_rows,
+            args.routing, args.lww_layout,
+            args.sw_via_east_backchannel,
+            block_weight=args.block_weight,
+            log_prefix=f"  [{td['name']}] ")
+        if log_msg:
+            print(log_msg)
+        sw_via_east_record[td['name']] = sw_used
         if args.lww_layout == '2d_multicast':
             compute_multicast_bitmaps(pe_data)
         td_max_lv = max(d['local_n'] for d in pe_data)
@@ -1937,7 +2160,10 @@ def main():
                          max_bnd, max_relay, max_palette_size,
                          max_list_size, routing_mode, compiled_dir,
                          lww_east_only=args.lww_east_only,
-                         lww_layout=args.lww_layout)
+                         lww_layout=args.lww_layout,
+                         seg_size=args.seg_size,
+                         s_col=args.s_col,
+                         aggregate_row_done=args.aggregate_row_done)
         if not ok:
             sys.exit(1)
     print()
@@ -1980,9 +2206,14 @@ def main():
 
             print(f"--- {name} ---")
 
-            # Partition and run with host-driven recursion
+            # Partition and run with host-driven recursion. Use the
+            # per-test sw_via_east bit decided in the pre-pass so the
+            # auto reachability check runs at most once per test.
+            sw_used = sw_via_east_record.get(name, False)
             pe_data = partition_graph(num_verts, offsets, adj, num_cols, num_rows,
-                                      mode=partition_mode)
+                                      mode=partition_mode,
+                                      sw_via_east_backchannel=sw_used,
+                                      block_weight=args.block_weight)
             if args.lww_layout == '2d_multicast':
                 compute_multicast_bitmaps(pe_data)
 
@@ -2292,10 +2523,12 @@ def main():
             next_frac_c = args.palette_frac
             # --inv defaults to palette size P per test (matching C++ golden behaviour)
             inv_c = args.inv if args.inv is not None else pal_sz_c
+            cpu_t0 = time.perf_counter()
             module_result = run_picasso_module(
                 td['paulis'], palette_size=pal_sz_c, alpha=args.alpha,
                 list_size=ref['list_size'] if ref['list_size'] is not None else -1,
                 seed=123, max_invalid=inv_c, next_frac=next_frac_c)
+            cpu_algorithm_ms = (time.perf_counter() - cpu_t0) * 1000.0
 
             # Use module result for reference stats (CPU path already set module_result)
             pic_colors = module_result['num_colors']
@@ -2304,6 +2537,7 @@ def main():
             # Print Picasso module reference stats
             print(f"  Picasso ref: {pic_colors} colors, "
                   f"{pic_conflict_edges} conflict edges (L0)")
+            print(f"  CPU Picasso algorithm-only: {cpu_algorithm_ms:.3f} ms")
 
             # Validate coloring correctness
             errors, uncolored, num_colors = validate_coloring(num_verts, edges, colors)

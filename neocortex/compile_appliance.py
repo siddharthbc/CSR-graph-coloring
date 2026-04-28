@@ -52,6 +52,9 @@ def main():
                              'as --seg-size). Set to 1 to drop south_slot_count to '
                              '1 globally and free Q3 IQ for the dedicated '
                              'back-channel (CP2d.e). Ignored by other layouts.')
+    parser.add_argument('--aggregate-row-done', action='store_true',
+                        help='Experimental 2d_seg2 optimization: row bridges '
+                             'aggregate upstream data_done tokens.')
     args = parser.parse_args()
 
     # Locate CSL sources
@@ -135,7 +138,8 @@ def main():
             f"max_palette_size:{args.max_palette_size},"
             f"max_list_size:{args.max_list_size},"
             f"S_row:{args.seg_size},"
-            f"S_col:{s_col}"
+            f"S_col:{s_col},"
+            f"aggregate_row_done_flag:{1 if args.aggregate_row_done else 0}"
         )
     else:
         # other lww layouts (bidir, east, 2d, 2d_multicast)

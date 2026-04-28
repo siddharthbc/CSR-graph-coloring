@@ -32,7 +32,7 @@ mkdir -p "$MATRIX_DIR"
 SUMMARY_CSV="${MATRIX_DIR}/summary.csv"
 MATRIX_LOG="${MATRIX_DIR}/matrix.log"
 
-echo "row,test,grid_rows,num_pes,impl,status,kernel_cycles,kernel_ms,wall_seconds,levels,run_id,notes" > "$SUMMARY_CSV"
+echo "row,test,grid_rows,num_pes,impl,status,kernel_cycles,kernel_ms,cpu_algorithm_ms,wall_seconds,levels,run_id,notes" > "$SUMMARY_CSV"
 
 log() { echo "[matrix $(date -u +%H:%M:%S)] $*" | tee -a "$MATRIX_LOG"; }
 
@@ -49,9 +49,11 @@ ROW_IDX=0
 for raw in "${ROWS[@]}"; do
   ROW_IDX=$((ROW_IDX + 1))
   # tab-split
-  IFS=$'\t' read -r TEST GRID_ROWS NUM_PES IMPL GOLDEN_DIR MAX_MIN <<<"$raw"
+  IFS=$'\t' read -r TEST GRID_ROWS NUM_PES IMPL GOLDEN_DIR MAX_MIN BLOCK_WEIGHT <<<"$raw"
   TEST="${TEST// /}"; GRID_ROWS="${GRID_ROWS// /}"; NUM_PES="${NUM_PES// /}"
   IMPL="${IMPL// /}"; GOLDEN_DIR="${GOLDEN_DIR// /}"; MAX_MIN="${MAX_MIN// /}"
+  BLOCK_WEIGHT="${BLOCK_WEIGHT// /}"
+  BLOCK_WEIGHT="${BLOCK_WEIGHT:-none}"
 
   RUN_ID="matrix${STAMP}-row${ROW_IDX}-${IMPL}-${TEST}-${NUM_PES}pe"
   ROW_LOG="${MATRIX_DIR}/row${ROW_IDX}_${IMPL}_${TEST}_${NUM_PES}pe.log"
@@ -76,6 +78,7 @@ for raw in "${ROWS[@]}"; do
       timeout -k 60s "${MAX_MIN}m" ./neocortex/run_cs3_lww.sh "$TEST" \
         --num-pes "$NUM_PES" --grid-rows "$GRID_ROWS" \
         --lww-layout 2d_seg2 --seg-size 2 \
+        --block-weight "$BLOCK_WEIGHT" \
         --golden-dir "$GOLDEN_DIR" --run-id "$RUN_ID" \
         > "$ROW_LOG" 2>&1
       EXIT=$?
@@ -100,6 +103,7 @@ for raw in "${ROWS[@]}"; do
   STATUS="UNKNOWN"
   CYCLES=""
   KMS=""
+  CPU_MS=""
   LEVELS=""
   NOTES=""
 
@@ -127,10 +131,14 @@ for raw in "${ROWS[@]}"; do
       KMS="$(sed -nE 's/.* cycles, ([0-9.]+) ms.*/\1/p' <<<"$TIMELINE")"
       LEVELS="$(sed -nE 's/.*total across ([0-9]+) level.*/\1/p' <<<"$TIMELINE")"
     fi
+    CPULINE="$(grep -E 'CPU Picasso algorithm-only:' "$ROW_LOG" | tail -1 || true)"
+    if [[ -n "$CPULINE" ]]; then
+      CPU_MS="$(sed -nE 's/.*algorithm-only: ([0-9.]+) ms.*/\1/p' <<<"$CPULINE")"
+    fi
   fi
 
-  log "  -> status=$STATUS cycles=${CYCLES:-?} kms=${KMS:-?} levels=${LEVELS:-?} wall=${WALL_SEC}s exit=$EXIT"
-  echo "$ROW_IDX,$TEST,$GRID_ROWS,$NUM_PES,$IMPL,$STATUS,$CYCLES,$KMS,$WALL_SEC,$LEVELS,$RUN_ID,\"$NOTES\"" >> "$SUMMARY_CSV"
+  log "  -> status=$STATUS cycles=${CYCLES:-?} kms=${KMS:-?} cpu_ms=${CPU_MS:-?} levels=${LEVELS:-?} wall=${WALL_SEC}s exit=$EXIT"
+  echo "$ROW_IDX,$TEST,$GRID_ROWS,$NUM_PES,$IMPL,$STATUS,$CYCLES,$KMS,$CPU_MS,$WALL_SEC,$LEVELS,$RUN_ID,\"$NOTES\"" >> "$SUMMARY_CSV"
 done
 
 log "matrix complete. Summary: $SUMMARY_CSV"

@@ -4,7 +4,9 @@
 #
 # Usage:
 #   ./neocortex/run_cs3_lww.sh <test_name> --num-pes N --grid-rows R \
-#       --lww-layout 2d_seg2 [--seg-size 2] [--no-compile] [--run-id ID]
+#       --lww-layout 2d_seg2 [--seg-size 2] [--block-weight none|degree|hybrid] \
+#       [--aggregate-row-done] \
+#       [--no-compile] [--run-id ID]
 #
 # Example:
 #   ./neocortex/run_cs3_lww.sh test12_many_nodes_20nodes \
@@ -37,6 +39,8 @@ MAX_PALETTE_SIZE="32"
 MAX_LIST_SIZE="2"
 MAX_ROUNDS="30"
 HEADROOM="1.5"
+BLOCK_WEIGHT="none"
+AGGREGATE_ROW_DONE="0"
 SKIP_COMPILE="0"
 RUN_ID=""
 LAUNCHER_PER_LEVEL="0"
@@ -57,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     --max-list-size)     MAX_LIST_SIZE="$2"; shift 2 ;;
     --max-rounds)        MAX_ROUNDS="$2"; shift 2 ;;
     --headroom)          HEADROOM="$2"; shift 2 ;;
+    --block-weight)      BLOCK_WEIGHT="$2"; shift 2 ;;
+    --aggregate-row-done) AGGREGATE_ROW_DONE="1"; shift ;;
     --run-id)            RUN_ID="$2"; shift 2 ;;
     --no-compile)        SKIP_COMPILE="1"; shift ;;
     --launcher-per-level) LAUNCHER_PER_LEVEL="1"; shift ;;
@@ -84,27 +90,36 @@ RESULTS_DIR="${RUN_DIR}/results"
 STDOUT_LOG="${RUN_DIR}/stdout.log"
 mkdir -p "$RESULTS_DIR"
 
+# Mirror EVERYTHING this script prints into the managed per-run
+# stdout.log so callers (single-test, matrix wrapper, neocortex
+# automation) all get a consistent path layout per AGENTS.md
+# "managed runs/<scope>/<run_id>/stdout.log" rule. Matrix mode also
+# captures its own per-row log; both stay in sync.
+exec > >(tee -a "$STDOUT_LOG") 2>&1
+
 NUM_COLS=$((NUM_PES / GRID_ROWS))
 
 echo "=== CS-3 hardware LWW run: ${TEST_NAME} on ${NUM_COLS}x${GRID_ROWS} (${NUM_PES} PEs) ==="
-echo "    layout: ${LWW_LAYOUT}  seg_size: ${SEG_SIZE}"
+echo "    layout: ${LWW_LAYOUT}  seg_size: ${SEG_SIZE}  block_weight: ${BLOCK_WEIGHT}  aggregate_row_done: ${AGGREGATE_ROW_DONE}"
 echo
 
 echo "[1/5] Computing per-PE bounds + max_list_size + max_palette_size from input..."
-BOUNDS_JSON="$(python3 - "$INPUT_JSON" "$NUM_PES" "$GRID_ROWS" "$PALETTE_FRAC" "$ALPHA" <<'PY'
+BOUNDS_JSON="$(python3 - "$INPUT_JSON" "$NUM_PES" "$GRID_ROWS" "$PALETTE_FRAC" "$ALPHA" "$BLOCK_WEIGHT" <<'PY'
 import json, math, sys
 sys.path.insert(0, '.')
 from picasso.run_csl_tests import (
     load_pauli_json, build_conflict_graph, build_csr, partition_graph,
 )
-input_json, num_pes, num_rows, palette_frac, alpha = sys.argv[1:6]
+input_json, num_pes, num_rows, palette_frac, alpha, block_weight = sys.argv[1:7]
 num_pes = int(num_pes); num_rows = int(num_rows)
 palette_frac = float(palette_frac); alpha = float(alpha)
 num_cols = num_pes // num_rows
 paulis = load_pauli_json(input_json)
 nv, edges, _ = build_conflict_graph(paulis)
 offsets, adj = build_csr(nv, edges)
-pe = partition_graph(nv, offsets, adj, num_cols, num_rows, mode='block')
+pe = partition_graph(
+  nv, offsets, adj, num_cols, num_rows,
+  mode='block', block_weight=block_weight)
 max_lv  = max(d['local_n'] for d in pe)
 max_le  = max(len(d['local_adj']) for d in pe)
 max_bnd = max(len(d['boundary_local_idx']) for d in pe)
@@ -179,6 +194,7 @@ else
       --max-palette-size ${MAX_PALETTE_SIZE} --max-list-size ${MAX_LIST_SIZE} \
       --lww-layout ${LWW_LAYOUT} --seg-size ${SEG_SIZE} \
       $( [[ -n "${S_COL}" ]] && echo "--s-col ${S_COL}" ) \
+      $( [[ "${AGGREGATE_ROW_DONE}" == "1" ]] && echo "--aggregate-row-done" ) \
       --hardware --output ${ARTIFACT}
   '" 2>&1 | tee "${RUN_DIR}/compile.log"
   echo "    artifact: ${ARTIFACT}"
@@ -193,7 +209,7 @@ echo "      Remote log (tail anytime):  ssh ${REMOTE} 'tail -f ${REMOTE_LOG}'"
 LPL_FLAG=""
 [[ "${LAUNCHER_PER_LEVEL}" == "1" ]] && LPL_FLAG="--launcher-per-level"
 
-ssh -tt "$REMOTE" "bash -lc '
+ssh "$REMOTE" "bash -lc '
   mkdir -p ${REMOTE_RUN_DIR}/results &&
   cd ${REMOTE_ROOT} &&
   source ~/picasso_venv/bin/activate &&
@@ -207,10 +223,12 @@ ssh -tt "$REMOTE" "bash -lc '
     --golden-dir ${GOLDEN_DIR} \
     --palette-frac ${PALETTE_FRAC} --alpha ${ALPHA} \
     --max-rounds ${MAX_ROUNDS} \
+    --block-weight ${BLOCK_WEIGHT} \
+    $( [[ "${AGGREGATE_ROW_DONE}" == "1" ]] && echo "--aggregate-row-done" ) \
     --output-dir runs/hardware/${RUN_ID}/results \
     ${LPL_FLAG} \
     2>&1 | tee ${REMOTE_LOG}
-  '" 2>&1 | tee "${STDOUT_LOG}"
+  '"
 echo
 
 echo "[5/5] Pulling per-test output back..."

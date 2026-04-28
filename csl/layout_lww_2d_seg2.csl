@@ -50,6 +50,7 @@ param max_list_size: i16;
 // 4x4..32x32 with S_row=2 / S_col=1.
 param S_row: i16;                       // row-axis segment size
 param S_col: i16;                       // col-axis segment size
+param aggregate_row_done_flag: i16;      // opt-in row-bridge done aggregation
 
 // Source colors c_0..c_3 (reused per segment).
 const c_0: color = @get_color(0);
@@ -128,6 +129,8 @@ fn col_bridge_color_of(seg: i16) color {
 
 layout {
   @set_rectangle(num_cols, num_rows);
+
+  const aggregate_row_done: bool = (aggregate_row_done_flag != 0);
 
   // CP2b axis selection: south axis is active iff num_rows > 1 (and we
   // require num_cols == 1 at the runner for single-axis cases).
@@ -445,6 +448,19 @@ layout {
       else if (!rx_has_cross_bridge and rx_local_upstream > 3) source_color_of(3)
       else c_0;
     const rx_expected_data_done: i16 = S_row * rx_seg_idx + rx_local_upstream;
+    const rx_expected_data_done_agg: i16 = rx_slot_count;
+    const rx_expected_data_done_t3: i16 =
+      if (aggregate_row_done) rx_expected_data_done_agg else rx_expected_data_done;
+
+    const rx_last_axis_pos: i16 = num_cols - 1;
+    const rx_last_seg_idx: i16 = rx_last_axis_pos / S_row;
+    const rx_last_local_x: i16 = rx_last_axis_pos - rx_last_seg_idx * S_row;
+    const rx_last_has_cross_bridge: bool = (rx_last_seg_idx > 0);
+    const rx_last_expected_data_done: i16 = S_row * rx_last_seg_idx + rx_last_local_x;
+    const rx_last_expected_data_done_agg: i16 =
+      rx_last_local_x + (if (rx_last_has_cross_bridge) @as(i16, 1) else @as(i16, 0));
+    const rx_last_expected_data_done_t3: i16 =
+      if (aggregate_row_done) rx_last_expected_data_done_agg else rx_last_expected_data_done;
 
     // ── Col-axis per-PE state (mirror, S_col) ──
     const cy_axis_pos:  i16 = row;
@@ -506,11 +522,12 @@ layout {
     //       every PE(R, last)'s south arrival west; its south arrivals
     //       count R * (1 + (num_cols - 1)) = R * num_cols).
     //   col == 0 reduces to R * (1 + num_cols) (same as prior sink case).
+    const cy_own_south_data_done_t3: i16 = 1 + rx_expected_data_done_t3;
+    const cy_back_south_data_done_t3: i16 = 1 + rx_last_expected_data_done_t3;
     const cy_expected_data_done_t3: i16 =
       if (row == 0) @as(i16, 0)
-      else if (col == num_cols - 1) row * (1 + col)
-      else row * (1 + col + num_cols);
-    const rx_expected_data_done_t3: i16 = rx_expected_data_done;
+      else if (col == num_cols - 1) row * cy_own_south_data_done_t3
+      else row * (cy_own_south_data_done_t3 + cy_back_south_data_done_t3);
 
     // Per-PE south rx queue index assignment for slots 1 and 2.
     // Goal: fit the south_slot1 IQ binding without colliding with
@@ -583,6 +600,7 @@ layout {
       .is_west_edge     = rx_is_west,
       .is_east_edge     = rx_is_east,
       .is_bridge        = rx_is_bridge,
+      .aggregate_row_done = aggregate_row_done,
       .my_east_color    = rx_my_color,
       .slot0_color      = rx_slot0,
       .slot1_color      = rx_slot1,
